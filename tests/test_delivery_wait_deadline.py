@@ -642,54 +642,40 @@ async def test_a_booking_with_the_rerun_policy_off_holds_nothing(db, monkeypatch
 # --- Круг 3: данные вне транзакции перехода ---------------------------------
 
 
-async def test_a_deadline_raised_before_the_lock_cancels_the_escalation(
+async def test_a_deadline_raised_by_another_connection_is_honoured(
     db, db_dsn, monkeypatch
 ):
-    """Второе соединение сохранило срок 72 ч после чтения срока 24 ч проходом."""
-    from hub.services import orchestration
-
+    """Срок читается под локом прохода: 72 ч, сохранённые другим соединением."""
     task_id = await _setup(db, monkeypatch)
-    await set_policy(db, base_fetch_wait_hours=24)  # строка проекта существует
+    await set_policy(db, base_fetch_wait_hours=24)
     await _pass(db, task_id)
     await _age(db, task_id, 30)
-    real = orchestration.record_delivery_outcome
+    other = await aiosqlite.connect(db_dsn, uri=True)
+    try:
+        await other.execute(
+            "UPDATE projects SET gate_policy = ? WHERE slug = 'default'",
+            ('{"base_fetch_wait_hours": 72}',),
+        )
+        await other.commit()
+    finally:
+        await other.close()
 
-    async def raise_deadline_first(db_, task_, write, **kw):
-        other = await aiosqlite.connect(db_dsn, uri=True)
-        try:
-            await other.execute(
-                "UPDATE projects SET gate_policy = ? WHERE slug = 'default'",
-                ('{"base_fetch_wait_hours": 72}',),
-            )
-            await other.commit()
-        finally:
-            await other.close()
-        return await real(db_, task_, write, **kw)
+    await _pass(db, task_id)
 
-    monkeypatch.setattr(orchestration, "record_delivery_outcome", raise_deadline_first)
-
-    assert (await _pass(db, task_id))["status"] == "running"
     assert await _notices(db, task_id) == 0
     assert await _open_waits(db, task_id) == 1
 
 
-async def test_a_policy_unreadable_at_the_transition_cancels_it(db, monkeypatch):
-    from hub.services import orchestration
-
+async def test_a_policy_unreadable_at_the_pass_gives_no_notice(db, monkeypatch):
     task_id = await _setup(db, monkeypatch)
-    await set_policy(db, base_fetch_wait_hours=24)  # строка проекта существует
+    await set_policy(db, base_fetch_wait_hours=24)
     await _pass(db, task_id)
     await _age(db, task_id, 30)
-    real = orchestration.record_delivery_outcome
+    await db.execute("UPDATE projects SET gate_policy = '{broken'")
+    await db.commit()
 
-    async def corrupt_first(db_, task_, write, **kw):
-        await db_.execute("UPDATE projects SET gate_policy = '{broken'")
-        await db_.commit()
-        return await real(db_, task_, write, **kw)
+    await _pass(db, task_id)
 
-    monkeypatch.setattr(orchestration, "record_delivery_outcome", corrupt_first)
-
-    assert (await _pass(db, task_id))["status"] == "running"
     assert await _notices(db, task_id) == 0
 
 

@@ -8,29 +8,35 @@
   сдачи, ревизия вердикта); ``started_at`` пишется один раз, рестарт и смена
   текста ошибки его не двигают;
 * срок - ключ политики проекта ``base_fetch_wait_hours`` (24 ч по умолчанию);
-* просрочка проверяет одобрение заново и переводит задачу в needs_decision ОДИН
-  раз тем же путём, что любой отказ гейта на pair-свипе
-  (``delivery_writes.hand_pair_to_human`` -> ``emit_needs_decision``);
+* по истечении срока владелец получает ОДНО уведомление, ожидание закрывается
+  состоянием ``notified``. СТАТУС ЗАДАЧИ НЕ МЕНЯЕТСЯ и мерж не блокируется:
+  арбитраж «мерж или эскалация» - отдельная задача (решение роадмапа после
+  четырёх кругов ревью класса «устаревшая причина гейта = текущее состояние»);
 * успех, иная причина отказа, новое поколение или новая ревизия вердикта
   закрывают ожидание (иная причина - любой ответ гейта на проходе, кроме
   «поиск замены PR не ответил»: он о гейте ничего не говорит).
+
+Уведомление: запись ``alert`` в карточке (причина, срок, PR, ссылка на задачу),
+событие ``delivery_wait_deadline`` и ``watch_notices.notify_steward("stale")`` -
+всё в одной транзакции. ``emit_needs_decision`` НЕ используется: он пишет событие
+``needs_decision`` (метрики человеческого гейта, подсказка стюарду звать decide),
+а перехода статуса здесь нет.
 
 Только ``base_fetch_pending``. Остальные временные причины доставки срока не
 получают. Срок проверяет pair-свип поллера - единственный повторяющийся драйвер
 доставки; отчёт агента об окончании работы проходит тот же гейт, но срока не
 судит. «Не прочиталось» (политика, строка таймера) не равно «срок вышел» и не
 равно «срока нет»: нечитаемая политика или сбой таймера - ожидание
-продолжается, перевода нет; нет ключа - умолчание. Транзакцией владеет
-вызывающий: свои записи здесь идут через ``write_transaction`` и откатываются
-только если транзакцию открыли мы - чужие записи прохода (бронь #1956, события
-обновления ветки) этот модуль не откатывает.
+продолжается, уведомления нет; нет ключа - умолчание. Журнал и все решения
+читаются и пишутся под ОДНИМ write-локом; транзакцией владеет вызывающий: свои
+записи идут через ``write_transaction`` и откатываются только если транзакцию
+открыли мы - чужие записи прохода этот модуль не откатывает.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from functools import partial
 from typing import Any
 
 import aiosqlite
@@ -39,16 +45,15 @@ from hub import repository as repo
 from hub import repository_delivery_rerun as rerun_journal
 from hub import repository_delivery_wait as journal
 from hub.db import write_transaction
-from hub.services import delivery_claim, delivery_writes, project_policy
+from hub.services import project_policy, watch_notices
 
 log = logging.getLogger("hub")
 
 KIND = "base_fetch_pending"
-REASON = "base_fetch_deadline"
+EVENT = "delivery_wait_deadline"
 HINT = (
-    " Хаб не может получить свежую базовую ветку в клон (fetch). Устраните "
-    "отказ — доступ хаба к репозиторию — и решите: вернуть в работу или "
-    "повторить доставку (REST POST /api/tasks/<id>/decide)."
+    " Статус задачи не менялся, доставка не заблокирована. Хаб не может получить "
+    "свежую базовую ветку в клон (fetch): проверьте доступ хаба к репозиторию."
 )
 
 
@@ -121,24 +126,19 @@ async def _judge(
     detail: str,
     pr_num: Any,
 ) -> bool:
-    from hub.services import orchestration
-
-    hours = await wait_hours(db, key[0])
+    """Вести ожидание и после срока уведомить владельца; True - уведомление ушло."""
     async with write_transaction(db):
-        # Результат прохода относится к его снимку: если живая строка уже ушла
-        # на другое поколение или ревизию, проход устарел и журнала не трогает.
+        # Журнал, живая строка, политика и состояние доставки читаются и пишутся
+        # под одним локом. Результат прохода относится к его снимку: если живая
+        # строка уже ушла на другое поколение, ревизию, PR или закрепление,
+        # проход устарел и журнала не трогает.
         if not await _pass_is_live(db, task, key):
             return False
         await journal.open_wait(db, *key)
+        hours = await wait_hours(db, key[0])
         if hours is None or not await journal.is_overdue(db, *key, hours):
-            return False
-    written, escalated = await orchestration.record_delivery_outcome(
-        db,
-        task,
-        partial(_escalate, db, key, task, detail),
-        fallback=False,
-    )
-    return bool(written and escalated)
+            return False  # срок не вышел или политика не читается: уведомления нет
+        return await _notify_owner(db, key, task, detail, hours)
 
 
 async def _pass_is_live(
@@ -174,67 +174,56 @@ async def _live_key(
     )
 
 
-async def _escalate(
+async def _notify_owner(
     db: aiosqlite.Connection,
     key: tuple[int, int, int, str],
     snap: dict[str, Any],
     detail: str,
+    hours: int | None = None,
 ) -> bool:
-    """Под локом записи: тот же ключ жив, переход выигран, задача передана человеку.
+    """Под локом записи: срок вышел - ОДНО уведомление владельцу, статус прежний.
 
-    Всё, что решает переход, читается ЗДЕСЬ, под локом: ключ и PR, доставка,
-    бронь и срок. Срок, прочитанный проходом до лока, лишь предварительный:
-    второе соединение могло сохранить другой, и нечитаемая политика отменяет
-    переход так же, как не вышедший срок.
+    ``hours`` не передан (прямой вызов) - срок читается здесь же и перепроверяется.
     """
-    pr_num = snap.get("pr_number")
+    from hub.services import orchestration
+
+    pr_num = int(snap.get("pr_number") or 0)
     if not await _pass_is_live(db, snap, key):
         return False  # завершена, возвращена, сдана заново, PR или закрепление ушли
-    if await _delivery_moved_on(db, key, int(pr_num or 0)):
+    if hours is None:
+        hours = await wait_hours(db, key[0])
+        if hours is None or not await journal.is_overdue(db, *key, hours):
+            return False
+    if await _delivery_moved_on(db, key, pr_num):
         await journal.close_open(db, *key)
-        return False  # доставлено соседним путём: переводить нечего
-    if await _rerun_holds(db, key, int(pr_num or 0)):
+        return False  # доставлено соседним путём: сообщать не о чем
+    if await _rerun_holds(db, key, pr_num):
         return False  # живая бронь #1956 обслужит поколение; срок не продлевается
-    hours = await wait_hours(db, key[0])
-    if hours is None or not await journal.is_overdue(db, *key, hours):
-        return False  # срок сменился или не читается: решения нет
-    # Память гейта - словарь процесса, лок SQLite её не защищает. Проверка стоит
-    # последней и без await до условного UPDATE перехода: окно остаётся только
-    # между этим UPDATE и записью статуса (известная граница, как у #1956).
-    claim = (key[0], int(pr_num or 0))
-    if _merge_in_gate_memory(*claim):
+    if _merge_in_gate_memory(key[0], pr_num):
         return False  # мерж идёт или влит, реестр не записан: ждём, часы не трогаем
-    # Без await между проверкой и отметкой: мерж, начатый позже, увидит отметку и
-    # форж не позовёт (взаимное исключение с merge_if_approval_stands).
-    delivery_claim.hold(claim)
-    try:
-        moved = await _transition(db, key, pr_num, detail, hours)
-        if moved:  # тот же синхронный кусок, что и снятие отметки ниже
-            delivery_claim.mark_escalated(key[0], key[1])
-        return moved
-    finally:
-        delivery_claim.release(claim)
-
-
-async def _transition(
-    db: aiosqlite.Connection,
-    key: tuple[int, int, int, str],
-    pr_num: Any,
-    detail: str,
-    hours: int,
-) -> bool:
-    """Сам переход, под отметкой ``delivery_claim``: UPDATE, статус, событие."""
-    if not await journal.escalate(db, *key):
-        return False  # переход уже сделал другой проход
-    await delivery_writes.hand_pair_to_human(
+    if not await orchestration.approval_stands(db, snap):
+        return False  # одобрения нет: сообщать об «одобренной» работе нельзя
+    if not await journal.notify_once(db, *key):
+        return False  # уведомление по этому ключу уже ушло
+    text = (
+        f"Доставка одобренной задачи #{key[0]} (PR #{pr_num}) ждёт свежую базу "
+        f"дольше срока base_fetch_wait_hours ({hours} ч): {detail}. "
+        f"Причина {KIND}.{HINT}" + await _rerun_outcome_note(db, key)
+    )
+    await repo.add_task_update(db, key[0], "hub", "alert", text)
+    event_id = await repo.insert_event(
         db,
-        key[0],
-        pr_num,
-        f"{detail} — ожидание свежей базы дольше срока ({hours} ч)"
-        + await _rerun_outcome_note(db, key),
-        REASON,
-        "",
-        HINT,
+        kind=EVENT,
+        task_id=key[0],
+        actor="hub",
+        payload={"reason": KIND, "pr_number": pr_num, "hours": hours, "detail": detail},
+    )
+    await watch_notices.notify_steward(
+        db,
+        "stale",
+        task_id=key[0],
+        source_key=f"{EVENT}:{key[0]}:{key[1]}:{key[2]}",
+        source_event_id=event_id,
     )
     return True
 

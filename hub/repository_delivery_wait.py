@@ -13,7 +13,7 @@ from hub.db import fetchall
 
 OPEN = "open"
 CLOSED = "closed"
-ESCALATED = "escalated"
+NOTIFIED = "notified"
 
 
 async def open_wait(
@@ -22,8 +22,8 @@ async def open_wait(
     """Начать (или продолжить) ожидание; закрытое - заново, эскалированное - нет.
 
     Открытая строка не трогается: ``started_at`` не двигается ни повтором, ни
-    рестартом. ``escalated`` терминально для своего ключа: задача уже ушла к
-    человеку, и возврат в running с тем же ключом не заводит второй перевод. Открытые строки той же задачи с другим ключом (прежнее поколение
+    рестартом. ``notified`` терминально для своего ключа: владелец уже уведомлен, и
+    повторный отказ fetch с тем же ключом второго уведомления не даёт. Открытые строки той же задачи с другим ключом (прежнее поколение
     или ревизия вердикта) закрываются: новая сдача начинает отсчёт с нуля.
     """
     await db.execute(
@@ -62,15 +62,15 @@ async def is_overdue(
     return bool(rows)
 
 
-async def escalate(
+async def notify_once(
     db: aiosqlite.Connection, task_id: int, generation: int, revision: int, kind: str
 ) -> bool:
-    """open -> escalated одним условным UPDATE: True - выиграл этот вызов."""
+    """open -> notified одним условным UPDATE: True - уведомляет этот вызов."""
     cur = await db.execute(
         "UPDATE delivery_wait_deadlines SET state=?, closed_at=datetime('now') "
         "WHERE task_id=? AND submission_generation=? AND verdict_revision=? "
         "AND kind=? AND state=?",
-        (ESCALATED, task_id, generation, revision, kind, OPEN),
+        (NOTIFIED, task_id, generation, revision, kind, OPEN),
     )
     return cur.rowcount == 1
 
