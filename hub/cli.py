@@ -1144,6 +1144,7 @@ def cmd_decide(args: argparse.Namespace) -> int:
         "instructions": args.message or "",
         "decision_summary": getattr(args, "summary", "") or "",
         "record_decision": getattr(args, "record_decision", False),
+        "confirm_no_job": getattr(args, "confirm_no_job", False),
     }
     result = _api("POST", f"/api/tasks/{args.task_id}/decide", body)
     _print_json(result)
@@ -2819,6 +2820,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="record_decision",
         action="store_true",
         help="Устарел: решение всегда пишется в ленту задачи",
+    )
+    p_decide.add_argument(
+        "--confirm-no-job",
+        dest="confirm_no_job",
+        action="store_true",
+        help="rework после оборванного заказа: задания в очереди диспетчера нет",
     )
     p_decide.set_defaults(func=cmd_decide)
 

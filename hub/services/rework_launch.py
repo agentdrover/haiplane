@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from typing import Any
 
@@ -99,7 +100,32 @@ async def require_entry(db: aiosqlite.Connection, task_id: int) -> dict[str, Any
     return task
 
 
-async def reserve(db: aiosqlite.Connection, task_id: int) -> tuple[dict[str, Any], int]:
+async def refuse_unconfirmed_outcome(db: aiosqlite.Connection, task_id: int) -> None:
+    """409, пока исход прошлого заказа не установлен и человек не подтвердил.
+
+    Сверка не нашла задание, но это не доказательство, что его нет (оно могло
+    выпасть из просмотренных). Новое решение rework после ``needs_human``
+    возможно только с ``confirm_no_job``: иначе повтор того же запроса молча
+    запустил бы второе задание.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT id, state FROM rework_launches WHERE task_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    if rows and rows[0]["state"] == NEEDS_HUMAN:
+        raise _taken(
+            task_id,
+            f"исход прошлого заказа (бронь №{rows[0]['id']}) не установлен: "
+            "проверьте очередь диспетчера и повторите решение с "
+            "confirm_no_job=true, если задания там нет",
+        )
+
+
+async def reserve(
+    db: aiosqlite.Connection, task_id: int, *, confirm_no_job: bool = False
+) -> tuple[dict[str, Any], int]:
     """Потребить вход needs_decision и забронировать запуск: (задача, номер брони).
 
     Вызывается ВНУТРИ ``write_transaction`` вызывающего, вместе с записью
@@ -108,6 +134,8 @@ async def reserve(db: aiosqlite.Connection, task_id: int) -> tuple[dict[str, Any
     from hub.services import executor_launch
 
     task = await require_entry(db, task_id)
+    if not confirm_no_job:
+        await refuse_unconfirmed_outcome(db, task_id)
     live = await executor_launch._live_run(db, task_id)
     if live:
         raise _taken(task_id, live)
@@ -156,24 +184,30 @@ async def settle_launched(
     async with write_transaction(db):
         row = await repo.get_task(db, task_id)
         moved = row is not None and dict(row)["status"] == "needs_decision"
-        if moved:
-            await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
-            await resolve(db, reservation_id, LAUNCHED, job_id=job_id)
-            return True
-        await resolve(
+        # Бронь закрывается первой и условно: поздний ответ после сверки не
+        # трогает задачу, чью бронь уже закрыли.
+        won = await resolve(
             db,
             reservation_id,
-            NEEDS_HUMAN,
+            LAUNCHED if moved else NEEDS_HUMAN,
             job_id=job_id,
-            reason="задача вышла из needs_decision, пока заказ шёл",
+            reason="" if moved else "задача вышла из needs_decision, пока заказ шёл",
+        )
+        if won and moved:
+            await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
+            return True
+        why = (
+            "задача уже не в needs_decision"
+            if won
+            else "бронь уже закрыта сверкой или другим путём"
         )
         await repo.add_task_update(
             db,
             task_id,
             "hub",
             "alert",
-            f"Доработка заказана (задание {job_id}), но задача уже не в "
-            "needs_decision. Задание не привязано к задаче: проверьте его вручную.",
+            f"Доработка заказана (задание {job_id}), но {why}. Задание не "
+            "привязано к задаче: проверьте его вручную.",
         )
     return False
 
@@ -200,10 +234,11 @@ def _job_id_of(job: dict[str, Any]) -> str:
 
 
 async def _find_job(reservation_id: int) -> dict[str, Any] | None:
-    needle = marker(reservation_id)
+    # Номер - целиком: метка №1 не должна совпасть с №10 и №100.
+    needle = re.compile(re.escape(marker(reservation_id)) + r"(?!\d)")
     jobs = await asyncio.to_thread(plugins.dispatch.list_jobs, JOBS_SCANNED)
     for job in jobs:
-        if needle in json.dumps(job, ensure_ascii=False, default=str):
+        if needle.search(json.dumps(job, ensure_ascii=False, default=str)):
             return job
     return None
 
@@ -227,7 +262,8 @@ async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
     job = await _find_job(rid)
     job_id = _job_id_of(job) if job else ""
     if job_id:
-        await settle_launched(db, rid, task_id, job_id)
+        if not await settle_launched(db, rid, task_id, job_id):
+            return NEEDS_HUMAN
         await repo.add_task_update(
             db,
             task_id,
@@ -252,8 +288,8 @@ async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
             "alert",
             f"Заказ доработки (бронь №{rid}) оборвался, и установить, принял ли "
             f"диспетчер задание, не удалось: {reason}. Повторного запуска нет. "
-            "Проверьте очередь диспетчера и, если задания нет, примите решение "
-            "заново (REST POST /api/tasks/<id>/decide).",
+            "Проверьте очередь диспетчера; если задания там нет, примите решение "
+            "заново с confirm_no_job=true (REST POST /api/tasks/<id>/decide).",
         )
     return NEEDS_HUMAN
 

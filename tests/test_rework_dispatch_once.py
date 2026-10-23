@@ -420,3 +420,92 @@ async def test_the_sweep_closes_a_booking_of_a_task_that_moved_on(db, monkeypatc
     )
     assert [r[0] for r in rows] == ["closed"]
     assert len(jobs["calls"]) == 1
+
+
+async def test_a_repeat_decision_after_an_unproven_outcome_needs_confirmation(
+    db, monkeypatch
+):
+    """Сверка не нашла задание - это не доказательство, что его нет."""
+    from hub.services import rework_launch
+
+    task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=False)
+    await _age_reservations(db, task_id)
+    await rework_launch.sweep(db)
+
+    with pytest.raises(HTTPException) as again:
+        await services.decide_task(db, task_id, TaskDecide(**REWORK))
+    assert again.value.status_code == 409 and "confirm_no_job" in again.value.detail
+    assert len(jobs["calls"]) == 1
+
+    async def accepts(message: str, **_kwargs: Any) -> dict[str, Any]:
+        jobs["calls"].append(message)
+        return {"job_id": "job-2"}
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", accepts)
+    view = await services.decide_task(
+        db, task_id, TaskDecide(**REWORK, confirm_no_job=True)
+    )
+    assert view.status.value == "fix_requested" and len(jobs["calls"]) == 2
+
+
+async def test_an_unparsed_dispatcher_answer_is_not_a_refusal(db, monkeypatch):
+    """{raw, exit_code: 0}: задание могло быть принято - бронь остаётся до сверки."""
+
+    async def unparsed(message: str, **_kwargs: Any) -> dict[str, Any]:
+        return {"raw": "не json", "exit_code": 0}
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", unparsed)
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+
+    await services.decide_task(db, task_id, TaskDecide(**REWORK))
+
+    assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
+    rows = await db.execute_fetchall(
+        "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    assert [r[0] for r in rows] == ["reserved"]
+
+
+async def test_the_booking_marker_matches_the_whole_number(db, monkeypatch):
+    from hub.services import rework_launch
+
+    monkeypatch.setattr(
+        plugins.dispatch,
+        "list_jobs",
+        lambda limit=50: [{"id": "other", "message": "rework-launch:10 и :100"}],
+    )
+
+    assert await rework_launch._find_job(1) is None
+    assert (await rework_launch._find_job(10))["id"] == "other"
+
+
+async def test_force_complete_and_resubmission_wait_for_a_booking(client, db, net):
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    first = await _winner_in_network(client, net, task_id)
+
+    forced = await client.post(
+        f"/api/tasks/{task_id}/force-complete", json={"comment": "закрыть"}
+    )
+
+    assert forced.status_code == 409, forced.text
+    assert (await _finish(net, first)).status_code == 200
+    assert (await repo.get_task(db, task_id))["status"] == "fix_requested"
+
+
+async def test_a_late_answer_does_not_touch_a_booking_the_sweep_closed(db):
+    from hub.services import rework_launch
+
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    await db.execute(
+        "INSERT INTO rework_launches (task_id, state) VALUES (?, 'needs_human')",
+        (task_id,),
+    )
+    await db.commit()
+    rid = (await db.execute_fetchall("SELECT MAX(id) FROM rework_launches"))[0][0]
+
+    linked = await rework_launch.settle_launched(db, rid, task_id, "job-late")
+
+    assert linked is False
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision" and not task["job_id"]
+    assert "job-late" in await _feed(db, task_id)

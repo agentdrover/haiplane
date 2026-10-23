@@ -4070,6 +4070,8 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         await ci_trust.recheck_in_transaction(
             db, lambda: _step_bug_red_test(state), lambda: _step_ci_before_submit(state)
         )
+        if task["status"] == "needs_decision":
+            await rework_launch.refuse_if_reserved(db, task_id)  # #1991
         if not await repo.transition_status_if(
             db,
             task_id,
@@ -5888,12 +5890,21 @@ async def _dispatch_rework(
     if job_id:
         await rework_launch.settle_launched(db, reservation_id, task_id, job_id)
         return
+    if "raw" in result:
+        # Вывод диспетчера не разобран, а код возврата 0: задание могло быть
+        # принято. Это неизвестный исход, а не отказ - бронь остаётся до сверки.
+        await rework_launch.note_unknown_outcome(
+            db, task_id, reservation_id, ValueError("ответ диспетчера не разобран")
+        )
+        return
     async with write_transaction(db):
-        await repo.update_task(db, task_id, status="open")
-        await reset_mis_issued_assignment(db, task_id, task)
-        await rework_launch.resolve(
+        declined = await rework_launch.resolve(
             db, reservation_id, rework_launch.DECLINED, reason="диспетчер не дал job_id"
         )
+        row = await repo.get_task(db, task_id)
+        if declined and row is not None and dict(row)["status"] == "needs_decision":
+            await repo.update_task(db, task_id, status="open")
+            await reset_mis_issued_assignment(db, task_id, task)
 
 
 async def decide_task(
@@ -5987,7 +5998,9 @@ async def decide_task(
         async with write_transaction(db):
             # #1991: вход needs_decision потребляется ВМЕСТЕ с записью решения;
             # проигравший вход получает 409 и ничего не пишет.
-            task, _reservation = await rework_launch.reserve(db, task_id)
+            task, _reservation = await rework_launch.reserve(
+                db, task_id, confirm_no_job=body.confirm_no_job
+            )
             await repo.add_task_update(db, task_id, "human", "decision", update_content)
             closed_generation = await close_approval_for_rework(db, task_id, task)
             # #737: same trace as the accept branch — rework is the "override"
@@ -6521,6 +6534,8 @@ async def force_complete_task(
 
     # Serialize against refinement _atomic savepoints on the shared connection.
     async with write_transaction(db):
+        if status == "needs_decision":
+            await rework_launch.refuse_if_reserved(db, task_id)  # #1991
         await repo.add_task_update(db, task_id, "human", "done", comment)
         await prevention_gate.note_close_without_prevention(
             db, task, via="force_complete", actor="human"
