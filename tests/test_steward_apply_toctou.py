@@ -506,3 +506,35 @@ async def test_the_machine_review_gate_names_its_code(db, monkeypatch):
         await lifecycle._vstep_machine_review_present(state)
 
     assert reason_line(caught.value).startswith("machine_review_required: ")
+
+
+# Ветки, которыми реально отказывают ворота под одним кодом, и слово, без которого
+# фиксированный текст кода их не называет (#2040, CR gen2).
+_BRANCHES = {
+    "ci_not_green": {
+        "красный": "не зелён",
+        "отчёта CI нет или он не подтверждён": "не подтвержд",
+        "коммит сдачи не закреплён": "не закреплён",
+    },
+    "ac_tests_not_green": {
+        "красные": "не зелён",
+        "не подтверждены": "не подтвержд",
+        "локатор или раннер не разрешены": "не удалось сопоставить",
+    },
+    "class_above_policy_ceiling": {
+        "класс выше потолка": "выше потолка",
+        "класс не прочитан": "класс",
+        "потолок не прочитан": "потолок не",
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("code", "branch", "needle"),
+    [(c, b, n) for c, branches in _BRANCHES.items() for b, n in branches.items()],
+)
+def test_a_fixed_text_is_true_for_every_branch_of_its_code(code, branch, needle):
+    """Текст кода не называет одну ветку там, где код покрывает и отсутствие данных."""
+    from hub.services.refusal_reason import REASON_TEXTS
+
+    assert needle in REASON_TEXTS[code], (code, branch)
