@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import logging
+import os
 import secrets
 import sqlite3
 from pathlib import Path
@@ -39,10 +40,6 @@ from hub.integrations.registry import plugins
 
 log = logging.getLogger("hub")
 
-#: Идентификатор процесса хаба. Бронь помнит процесс, который её завёл: пока тот
-#: жив, его отправитель может ещё создать задание, и сверка бронь не трогает.
-#: После перезапуска прежнего отправителя нет - тогда сверка вправе решать.
-BOOT_ID = secrets.token_hex(8)
 #: Сколько заданий диспетчера сверка просматривает в поисках метки.
 JOBS_SCANNED = 200
 
@@ -53,59 +50,95 @@ NEEDS_HUMAN = "needs_human"
 CLOSED = "closed"
 
 
-# Единственность процесса на базе: восстановление по BOOT_ID верно, пока второго
-# живого хаба на той же базе нет. Блокировка берётся один раз на процесс и путь
-# (несколько приложений в одном процессе делят её); второй процесс не сверяет
-# брони и не заказывает доработку, пока не получит блокировку сам.
-_HELD: dict[str, list[Any]] = {}
-_FOREIGN: set[str] = set()
+# Единственность процесса на базе: восстановление по boot_id верно, пока второго
+# живого хаба на той же базе нет. Владение - явный объект: PID, открытый дескриптор
+# с удерживаемым flock и список зарегистрированных приложений. Владельцем считается
+# только тот, кто такой дескриптор держит; отсутствие отказа владением не является.
+_IMPLICIT = "implicit"
+_OWNERS: dict[str, _Ownership] = {}
+_BOOT: dict[str, Any] = {"pid": 0, "id": ""}
 
 
-def claim_process(db_path: Any) -> bool:
-    """Взять исключительное право на базу для этого процесса."""
+class _Ownership:
+    def __init__(self, handle: Any) -> None:
+        self.pid = os.getpid()
+        self.handle = handle
+        self.apps: list[Any] = []
+
+    def valid(self) -> bool:
+        return self.pid == os.getpid() and not self.handle.closed
+
+
+def boot_id() -> str:
+    """Идентификатор процесса хаба; после fork потомок получает свой."""
+    pid = os.getpid()
+    if _BOOT["pid"] != pid:
+        _BOOT["pid"], _BOOT["id"] = pid, secrets.token_hex(8)
+    return str(_BOOT["id"])
+
+
+def _drop(key: str) -> None:
+    """Убрать владение. В потомке fork дескриптор только закрывается: LOCK_UN
+    снял бы блокировку родителя (общее открытое описание файла)."""
+    owner = _OWNERS.pop(key, None)
+    if owner is not None and not owner.handle.closed:
+        owner.handle.close()
+
+
+def claim_process(db_path: Any, app: Any = None) -> bool:
+    """Взять исключительное право на базу для этого процесса; ``app`` - заявитель."""
     key = str(db_path)
-    held = _HELD.get(key)
-    if held is not None:
-        held[1] += 1
-        _FOREIGN.discard(key)
-        return True
-    try:
-        Path(key).parent.mkdir(parents=True, exist_ok=True)
-        handle = open(f"{key}.owner.lock", "a+")  # noqa: SIM115
-    except OSError:
-        # Не доказали единственность - владения нет (повтор при следующей попытке).
-        log.warning("блокировка владельца базы %s недоступна: владения нет", key)
-        _FOREIGN.add(key)
-        return False
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.close()
-        _FOREIGN.add(key)
-        return False
-    _HELD[key] = [handle, 1]
-    _FOREIGN.discard(key)
+    owner = _OWNERS.get(key)
+    if owner is not None and not owner.valid():
+        _drop(key)
+        owner = None
+    if owner is None:
+        try:
+            Path(key).parent.mkdir(parents=True, exist_ok=True)
+            handle = open(f"{key}.owner.lock", "a+")  # noqa: SIM115
+        except OSError:
+            # Не доказали единственность - владения нет (повтор при следующей попытке).
+            log.warning("блокировка владельца базы %s недоступна: владения нет", key)
+            return False
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        owner = _Ownership(handle)
+        _OWNERS[key] = owner
+    owner.apps.append(app if app is not None else "anon")
     return True
 
 
-def release_process(db_path: Any) -> None:
+def release_process(db_path: Any, app: Any = None) -> None:
+    """Снять заявку приложения; без владения (приложение lock не получало) - ничего."""
     key = str(db_path)
-    held = _HELD.get(key)
-    if held is None:
-        _FOREIGN.discard(key)
+    owner = _OWNERS.get(key)
+    if owner is None:
         return
-    held[1] -= 1
-    if held[1] <= 0:
-        del _HELD[key]
-        held[0].close()
+    token = app if app is not None else "anon"
+    if token in owner.apps:
+        owner.apps.remove(token)
+    if not owner.apps:
+        _drop(key)
+
+
+def release_all() -> None:
+    """Снять все владения процесса (остановка, чистка в тестах)."""
+    for key in list(_OWNERS):
+        _drop(key)
 
 
 def owns_db() -> bool:
-    """Этот процесс вправе сверять брони и заказывать доработку (с повтором попытки)."""
+    """Этот процесс держит дескриптор с flock и вправе сверять брони и заказывать."""
     from hub import config
 
     key = str(config.HUB_DB_PATH)
-    return key not in _FOREIGN or claim_process(key)
+    owner = _OWNERS.get(key)
+    if owner is not None and owner.valid():
+        return True
+    return claim_process(key, _IMPLICIT)
 
 
 def marker(reservation_id: int) -> str:
@@ -199,7 +232,7 @@ async def is_current(db: aiosqlite.Connection, reservation_id: int) -> bool:
 async def claim_submit(db: aiosqlite.Connection, reservation_id: int) -> str | None:
     """Токен брони для заказа или ``None``, если бронь уже закрыта.
 
-    Закрыть бронь при живом отправителе сверка не может (см. ``BOOT_ID``), так что
+    Закрыть бронь при живом отправителе сверка не может (см. ``boot_id``), так что
     ``None`` - это бронь, закрытую другим путём (задача завершена, процесс
     перезапущен): такая попытка задание не заказывает.
     """
@@ -291,7 +324,7 @@ async def reserve(
     try:
         cur = await db.execute(
             "INSERT INTO rework_launches (task_id, nonce, boot_id) VALUES (?, ?, ?)",
-            (task_id, secrets.token_hex(8), BOOT_ID),
+            (task_id, secrets.token_hex(8), boot_id()),
         )
     except sqlite3.IntegrityError as exc:
         raise _taken(task_id, "запуск доработки уже заказан") from exc
@@ -555,7 +588,7 @@ async def sweep(db: aiosqlite.Connection) -> None:
         "(state=? AND boot_id != ?) OR "
         "(state=? AND id=(SELECT MAX(id) FROM rework_launches WHERE task_id=r.task_id)) "
         "ORDER BY id",
-        (RESERVED, BOOT_ID, NEEDS_HUMAN),
+        (RESERVED, boot_id(), NEEDS_HUMAN),
     )
     for row in rows:
         held = dict(row)

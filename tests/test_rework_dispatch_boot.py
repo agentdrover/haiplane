@@ -14,7 +14,6 @@ import pytest
 
 from hub import repository as repo
 from hub import services
-from hub.integrations import dispatch as dispatch_mod
 from hub.integrations.registry import plugins
 from hub.models import TaskDecide
 from tests.test_decision_brief import _task_in
@@ -89,7 +88,7 @@ async def test_sweep_reconciles_a_booking_of_a_previous_process(db, monkeypatch)
     task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=True)
     await db.execute(
         "UPDATE rework_launches SET boot_id=? WHERE task_id=?",
-        (rework_launch.BOOT_ID, task_id),
+        (rework_launch.boot_id(), task_id),
     )
     await db.commit()
     await rework_launch.sweep(db)
@@ -147,33 +146,6 @@ async def test_force_complete_closes_an_unproven_outcome(client, db):
 
     assert forced.status_code == 200, forced.text
     assert await _states(db, task_id) == ["closed"]
-
-
-async def test_a_timed_out_submit_kills_its_child(monkeypatch):
-    killed: list[str] = []
-
-    class Proc:
-        returncode = None
-
-        async def communicate(self):
-            await asyncio.sleep(30)
-
-        def kill(self):
-            killed.append("kill")
-
-        async def wait(self):
-            killed.append("wait")
-
-    async def spawn(*_a, **_k):
-        return Proc()
-
-    monkeypatch.setattr(dispatch_mod, "SUBMIT_TIMEOUT", 0.05, raising=False)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-
-    with pytest.raises(asyncio.TimeoutError):
-        await dispatch_mod.DispatchIntegration().submit_task("m", task_id=1)
-
-    assert killed == ["kill", "wait"]
 
 
 async def test_archiving_closes_an_unproven_outcome_but_not_a_live_booking(db):

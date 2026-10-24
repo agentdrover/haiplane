@@ -46,6 +46,7 @@ async def test_a_second_instance_neither_sweeps_nor_orders(db, monkeypatch, lock
         (task_id,),
     )
     await db.commit()
+    rework_launch.release_all()  # другой процесс держит блокировку, не мы
     holder = _other_process_holds(lock_path)
     try:
         assert rework_launch.claim_process(lock_path) is False
@@ -173,9 +174,13 @@ async def test_a_forked_child_inherits_neither_ownership_nor_boot_id(
 
     assert rework_launch.claim_process(lock_path) is True
     parent_boot = rework_launch.boot_id()
-    monkeypatch.setattr(rework_launch.os, "getpid", lambda: os.getpid() + 100000)
+    # Родитель держит своё открытое описание файла (после fork их два).
+    parent_copy = os.dup(rework_launch._OWNERS[str(lock_path)].handle.fileno())
+    child_pid = os.getpid() + 100000
+    monkeypatch.setattr(rework_launch.os, "getpid", lambda: child_pid)
 
     assert rework_launch.owns_db() is False, "потомок унаследовал владение"
     assert rework_launch.boot_id() != parent_boot, "потомок унаследовал boot id"
     monkeypatch.undo()
-    rework_launch.release_process(lock_path)
+    os.close(parent_copy)
+    rework_launch.release_all()

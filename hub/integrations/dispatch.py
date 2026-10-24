@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from hub.config import DISPATCH_BIN, DISPATCH_JOBS_DIR, DISPATCH_LOGS_DIR
+from hub.process_kill import kill_process_group
 
 log = logging.getLogger(__name__)
 
@@ -383,6 +384,8 @@ class DispatchIntegration:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                # Своя сессия: kill_process_group снимает всю группу, не хаб.
+                start_new_session=True,
             )
         except (FileNotFoundError, PermissionError):
             log.warning("oc-dev-dispatch binary not found at %s", DISPATCH_BIN)
@@ -392,8 +395,9 @@ class DispatchIntegration:
                 proc.communicate(), timeout=SUBMIT_TIMEOUT
             )
         except (TimeoutError, asyncio.CancelledError):
-            proc.kill()
-            await proc.wait()
+            # Закрывает transport и ждёт не дольше потолка: на полной трубе
+            # голый wait() после kill не возвращается.
+            await kill_process_group(proc, pgid=proc.pid)
             raise
         raw = stdout.decode(errors="replace").strip()
         if proc.returncode != 0:

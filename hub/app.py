@@ -445,7 +445,7 @@ async def lifespan(app: FastAPI):
     # корутины фиксирует незакоммиченное другой — хаб описал эту дыру сам в
     # docstring get_write_lock и отложил как hardening work.
     app.state.dsn = str(config.HUB_DB_PATH)
-    if not rework_launch.claim_process(config.HUB_DB_PATH):
+    if not rework_launch.claim_process(config.HUB_DB_PATH, app):
         log.warning(
             "На базе %s работает другой экземпляр хаба: сверку броней и заказ "
             "доработки он ведёт сам, этот экземпляр их не выполняет",
@@ -487,7 +487,7 @@ async def lifespan(app: FastAPI):
         )
         set_telemetry_sink(None)
         await app.state.db.close()
-        rework_launch.release_process(config.HUB_DB_PATH)
+        rework_launch.release_process(config.HUB_DB_PATH, app)
 
 
 async def _provision_project_detached(app: FastAPI, pid: int, *, actor: str) -> None:
