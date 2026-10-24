@@ -1,0 +1,132 @@
+"""Бронь доработки #1991: один процесс на базу и отмена на COMMIT брони.
+
+Восстановление по boot_id верно, пока на одной базе живёт один процесс хаба.
+Второй экземпляр не должен ни сверять брони, ни заказывать доработку.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import fcntl
+from typing import Any
+
+import pytest
+from fastapi import HTTPException
+
+from hub import config
+from hub import repository as repo
+from hub import services
+from hub.integrations.registry import plugins
+from hub.models import TaskDecide
+from tests.test_decision_brief import _task_in
+from tests.test_rework_dispatch_once import REWORK, _crash_on_submit
+
+
+@pytest.fixture
+def lock_path(tmp_path, monkeypatch):
+    path = tmp_path / "hub.db"
+    monkeypatch.setattr(config, "HUB_DB_PATH", path)
+    return path
+
+
+def _other_process_holds(path):
+    """Другой экземпляр хаба: свой open того же файла блокировки."""
+    fd = open(f"{path}.owner.lock", "a+")  # noqa: SIM115
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+async def test_a_second_instance_neither_sweeps_nor_orders(db, monkeypatch, lock_path):
+    from hub.services import rework_launch
+
+    task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=True)
+    await db.execute(
+        "UPDATE rework_launches SET boot_id='previous-boot' WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+    holder = _other_process_holds(lock_path)
+    try:
+        assert rework_launch.claim_process(lock_path) is False
+
+        await rework_launch.sweep(db)
+        rows = await db.execute_fetchall(
+            "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
+        )
+        assert [r[0] for r in rows] == ["reserved"], "второй экземпляр сверил бронь"
+
+        other = await _task_in(db, "needs_decision", submission_generation=1)
+        with pytest.raises(HTTPException) as refused:
+            await services.decide_task(db, other, TaskDecide(**REWORK))
+        assert refused.value.status_code == 503
+        assert len(jobs["calls"]) == 1
+    finally:
+        holder.close()
+
+    # Первый экземпляр ушёл: право берётся при следующей попытке.
+    await rework_launch.sweep(db)
+    rows = await db.execute_fetchall(
+        "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    assert [r[0] for r in rows] == ["launched"]
+    rework_launch.release_process(lock_path)
+
+
+async def test_the_process_lock_is_taken_once_per_process(lock_path):
+    from hub.services import rework_launch
+
+    assert rework_launch.claim_process(lock_path) is True
+    assert rework_launch.claim_process(lock_path) is True  # второе приложение
+    rework_launch.release_process(lock_path)
+    holder = _other_process_holds(lock_path)
+    try:
+        assert rework_launch.claim_process(lock_path) is False
+    finally:
+        holder.close()
+    rework_launch.release_process(lock_path)
+
+
+async def test_a_cancel_on_the_booking_commit_frees_the_booking(db, monkeypatch):
+    """Отмена на COMMIT брони: решение записано, до release_sender раньше не доходило."""
+    from hub.services import rework_launch
+
+    sent: list[str] = []
+
+    async def submit(message: str, **_kwargs: Any) -> dict[str, Any]:
+        sent.append(message)
+        return {"job_id": f"job-{len(sent)}"}
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", submit)
+    monkeypatch.setattr(plugins.dispatch, "list_jobs", lambda limit=50: [])
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    loop = asyncio.get_running_loop()
+    seen = {"booked": False, "task": None}
+
+    def trace(statement: str) -> None:
+        if statement.startswith("INSERT INTO rework_launches"):
+            seen["booked"] = True
+        elif statement.startswith("COMMIT") and seen["booked"] and seen["task"]:
+            seen["booked"] = False
+            loop.call_soon_threadsafe(seen["task"].cancel)
+
+    await db.set_trace_callback(trace)
+    attempt = asyncio.create_task(
+        services.decide_task(db, task_id, TaskDecide(**REWORK))
+    )
+    seen["task"] = attempt
+    with pytest.raises(asyncio.CancelledError):
+        await attempt
+    await db.set_trace_callback(None)
+
+    assert sent == []
+    await rework_launch.sweep(db)
+    rows = await db.execute_fetchall(
+        "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    assert [r[0] for r in rows] == ["needs_human"], "бронь осталась занятой"
+
+    view = await services.decide_task(
+        db, task_id, TaskDecide(**REWORK, confirm_no_job=True)
+    )
+    assert view.status.value == "fix_requested" and len(sent) == 1
+    assert dict(await repo.get_task(db, task_id))["job_id"] == "job-1"
