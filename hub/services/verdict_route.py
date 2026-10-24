@@ -29,6 +29,7 @@ from typing import Any
 import aiosqlite
 
 from hub.mcp_envelope import route_line
+from hub.services.steward_apply import CeilingUnavailable
 from hub.services.result_kind import (
     AUTOMATION_REFUSAL,
     AUTOMATION_REFUSAL_CODE,
@@ -46,6 +47,7 @@ CODE_REVIEWER_PENDING = "reviewer_pending"
 CODE_STEWARD_SHADOW = "steward_shadow"
 CODE_STEWARD_ACT = "steward_act"
 CODE_ADVISOR_SKIPPED = "steward_advisor_skipped"
+CODE_APPLY_FAILED = "steward_apply_failed"
 CODE_NOT_IN_REVIEW = "not_in_review"
 
 # Коды стойки, после которых стюарда спрашивать не о чем: сдачи, отчёта или
@@ -149,6 +151,20 @@ async def _ci_integrity_refusal(
     return auto_verdict.CODE_CI_INTEGRITY, standing.reason
 
 
+async def _failed_application(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> str:
+    """Причина, если применение approve этой сдачи кончилось ``failed``, иначе пусто."""
+    from hub import repository as repo
+    from hub.services.steward_advisor import OUTCOME_FAILED
+
+    row = await repo.get_steward_judgement(db, task_id, generation, "verdict")
+    judgement = dict(row) if row is not None else {}
+    if judgement.get("advisor_outcome") != OUTCOME_FAILED:
+        return ""
+    return str(judgement.get("advisor_outcome_detail") or "причина не записана")
+
+
 async def _steward_route(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -202,11 +218,18 @@ async def _steward_route(
             CODE_STEWARD_SHADOW,
             "стюард в тени: суждение записывается, вердикт выносит человек",
         )
+    failed = await _failed_application(db, int(task["id"]), generation)
+    if failed:
+        # Применение approve этой сдачи не удалось: поллер его не повторит,
+        # вердикт остаётся человеку, и причина названа тут, а не молчанием.
+        return _human(
+            CODE_APPLY_FAILED, f"одобрение стюарда не применено: {failed}", mode
+        )
     from hub.services.steward_act_readiness import BLOCKED, ceiling_reason
 
     key = "steward_approve_max_class"
     found = ceiling_reason(
-        await steward_apply.current_ceiling(db, int(task["id"]), key),
+        await steward_apply.read_ceiling(db, int(task["id"]), key),
         task.get("risk_class"),
         key=key,
     )
@@ -265,7 +288,12 @@ async def verdict_route(
     from hub import repository as repo
     from hub.services import ci_integrity
 
-    route = await _decide_route(db, task_id, observe=observe)
+    try:
+        route = await _decide_route(db, task_id, observe=observe)
+    except CeilingUnavailable as exc:
+        # Потолок не прочитать (автопилот, стюард, советник читают его одним
+        # читателем): маршрут не падает, вердикт за человеком с названной причиной.
+        route = _human(exc.code, exc.reason)
     if route.decider == DECIDER_NONE:
         return route
     task = dict(await repo.get_task(db, task_id) or {})

@@ -42,11 +42,17 @@ from contextvars import ContextVar
 from typing import Any
 
 import aiosqlite
+from fastapi import HTTPException
 
 from hub import config
 from hub.db import fetchall
 from hub.services import gate_grounds as grounds
-from hub.services.refusal_reason import ACT_REVOKED
+from hub.services.refusal_reason import (
+    ACT_REVOKED,
+    CEILING_CHECK_FAILED,
+    REASON_TEXTS,
+    CodedRefusal,
+)
 from hub.models import RiskClass
 from hub.services.auto_approve import ladder_hits
 from hub.services.project_policy import STEWARD_CEILING_UNREADABLE
@@ -283,6 +289,43 @@ _CLEAN: ContextVar[dict[int, dict[str, Any]] | None] = ContextVar(
 STEWARD_CEILING_KEY = "steward_approve_max_class"
 
 
+class CeilingUnavailable(CodedRefusal):
+    """Потолок не удалось прочитать или проверить: «не смогли», а не «класс выше».
+
+    Причина без сырого текста исключения (он остаётся в ``__cause__`` и журнале
+    хаба); ``reason`` годится для маршрута вердикта и карточки.
+    """
+
+    def __init__(self, exc: Exception) -> None:
+        name = type(exc).__name__
+        super().__init__(
+            503, f"{CEILING_CHECK_FAILED}: {name}", code=CEILING_CHECK_FAILED
+        )
+        self.reason = f"{REASON_TEXTS[CEILING_CHECK_FAILED]} ({name})"
+
+
+@asynccontextmanager
+async def ceiling_check_guard() -> AsyncIterator[None]:
+    """Исключение проверки потолка - ``CeilingUnavailable``, а не безымянная ошибка.
+
+    Ворота и отказы (``HTTPException``) проходят как есть.
+    """
+    try:
+        yield
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise CeilingUnavailable(exc) from exc
+
+
+async def read_ceiling(
+    db: aiosqlite.Connection, task_id: int, key: str = "steward_approve_max_class"
+) -> str | None:
+    """Потолок для ВСЕХ читателей: сбой чтения - ``CeilingUnavailable`` у источника."""
+    async with ceiling_check_guard():
+        return await current_ceiling(db, task_id, key)
+
+
 @asynccontextmanager
 async def ceiling_scope() -> AsyncIterator[None]:
     """Одно применение стюарда: факт ранней проверки не переживает его."""
@@ -362,7 +405,7 @@ async def ceiling_gate(
     slot = _clean_slot(task_id)
     if slot is not None:
         slot.pop("applied", None)
-    ceiling = await current_ceiling(db, task_id, key)
+    ceiling = await read_ceiling(db, task_id, key)
     if ceiling is None:
         return None
     task = dict(await repo.get_task(db, task_id) or {})
@@ -449,7 +492,7 @@ async def ceiling_refusals(
     slot = _clean_slot(task_id)
     if slot is not None:
         slot.clear()  # решение прошлого прохода не переживает этот
-    ceiling = await current_ceiling(db, task_id)
+    ceiling = await read_ceiling(db, task_id)
     refusal = class_ceiling_refusal(ceiling, fact)
     if refusal is not None and ceiling is not None:
         refusal = await _double_clean(
@@ -1100,7 +1143,8 @@ async def apply_refusals(
     out.extend(await text_origin_refusals(db, task_id, generation))
     out.extend(await integrity_refusals(db, task_id))
     out.extend(precondition_refusals(packet))
-    out.extend(await ceiling_refusals(db, task_id, packet, statement))
+    async with ceiling_check_guard():
+        out.extend(await ceiling_refusals(db, task_id, packet, statement))
     self_authored = await self_authored_refusal(db, task_id)
     if self_authored:
         out.append(self_authored)
