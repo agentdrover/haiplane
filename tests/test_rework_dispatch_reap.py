@@ -104,3 +104,25 @@ async def test_a_full_pipe_timeout_frees_the_booking(db, monkeypatch, flooding_c
         "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
     )
     assert [r[0] for r in rows] == ["needs_human"]
+
+
+async def test_a_cancel_during_spawn_still_reaps_the_group(flooding_child, monkeypatch):
+    """Отмена, пока spawn подключает трубы: дочерний процесс не остаётся сиротой."""
+    real = asyncio.create_subprocess_exec
+
+    async def slow_attach(*args, **kwargs):
+        proc = await real(*args, **kwargs)
+        await asyncio.sleep(1.0)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", slow_attach)
+    task = asyncio.ensure_future(
+        dispatch_mod.DispatchIntegration().submit_task("m", task_id=1)
+    )
+    await asyncio.sleep(0.4)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _within(task, CEILING)
+    await asyncio.sleep(0.3)
+    assert not _alive(int(flooding_child.read_text())), "дочерний процесс жив"
