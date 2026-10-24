@@ -55,6 +55,7 @@ from hub.services.result_kind import (
     task_automation_not_applicable,
 )
 from hub.services import steward_advisor_skip as advisor_skip
+from hub.services.refusal_reason import CAP_HANDOFF, reason_line
 from hub.services import steward_cap
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
@@ -718,7 +719,7 @@ async def cap_refusal(
     (``steward_apply.write_refusal``). Причина у обоих одна и та же строка.
     """
     handoff = await steward_cap.cap_handoff(db, task_id, generation)
-    return None if handoff is None else (REFUSED_ADVISOR, handoff.reason)
+    return None if handoff is None else (CAP_HANDOFF, handoff.reason)
 
 
 async def advisor_refusal(
@@ -844,6 +845,78 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     return moved
 
 
+failure_reason = reason_line  # #2040: закрытый словарь, hub/services/refusal_reason.py
+
+
+async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
+    """Записал ли approve ЭТОГО применения (стюард): сбой мог быть после записи вердикта.
+
+    Признак - событие вердикта задачи с источником стюарда
+    (``steward_applied``), approved, то же поколение; последующий вердикт
+    человека его не скрывает. Вердикт человека, легший в гонке раньше
+    (``verdict_already_stands``), под признак не подпадает: у него нет
+    источника стюарда.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind='review_verdict_recorded' "
+        "AND task_id=? ORDER BY id DESC",
+        (int(item["task_id"]),),
+    )
+    for row in rows:
+        try:
+            payload = json.loads(dict(row)["payload"] or "{}")
+        except ValueError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("source") == "steward_applied"
+            and payload.get("verdict") == "approved"
+            and payload.get("submission_generation") == int(item["generation"])
+        ):
+            return True
+    return False
+
+
+async def _finish_outcome(
+    db: aiosqlite.Connection,
+    item: dict[str, Any],
+    stamp: str,
+    outcome: str,
+    detail: str,
+) -> bool:
+    """Финальная запись исхода, условная ТОЙ ЖЕ меткой; ``True`` - исход записан.
+
+    Если применение уже переведено в escalated (прервано и названо вслух),
+    чужой исход не перезаписывается. Исход ``failed`` с причиной (#2040) -
+    ровно одна строка в ленте задачи: запись условна, а ``failed`` поллер
+    больше не выбирает, поэтому повторные тики её не дублируют.
+    """
+    final = await db.execute(
+        "UPDATE steward_judgements SET advisor_outcome=?, "
+        "advisor_outcome_detail=? "
+        "WHERE id=? AND advisor_outcome=? AND advisor_claimed_at=?",
+        (outcome, detail, item["id"], _OUTCOME_CLAIMED, stamp),
+    )
+    if final.rowcount == 1 and outcome == OUTCOME_FAILED and detail:
+        recorded = await _approve_recorded(db, item)
+        head = (
+            "Одобрение стюарда записано, но следующий шаг применения не выполнен"
+            if recorded
+            else "Одобрение стюарда не применено, решает человек"
+        )
+        await repo.add_task_update(
+            db,
+            int(item["task_id"]),
+            "hub",
+            "alert",
+            f"{head}: сдача {item['generation']}, причина - {detail}",
+            author_kind="hub",
+        )
+    await db.commit()
+    return final.rowcount == 1
+
+
 async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
     """Применить approve судьи там, где советник уже ответил (или не ответит).
 
@@ -884,6 +957,7 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
         if await steward_cap.cap_handoff(db, task_id, generation) is not None:
             continue  # #1915: сдача у человека до reset_at — исход не применяется
         stamp = await _stamp_now(db)
+        detail = ""
         cursor = await db.execute(
             "UPDATE steward_judgements SET advisor_outcome=?, "
             "advisor_claimed_at=? "
@@ -899,6 +973,7 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
         except Exception as exc:  # noqa: BLE001 — исход записывается в любом случае
             log.warning("advisor outcome not applied for #%s: %s", task_id, exc)
             outcome = OUTCOME_FAILED
+            detail = failure_reason(exc)  # #2040: причина не остаётся в логе
         else:
             if result is None:
                 outcome = OUTCOME_SKIPPED
@@ -910,15 +985,6 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
                     if result[0] == ESCALATED_TO_HUMAN
                     else OUTCOME_SKIPPED
                 )
-        # Финальная запись исхода условна ТОЙ ЖЕ меткой: если применение уже
-        # переведено в escalated (прервано и названо вслух), чужой исход не
-        # перезаписывается.
-        final = await db.execute(
-            "UPDATE steward_judgements SET advisor_outcome=? "
-            "WHERE id=? AND advisor_outcome=? AND advisor_claimed_at=?",
-            (outcome, item["id"], _OUTCOME_CLAIMED, stamp),
-        )
-        await db.commit()
-        if final.rowcount == 1:
+        if await _finish_outcome(db, item, stamp, outcome, detail):
             applied += 1
     return applied

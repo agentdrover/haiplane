@@ -20,6 +20,7 @@ from fastapi import HTTPException, status
 
 from hub import commit_scope, config
 from hub import db as db_module
+from hub.services.refusal_reason import CodedRefusal
 from hub.actionable_errors import (
     empty_resubmission_detail,
     archive_active_work_detail,
@@ -4495,9 +4496,10 @@ async def _vstep_machine_review_present(state: VerdictContext) -> None:
 
         gap = await machine_review_gap(state.db, state.task)
         if gap:
-            raise HTTPException(
+            raise CodedRefusal(
                 422,
                 f"machine-review обязателен для аппрува этой задачи: {gap}",
+                code="machine_review_required",
             )
 
 
@@ -4545,10 +4547,11 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
         )
     task = dict(await repo.get_task(state.db, state.task_id) or state.task)
     if int(task.get("submission_generation") or 0) != state.expected_generation:
-        raise HTTPException(
+        raise CodedRefusal(
             409,
             f"вердикт о сдаче {state.expected_generation} не записан: поколение "
             "уже другое",
+            code="generation_moved",
         )
     if state.applied_by_steward:
         # #2037: право стюарда на одобрение (делегирование verdict и cap-handoff)

@@ -49,6 +49,7 @@ from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.services import watch_notices
+from hub.services.refusal_reason import CodedRefusal
 from hub.models import ReviewVerdict, TaskReviewVerdict
 from hub.services.result_kind import (
     AUTOMATION_REFUSAL,
@@ -196,12 +197,11 @@ async def apply_judgement(
 
         refusal = await advisor_refusal(db, task_id, generation)
         if refusal is not None:
-            raise HTTPException(
+            raise CodedRefusal(
                 409,
-                detail=(
-                    f"approve судьи не применяется без согласия советника "
-                    f"({refusal[0]}): {refusal[1]}"
-                ),
+                f"approve судьи не применяется без согласия советника "
+                f"({refusal[0]}): {refusal[1]}",
+                code=refusal[0],
             )
         await _record(db, task_id, ReviewVerdict.approved, generation, claim=claim)
         return APPLIED, f"approve применён к сдаче {generation}"
@@ -246,13 +246,12 @@ def _refuse_if_the_submission_moved(task: dict[str, Any], generation: int) -> No
     live = int(task.get("submission_generation") or 0)
     if live == generation:
         return
-    raise HTTPException(
+    raise CodedRefusal(
         409,
-        detail=(
-            f"суждение о сдаче {generation}, а живая сдача — {live}: "
-            "применять его значило бы записать вердикт о коде, которого "
-            "на ветке уже нет"
-        ),
+        f"суждение о сдаче {generation}, а живая сдача — {live}: "
+        "применять его значило бы записать вердикт о коде, которого "
+        "на ветке уже нет",
+        code="submission_moved",
     )
 
 
@@ -270,13 +269,12 @@ def _refuse_if_the_verdict_is_taken(task: dict[str, Any], generation: int) -> No
     verdict_generation = task.get("review_verdict_generation")
     if not stored or verdict_generation != generation:
         return
-    raise HTTPException(
+    raise CodedRefusal(
         409,
-        detail=(
-            f"на сдачу {generation} вердикт уже записан ({stored}) — "
-            "суждение стюарда его не перезаписывает: человек старше, и "
-            "повторное применение тоже"
-        ),
+        f"на сдачу {generation} вердикт уже записан ({stored}) — "
+        "суждение стюарда его не перезаписывает: человек старше, и "
+        "повторное применение тоже",
+        code="verdict_taken",
     )
 
 
