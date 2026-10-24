@@ -245,11 +245,21 @@ async def resolve(
     from_state: str = RESERVED,
 ) -> bool:
     """Закрыть бронь условно: только из ``from_state``. Коммит - за вызывающим."""
-    cur = await db.execute(
+    sql = (
         "UPDATE rework_launches SET state=?, job_id=?, reason=?, "
-        "resolved_at=datetime('now') WHERE id=? AND state=?",
-        (state, job_id, reason, reservation_id, from_state),
+        "resolved_at=datetime('now') WHERE id=? AND state=?"
     )
+    if from_state == NEEDS_HUMAN:
+        # Неснятый исход привязывается только пока он последний заказ задачи:
+        # повтор решения человека его уже заменил.
+        sql += (
+            " AND id=(SELECT MAX(id) FROM rework_launches WHERE task_id="
+            "(SELECT task_id FROM rework_launches WHERE id=?))"
+        )
+    args: tuple[Any, ...] = (state, job_id, reason, reservation_id, from_state)
+    if from_state == NEEDS_HUMAN:
+        args += (reservation_id,)
+    cur = await db.execute(sql, args)
     return (cur.rowcount or 0) > 0
 
 
@@ -317,8 +327,13 @@ async def note_unknown_outcome(
         "alert",
         f"Заказ доработки оборвался ({type(error).__name__}): принял ли диспетчер "
         f"задание, неизвестно. Бронь №{reservation_id} не даёт заказать второе; "
-        "после перезапуска хаба сверка проверит задания диспетчера и либо свяжет "
+        "сверка проверит задания диспетчера и либо свяжет "
         "задачу с найденным, либо вернёт решение человеку.",
+    )
+    # Отправитель этого заказа закончил (вызов вернулся или оборвался): живого,
+    # кто мог бы создать задание, нет, и сверка вправе решать без перезапуска.
+    await db.execute(
+        "UPDATE rework_launches SET boot_id='' WHERE id=?", (reservation_id,)
     )
     await db.commit()
 

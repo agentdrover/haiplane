@@ -5899,7 +5899,7 @@ async def _dispatch_rework(
         result = await plugins.dispatch.submit_task(
             message, runtime=runtime, task_id=task_id
         )
-    except Exception as exc:
+    except BaseException as exc:
         # Принял ли диспетчер задание, неизвестно: бронь остаётся и держит повтор.
         await rework_launch.note_unknown_outcome(db, task_id, reservation_id, exc)
         raise

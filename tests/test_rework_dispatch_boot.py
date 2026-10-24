@@ -87,6 +87,11 @@ async def test_sweep_reconciles_a_booking_of_a_previous_process(db, monkeypatch)
     from hub.services import rework_launch
 
     task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=True)
+    await db.execute(
+        "UPDATE rework_launches SET boot_id=? WHERE task_id=?",
+        (rework_launch.BOOT_ID, task_id),
+    )
+    await db.commit()
     await rework_launch.sweep(db)
     assert await _states(db, task_id) == ["reserved"], "тот же процесс: не трогать"
 
