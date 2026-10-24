@@ -3390,10 +3390,12 @@ async def web_decide_task(
     # inbox" needs its own flag rather than inbox_project being present.
     from_inbox: bool = Form(False),
     inbox_project: str = Form(""),
+    confirm_no_job: bool = Form(False),
 ):
     _require_human_web(request)
     try:
         body = TaskDecide(
+            confirm_no_job=confirm_no_job,
             action=action,
             instructions=instructions,
             decision_summary=decision_summary,

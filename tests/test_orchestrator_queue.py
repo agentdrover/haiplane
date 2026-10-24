@@ -178,8 +178,6 @@ async def test_shadow_mode_writes_one_event_and_touches_no_task(db):
     Проект в режиме off и проект с нечитаемым режимом (#835) событий не
     получают вовсе.
     """
-    from hub import poller
-
     shadow = await _project(db, "oq-ac3", {"orchestrator_queue": "shadow"})
     off = await _project(db, "oq-off", {})
     bogus = await _project(db, "oq-bogus", {})
@@ -196,8 +194,8 @@ async def test_shadow_mode_writes_one_event_and_touches_no_task(db):
     before = await _snapshot(db)
     updates_before = await fetchall(db, "SELECT COUNT(*) AS n FROM task_updates")
 
-    await poller._sweep_orchestrator_queue(db)
-    await poller._sweep_orchestrator_queue(db)
+    await oq.run_sweep(db)
+    await oq.run_sweep(db)
 
     events = await _candidate_events(db, int(shadow["id"]))
     assert len(events) == 1, events
@@ -211,15 +209,13 @@ async def test_shadow_mode_writes_one_event_and_touches_no_task(db):
 
 
 async def test_shadow_mode_writes_again_when_the_answer_changes(db):
-    from hub import poller
-
     shadow = await _project(db, "oq-change", {"orchestrator_queue": "shadow"})
     pid = int(shadow["id"])
     first = await _task(db, pid, areas=["hub/c.py"])
-    await poller._sweep_orchestrator_queue(db)
+    await oq.run_sweep(db)
     await repo.update_task(db, first, status="running")
     await db.commit()
-    await poller._sweep_orchestrator_queue(db)
+    await oq.run_sweep(db)
 
     events = await _candidate_events(db, pid)
     assert [e["next_task_id"] for e in events] == [first, None]

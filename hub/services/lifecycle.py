@@ -82,6 +82,7 @@ from hub.services import (
     finding_outcome,
     owner_minutes,
     resubmission_guard,
+    rework_launch,
     verdict_guard,
 )
 from hub.services import ci_contract, ci_integrity, ci_trust
@@ -4070,6 +4071,8 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         await ci_trust.recheck_in_transaction(
             db, lambda: _step_bug_red_test(state), lambda: _step_ci_before_submit(state)
         )
+        if task["status"] == "needs_decision":
+            await rework_launch.refuse_if_unresolved(db, task_id)  # #1991
         if not await repo.transition_status_if(
             db,
             task_id,
@@ -5862,9 +5865,31 @@ async def return_to_work(
 
 
 async def _dispatch_rework(
-    db: aiosqlite.Connection, task_id: int, task: dict[str, Any], instructions: str
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    instructions: str,
+    reservation_id: int,
 ) -> None:
-    """Rework commit-задачи после арбитража: fix-задание или, без него, open."""
+    """Rework commit-задачи после арбитража: fix-задание или, без него, open.
+
+    Любой сбой по пути (сеть, отмена, запись результата) освобождает бронь для
+    сверки: отправитель закончил, и висеть ей до перезапуска хаба незачем.
+    """
+    try:
+        await _order_rework(db, task_id, task, instructions, reservation_id)
+    except BaseException:
+        await rework_launch.release_sender(db, reservation_id)
+        raise
+
+
+async def _order_rework(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    instructions: str,
+    reservation_id: int,
+) -> None:
     message = plugins.dispatch.build_fix_message(
         task_id=task_id,
         title=task["title"],
@@ -5874,16 +5899,67 @@ async def _dispatch_rework(
         max_cycles=config.MAX_REVIEW_CYCLES,
     )
     runtime = task.get("runtime", "auto")
-    result = await plugins.dispatch.submit_task(
-        message, runtime=runtime, task_id=task_id
-    )
+    # Право заказать берётся условным UPDATE брони этой попытки: закрытую
+    # сверкой бронь права не даёт, а взявшая право удерживает бронь от сверки.
+    nonce = await rework_launch.claim_submit(db, reservation_id)
+    if nonce is None:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Бронь №{reservation_id} закрыта, пока этот запрос стоял: он задание "
+            "не заказывает (заказ ведёт другая бронь).",
+        )
+        await db.commit()
+        return
+    message += "\n\n" + rework_launch.marker_line(reservation_id, task_id, nonce)
+    try:
+        result = await plugins.dispatch.submit_task(
+            message, runtime=runtime, task_id=task_id
+        )
+    except BaseException as exc:
+        # Принял ли диспетчер задание, неизвестно: бронь остаётся и держит повтор.
+        await rework_launch.note_unknown_outcome(db, task_id, reservation_id, exc)
+        raise
     job_id = result.get("job_id")
     if job_id:
-        await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
+        await rework_launch.settle_launched(db, reservation_id, task_id, job_id)
+        return
+    if "raw" in result:
+        # Вывод диспетчера не разобран, а код возврата 0: задание могло быть
+        # принято. Это неизвестный исход, а не отказ - бронь остаётся до сверки.
+        await rework_launch.note_unknown_outcome(
+            db, task_id, reservation_id, ValueError("ответ диспетчера не разобран")
+        )
+        return
+    async with write_transaction(db):
+        declined = await rework_launch.resolve(
+            db, reservation_id, rework_launch.DECLINED, reason="диспетчер не дал job_id"
+        )
+        row = await repo.get_task(db, task_id)
+        if declined and row is not None and dict(row)["status"] == "needs_decision":
+            await repo.update_task(db, task_id, status="open")
+            await reset_mis_issued_assignment(db, task_id, task)
+
+
+async def _after_rework_decision(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    instructions: str,
+    reservation_id: int,
+) -> None:
+    if is_state(task):
+        # #1647: rework задачи-состояния не заказывает headless-задание - её
+        # руками делает человек или агент в pair. Задача возвращается в open
+        # (как при return-to-work): постановку можно править, затем новая сдача.
+        from hub.services.state_task import rework_without_dispatch
+
+        await rework_without_dispatch(db, task_id)
+        await rework_launch.close_for_task(db, task_id, "state-задача: без задания")
     else:
-        await repo.update_task(db, task_id, status="open")
-        await reset_mis_issued_assignment(db, task_id, task)
-    await db.commit()
+        await _dispatch_rework(db, task_id, task, instructions, reservation_id)
 
 
 async def decide_task(
@@ -5915,35 +5991,40 @@ async def decide_task(
         update_content = "Human accepted task after arbiter review."
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
-        await repo.add_task_update(db, task_id, "human", "decision", update_content)
-        await prevention_gate.note_close_without_prevention(
-            db, task, via="decide_accept", actor="human"
-        )
-        await repo.update_task(db, task_id, status="completed")
-        await repo.insert_event(
-            db,
-            kind="task_completed",
-            task_id=task_id,
-            actor="human",
-            payload={"via": "decide_accept"},
-        )
-        # #737: the decision gate is a human gate like approve and verdict,
-        # but until this event it left no machine-readable trace of the
-        # OUTCOME — accept vs rework — so its override-rate was uncountable.
-        # entered_at is when the task hit needs_decision (status_entered_at
-        # advances only on real status changes, #416), which makes the queue
-        # wait computable.
-        await repo.insert_event(
-            db,
-            kind="task_decided",
-            task_id=task_id,
-            actor="human",
-            payload={
-                "action": "accept",
-                "entered_at": task.get("status_entered_at") or "",
-                **owner_minutes.stamp(who),
-            },
-        )
+        async with write_transaction(db):
+            # #1991: вход потребляется под write-локом: принять нельзя, пока
+            # доработка заказана, и второе принятие не пишется.
+            await rework_launch.require_entry(db, task_id)
+            await rework_launch.close_open(db, task_id, "задача принята человеком")
+            await repo.add_task_update(db, task_id, "human", "decision", update_content)
+            await prevention_gate.note_close_without_prevention(
+                db, task, via="decide_accept", actor="human"
+            )
+            await repo.update_task(db, task_id, status="completed")
+            await repo.insert_event(
+                db,
+                kind="task_completed",
+                task_id=task_id,
+                actor="human",
+                payload={"via": "decide_accept"},
+            )
+            # #737: the decision gate is a human gate like approve and verdict,
+            # but until this event it left no machine-readable trace of the
+            # OUTCOME — accept vs rework — so its override-rate was uncountable.
+            # entered_at is when the task hit needs_decision (status_entered_at
+            # advances only on real status changes, #416), which makes the queue
+            # wait computable.
+            await repo.insert_event(
+                db,
+                kind="task_decided",
+                task_id=task_id,
+                actor="human",
+                payload={
+                    "action": "accept",
+                    "entered_at": task.get("status_entered_at") or "",
+                    **owner_minutes.stamp(who),
+                },
+            )
         await db.commit()
         # #897: the acceptance is done and stays done — this only refuses to
         # let it be silent. On 21.08.2026 exactly this transition left #878 and
@@ -5970,37 +6051,45 @@ async def decide_task(
         update_content = f"Human requested rework after arbiter review: {instructions}"
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
-        await repo.add_task_update(db, task_id, "human", "decision", update_content)
-        closed_generation = await close_approval_for_rework(db, task_id, task)
-        # #737: same trace as the accept branch — rework is the "override"
-        # outcome of the decision gate.
-        await repo.insert_event(
-            db,
-            kind="task_decided",
-            task_id=task_id,
-            actor="human",
-            payload={
-                "action": "rework",
-                "entered_at": task.get("status_entered_at") or "",
-                # #1286: how many approvals a rework revokes is a number
-                # somebody will want; reading it out of feed prose is not a
-                # way to count. Null when there was nothing to close.
-                "closed_verdict_generation": closed_generation,
-                **owner_minutes.stamp(who),
-            },
-        )
-        await db.commit()
-
-        if is_state(task):
-            # #1647: rework задачи-состояния не заказывает headless-задание —
-            # её руками делает человек или агент в pair. Задача возвращается в
-            # open (как при return-to-work): постановку можно править, затем
-            # новая сдача.
-            from hub.services.state_task import rework_without_dispatch
-
-            await rework_without_dispatch(db, task_id)
-        else:
-            await _dispatch_rework(db, task_id, task, instructions)
+        reservation_id = 0
+        try:
+            async with write_transaction(db):
+                # #1991: вход needs_decision потребляется ВМЕСТЕ с записью решения;
+                # проигравший вход получает 409 и ничего не пишет.
+                task, reservation_id = await rework_launch.reserve(
+                    db, task_id, confirm_no_job=body.confirm_no_job
+                )
+                await repo.add_task_update(
+                    db, task_id, "human", "decision", update_content
+                )
+                closed_generation = await close_approval_for_rework(db, task_id, task)
+                # #737: same trace as the accept branch — rework is the "override"
+                # outcome of the decision gate.
+                await repo.insert_event(
+                    db,
+                    kind="task_decided",
+                    task_id=task_id,
+                    actor="human",
+                    payload={
+                        "action": "rework",
+                        "entered_at": task.get("status_entered_at") or "",
+                        # #1286: how many approvals a rework revokes is a number
+                        # somebody will want; reading it out of feed prose is not a
+                        # way to count. Null when there was nothing to close.
+                        "closed_verdict_generation": closed_generation,
+                        **owner_minutes.stamp(who),
+                    },
+                )
+            await db.commit()
+            await _after_rework_decision(
+                db, task_id, task, instructions, reservation_id
+            )
+        except BaseException:
+            # Любой сбой или отмена после коммита брони, включая сам COMMIT:
+            # отправителя нет, бронь освобождается для сверки.
+            if reservation_id:
+                await rework_launch.release_sender(db, reservation_id)
+            raise
         await log_activity(
             db,
             "task_decided",
@@ -6502,6 +6591,26 @@ async def force_complete_task(
 
     # Serialize against refinement _atomic savepoints on the shared connection.
     async with write_transaction(db):
+        if status == "needs_decision":
+            await rework_launch.refuse_if_reserved(db, task_id)  # #1991
+        # Снимок статуса и заданий взят до лока: задача, ушедшая в работу
+        # (rework записал job_id), закрытой силой не становится.
+        fresh = dict(await repo.get_task(db, task_id) or {})
+        if (
+            fresh.get("status"),
+            fresh.get("job_id") or "",
+            fresh.get("review_job_id") or "",
+        ) != (
+            status,
+            task.get("job_id") or "",
+            task.get("review_job_id") or "",
+        ):
+            raise HTTPException(
+                409,
+                f"Task #{task_id} changed while being force-completed "
+                f"(status now {fresh.get('status')}); nothing was changed",
+            )
+        await rework_launch.close_open(db, task_id, "задача закрыта force-complete")
         await repo.add_task_update(db, task_id, "human", "done", comment)
         await prevention_gate.note_close_without_prevention(
             db, task, via="force_complete", actor="human"
@@ -6973,6 +7082,10 @@ async def archive_task(
                 ),
             )
         await repo.set_tasks_archived(db, ids, 1)
+        for archived_id in ids:
+            await rework_launch.close_open(
+                db, archived_id, "задача архивирована", reserved=False
+            )
         for entry in blocking:
             await repo.add_task_update(
                 db,
