@@ -27,6 +27,7 @@ import fcntl
 import logging
 import secrets
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -69,12 +70,13 @@ def claim_process(db_path: Any) -> bool:
         _FOREIGN.discard(key)
         return True
     try:
+        Path(key).parent.mkdir(parents=True, exist_ok=True)
         handle = open(f"{key}.owner.lock", "a+")  # noqa: SIM115
     except OSError:
-        log.warning(
-            "блокировка владельца базы %s недоступна: считаем себя владельцем", key
-        )
-        return True
+        # Не доказали единственность - владения нет (повтор при следующей попытке).
+        log.warning("блокировка владельца базы %s недоступна: владения нет", key)
+        _FOREIGN.add(key)
+        return False
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

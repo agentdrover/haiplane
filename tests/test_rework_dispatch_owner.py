@@ -131,3 +131,18 @@ async def test_a_cancel_on_the_booking_commit_frees_the_booking(db, monkeypatch)
     )
     assert view.status.value == "fix_requested" and len(sent) == 1
     assert dict(await repo.get_task(db, task_id))["job_id"] == "job-1"
+
+
+async def test_the_lock_creates_its_directory_and_never_grants_ownership_on_error(
+    tmp_path,
+):
+    from hub.services import rework_launch
+
+    fresh = tmp_path / "not-yet" / "hub.db"
+    assert rework_launch.claim_process(fresh) is True
+    rework_launch.release_process(fresh)
+
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    assert rework_launch.claim_process(blocker / "hub.db") is False
+    rework_launch.release_process(blocker / "hub.db")
