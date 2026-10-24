@@ -236,3 +236,37 @@ async def test_a_stale_sweep_does_not_link_a_job_to_a_superseded_booking(
 
     assert result == "needs_human"
     assert (await repo.get_task(db, task_id))["job_id"] in (None, "")
+
+
+async def test_a_failed_result_write_frees_the_booking_for_reconciliation(
+    db, monkeypatch
+):
+    """Диспетчер принял задание, а запись результата сорвалась: бронь не вечна."""
+    from hub.services import rework_launch
+
+    jobs: dict[str, Any] = {}
+
+    async def accepts(message: str, **_kwargs: Any) -> dict[str, Any]:
+        jobs["job-5"] = {"id": "job-5", "message": message}
+        return {"job_id": "job-5"}
+
+    async def broken(*_a: Any, **_k: Any) -> bool:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", accepts)
+    monkeypatch.setattr(
+        plugins.dispatch, "list_jobs", lambda limit=50: list(jobs.values())
+    )
+    monkeypatch.setattr(rework_launch, "settle_launched", broken)
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    with pytest.raises(RuntimeError):
+        await services.decide_task(db, task_id, TaskDecide(**REWORK))
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        plugins.dispatch, "list_jobs", lambda limit=50: list(jobs.values())
+    )
+
+    await rework_launch.sweep(db)
+
+    assert await _states(db, task_id) == ["launched"]
+    assert (await repo.get_task(db, task_id))["job_id"] == "job-5"
