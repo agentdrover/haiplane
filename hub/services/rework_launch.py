@@ -69,6 +69,11 @@ class _Ownership:
         return self.pid == os.getpid() and not self.handle.closed
 
 
+def _key(db_path: Any) -> str:
+    """Один файл базы - один ключ, как бы к нему ни обратились (симлинк)."""
+    return os.path.realpath(str(db_path))
+
+
 def boot_id() -> str:
     """Идентификатор процесса хаба; после fork потомок получает свой."""
     pid = os.getpid()
@@ -109,14 +114,14 @@ def _acquire(key: str) -> bool:
 
 def claim_process(db_path: Any, app: Any = None) -> bool:
     """Зарегистрировать приложение и взять право на базу, если оно свободно."""
-    key = str(db_path)
+    key = _key(db_path)
     _APPS.setdefault(key, []).append(app if app is not None else "anon")
     return _acquire(key)
 
 
 def release_process(db_path: Any, app: Any = None) -> None:
     """Снять заявку приложения; с уходом последнего закрывается и дескриптор."""
-    key = str(db_path)
+    key = _key(db_path)
     apps = _APPS.get(key)
     if apps is None:
         return
@@ -143,7 +148,7 @@ def owns_db() -> bool:
     """
     from hub import config
 
-    key = str(config.HUB_DB_PATH)
+    key = _key(config.HUB_DB_PATH)
     return key in _APPS and _acquire(key)
 
 
