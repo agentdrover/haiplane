@@ -1467,3 +1467,60 @@ async def test_independence_nobody_established_is_not_a_second_look(
         machine_review_fields={**owned, "is_current": True, "incomplete": False}
     )
     assert decision.allowed, decision.reason
+
+
+async def test_cap_handoff_texts_do_not_claim_missing_consent(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Передача по суточному потолку названа потолком, а не отсутствием согласия.
+
+    Согласие советника при этом действительно. Три места текста: деталь отказа
+    прямого применения, возвращаемая деталь самостоятельного применения и
+    строка в карточке. Без передачи прежние тексты отсутствия согласия те же.
+    """
+    from hub.services.refusal_reason import CAP_HANDOFF, REASON_TEXTS
+    from hub.services.steward_advisor import advisor_refusal
+    from hub.services.steward_applied import CodedRefusal, apply_self_approval
+    from tests.steward_cap_support import hand_to_the_human_by_the_cap
+
+    false_claims = ("без согласия советника", "Второго мнения нет", "не согласен")
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    _grant_act(monkeypatch)
+
+    # Контроль: без передачи и без согласия тексты прежние.
+    project_id = await _project(db, "cap-texts-control")
+    plain = await _client_task(db, project_id)
+    await _judge(db, plain, verdict="approve")
+    with pytest.raises(CodedRefusal) as plain_exc:
+        await apply_judgement(db, plain, 1)
+    assert "без согласия советника" in plain_exc.value.detail
+    outcome, detail = await apply_self_approval(db, plain, 1)
+    assert outcome == ESCALATED_TO_HUMAN and "советник не согласен" in detail
+    assert any("Второго мнения нет" in line for line in await _steward_lines(db, plain))
+
+    # Передача по потолку при действительном согласии.
+    project_id = await _project(db, "cap-texts")
+    capped = await _client_task(db, project_id)
+    await _judge(db, capped, verdict="approve")
+    await _concur(db, monkeypatch, capped)
+    assert await advisor_refusal(db, capped, 1) is None, "согласие действительно"
+    await hand_to_the_human_by_the_cap(db, monkeypatch, capped, project_id)
+    text = REASON_TEXTS[CAP_HANDOFF]
+
+    with pytest.raises(CodedRefusal) as exc:
+        await apply_judgement(db, capped, 1)
+    assert exc.value.code == CAP_HANDOFF
+    assert text in exc.value.detail
+    assert not any(claim in exc.value.detail for claim in false_claims)
+
+    outcome, detail = await apply_self_approval(db, capped, 1)
+    assert outcome == ESCALATED_TO_HUMAN
+    assert text in detail and not any(claim in detail for claim in false_claims)
+    lines = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, capped)
+        if "Самостоятельного одобрения не будет" in dict(u)["content"]
+    ]
+    assert lines and text in lines[-1]
+    assert not any(claim in lines[-1] for claim in false_claims)
