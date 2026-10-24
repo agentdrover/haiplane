@@ -5942,6 +5942,25 @@ async def _order_rework(
             await reset_mis_issued_assignment(db, task_id, task)
 
 
+async def _after_rework_decision(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    instructions: str,
+    reservation_id: int,
+) -> None:
+    if is_state(task):
+        # #1647: rework задачи-состояния не заказывает headless-задание - её
+        # руками делает человек или агент в pair. Задача возвращается в open
+        # (как при return-to-work): постановку можно править, затем новая сдача.
+        from hub.services.state_task import rework_without_dispatch
+
+        await rework_without_dispatch(db, task_id)
+        await rework_launch.close_for_task(db, task_id, "state-задача: без задания")
+    else:
+        await _dispatch_rework(db, task_id, task, instructions, reservation_id)
+
+
 async def decide_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -6056,19 +6075,15 @@ async def decide_task(
                     **owner_minutes.stamp(who),
                 },
             )
-        await db.commit()
-
-        if is_state(task):
-            # #1647: rework задачи-состояния не заказывает headless-задание —
-            # её руками делает человек или агент в pair. Задача возвращается в
-            # open (как при return-to-work): постановку можно править, затем
-            # новая сдача.
-            from hub.services.state_task import rework_without_dispatch
-
-            await rework_without_dispatch(db, task_id)
-            await rework_launch.close_for_task(db, task_id, "state-задача: без задания")
-        else:
-            await _dispatch_rework(db, task_id, task, instructions, reservation_id)
+        try:
+            await db.commit()
+            await _after_rework_decision(
+                db, task_id, task, instructions, reservation_id
+            )
+        except BaseException:
+            # Решение записано, заказ не дошёл до диспетчера: отправителя нет.
+            await rework_launch.release_sender(db, reservation_id)
+            raise
         await log_activity(
             db,
             "task_decided",

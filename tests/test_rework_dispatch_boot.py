@@ -270,3 +270,26 @@ async def test_a_failed_result_write_frees_the_booking_for_reconciliation(
 
     assert await _states(db, task_id) == ["launched"]
     assert (await repo.get_task(db, task_id))["job_id"] == "job-5"
+
+
+async def test_a_failure_after_the_decision_commit_frees_the_booking(db, monkeypatch):
+    """Решение записано, а обработка упала до диспетчера: бронь не вечна."""
+    from hub.services import rework_launch, state_task
+    from tests.state_support import make_state_task
+
+    async def boom(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("упало после коммита решения")
+
+    monkeypatch.setattr(state_task, "rework_without_dispatch", boom)
+    task_id = await make_state_task(db)
+    await db.execute(
+        "UPDATE tasks SET status='needs_decision', submission_generation=1 WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    with pytest.raises(RuntimeError):
+        await services.decide_task(db, task_id, TaskDecide(**REWORK))
+
+    await rework_launch.sweep(db)
+
+    assert await _states(db, task_id) == ["needs_human"]
