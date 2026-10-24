@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -378,8 +379,8 @@ class DispatchIntegration:
             env["HAIPLANE_OPENROUTER_DEV_AGENT"] = agent
             env["HAIPLANE_VAST_DEV_AGENT"] = agent
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
+        spawn = asyncio.ensure_future(
+            asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -387,6 +388,17 @@ class DispatchIntegration:
                 # Своя сессия: kill_process_group снимает всю группу, не хаб.
                 start_new_session=True,
             )
+        )
+        try:
+            try:
+                proc = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                # Отмена в момент spawn: процесс уже может работать. Дожидаемся
+                # его и снимаем всю группу, иначе он остаётся сиротой.
+                with contextlib.suppress(Exception):
+                    spawned = await spawn
+                    await kill_process_group(spawned, pgid=spawned.pid)
+                raise
         except (FileNotFoundError, PermissionError):
             log.warning("oc-dev-dispatch binary not found at %s", DISPATCH_BIN)
             return {"error": f"dispatch binary not found: {DISPATCH_BIN}"}
