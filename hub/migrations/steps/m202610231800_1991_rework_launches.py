@@ -11,6 +11,9 @@
 ``declined`` (диспетчер задания не дал, задача ушла в open) | ``needs_human``
 (исход заказа установить нельзя, повторного запуска нет) | ``closed`` (задача
 ушла из needs_decision другим путём). Строка живёт, пока живёт задача.
+
+``nonce`` - случайный токен брони: уходит только в текст её заказа, и по нему
+сверка отличает своё задание от чужого, цитирующего метку.
 """
 
 MIGRATIONS = [
@@ -32,5 +35,9 @@ MIGRATIONS = [
         "index_rework_launches_one_reserved_per_task",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_rework_launches_one_reserved "
         "ON rework_launches(task_id) WHERE state = 'reserved'",
+    ),
+    (
+        "add_rework_launches_nonce",
+        "ALTER TABLE rework_launches ADD COLUMN nonce TEXT NOT NULL DEFAULT ''",
     ),
 ]

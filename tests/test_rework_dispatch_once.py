@@ -473,13 +473,14 @@ async def test_the_booking_marker_matches_the_whole_line(db, monkeypatch):
         plugins.dispatch,
         "list_jobs",
         lambda limit=50: [
-            {"id": "other", "message": rework_launch.marker_line(10, 5)},
-            {"id": "wrong-task", "message": rework_launch.marker_line(1, 6)},
+            {"id": "other", "message": rework_launch.marker_line(10, 5, "ab")},
+            {"id": "wrong-task", "message": rework_launch.marker_line(1, 6, "ab")},
         ],
     )
 
-    assert await rework_launch._find_job(1, 5) == (None, False)
-    found, ambiguous = await rework_launch._find_job(10, 5)
+    assert await rework_launch._find_job(1, 5, "ab") == (None, False)
+    assert await rework_launch._find_job(10, 5, "zz") == (None, False)
+    found, ambiguous = await rework_launch._find_job(10, 5, "ab")
     assert found["id"] == "other" and not ambiguous
 
 
@@ -728,3 +729,48 @@ async def test_resubmission_is_refused_while_an_unproven_outcome_stands(
     assert refused.value.status_code == 409
     assert "confirm_no_job" in refused.value.detail
     assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
+
+
+async def test_an_attempt_holding_the_right_to_submit_is_not_swept(
+    client, db, monkeypatch
+):
+    """Бронь состарилась, пока попытка стояла; взяв право, она держит бронь от сверки."""
+    from hub.services import lifecycle, rework_launch
+
+    in_net, release = asyncio.Event(), asyncio.Event()
+    sent: list[str] = []
+
+    async def submit(message: str, **_kwargs: Any) -> dict[str, Any]:
+        sent.append(message)
+        in_net.set()
+        await asyncio.wait_for(release.wait(), 10)
+        return {"job_id": "job-1"}
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", submit)
+    monkeypatch.setattr(plugins.dispatch, "list_jobs", lambda limit=50: [])
+    entered, go, real = asyncio.Event(), asyncio.Event(), lifecycle._dispatch_rework
+
+    async def stalled(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        await asyncio.wait_for(go.wait(), 10)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "_dispatch_rework", stalled)
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    attempt = asyncio.create_task(
+        client.post(f"/api/tasks/{task_id}/decide", json=REWORK)
+    )
+    await asyncio.wait_for(entered.wait(), 10)
+    await _age_reservations(db, task_id)
+    go.set()
+    await asyncio.wait_for(in_net.wait(), 10)
+
+    await rework_launch.sweep(db)
+
+    rows = await db.execute_fetchall(
+        "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    assert [r[0] for r in rows] == ["reserved"]
+    release.set()
+    assert (await asyncio.wait_for(attempt, 10)).status_code == 200
+    assert (await repo.get_task(db, task_id))["job_id"] == "job-1"

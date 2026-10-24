@@ -5880,12 +5880,10 @@ async def _dispatch_rework(
         max_cycles=config.MAX_REVIEW_CYCLES,
     )
     runtime = task.get("runtime", "auto")
-    message += "\n\n" + rework_launch.marker_line(reservation_id, task_id)
-    # Бронь этой попытки могли закрыть, пока она стояла (сверка, повтор человека):
-    # заказывает только та, чья бронь ещё действует.
-    async with write_transaction(db):
-        current = await rework_launch.is_current(db, reservation_id)
-    if not current:
+    # Право заказать берётся условным UPDATE брони этой попытки: закрытую
+    # сверкой бронь права не даёт, а взявшая право удерживает бронь от сверки.
+    nonce = await rework_launch.claim_submit(db, reservation_id)
+    if nonce is None:
         await repo.add_task_update(
             db,
             task_id,
@@ -5896,6 +5894,7 @@ async def _dispatch_rework(
         )
         await db.commit()
         return
+    message += "\n\n" + rework_launch.marker_line(reservation_id, task_id, nonce)
     try:
         result = await plugins.dispatch.submit_task(
             message, runtime=runtime, task_id=task_id

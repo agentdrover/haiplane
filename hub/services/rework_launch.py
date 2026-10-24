@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import sqlite3
 from typing import Any
 
@@ -54,14 +55,14 @@ def marker(reservation_id: int) -> str:
     return f"rework-launch:{reservation_id}"
 
 
-def marker_line(reservation_id: int, task_id: int) -> str:
-    """Последняя строка текста заказа: метка и задача, которой заказ принадлежит.
+def marker_line(reservation_id: int, task_id: int, nonce: str) -> str:
+    """Последняя строка текста заказа: метка, задача и токен брони.
 
-    Узнаётся только как ЦЕЛАЯ последняя строка поля ``message`` задания. Цитата
-    метки в описании чужой задачи стоит в середине текста и за свою не
-    сходит; строка с чужим номером задачи тоже.
+    Узнаётся только как ЦЕЛАЯ последняя строка поля ``message`` задания и только
+    с токеном брони, который знает лишь её заказ: цитата метки в описании чужой
+    задачи (без токена, в середине текста, с чужим номером) за свою не сходит.
     """
-    return f"(метка заказа {marker(reservation_id)}, задача #{task_id})"
+    return f"(метка заказа {marker(reservation_id)}:{nonce}, задача #{task_id})"
 
 
 def _taken(task_id: int, why: str) -> HTTPException:
@@ -128,14 +129,26 @@ async def refuse_if_unresolved(db: aiosqlite.Connection, task_id: int) -> None:
     await refuse_unconfirmed_outcome(db, task_id)
 
 
-async def is_current(db: aiosqlite.Connection, reservation_id: int) -> bool:
-    """Эта самая бронь ещё ``reserved``: попытка, чью бронь закрыли, не заказывает."""
-    rows = await fetchall(
-        db,
-        "SELECT 1 FROM rework_launches WHERE id=? AND state=?",
-        (reservation_id, RESERVED),
-    )
-    return bool(rows)
+async def claim_submit(db: aiosqlite.Connection, reservation_id: int) -> str | None:
+    """Право попытки заказать задание: токен брони или ``None``, если бронь закрыта.
+
+    Один условный UPDATE (``reserved`` -> ``reserved``) обновляет срок брони: сверка
+    и попытка делят одну строку, и выигрывает та, чей UPDATE прошёл раньше. Закрытая
+    сверкой бронь права не даёт (попытка не заказывает); взявшая право попытка
+    удерживает бронь от сверки на ``GRACE_SECONDS``, а вызов диспетчера короче.
+    """
+    async with write_transaction(db):
+        cur = await db.execute(
+            "UPDATE rework_launches SET reserved_at=datetime('now') "
+            "WHERE id=? AND state=?",
+            (reservation_id, RESERVED),
+        )
+        if not cur.rowcount:
+            return None
+        rows = await fetchall(
+            db, "SELECT nonce FROM rework_launches WHERE id=?", (reservation_id,)
+        )
+    return str(rows[0]["nonce"])
 
 
 async def require_entry(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
@@ -194,7 +207,8 @@ async def reserve(
         raise _taken(task_id, live)
     try:
         cur = await db.execute(
-            "INSERT INTO rework_launches (task_id) VALUES (?)", (task_id,)
+            "INSERT INTO rework_launches (task_id, nonce) VALUES (?, ?)",
+            (task_id, secrets.token_hex(8)),
         )
     except sqlite3.IntegrityError as exc:
         raise _taken(task_id, "запуск доработки уже заказан") from exc
@@ -297,14 +311,16 @@ def _last_line(job: dict[str, Any]) -> str:
 
 
 async def _find_job(
-    reservation_id: int, task_id: int
+    reservation_id: int, task_id: int, nonce: str
 ) -> tuple[dict[str, Any] | None, bool]:
     """Задание этой брони: (задание, неоднозначно ли совпадение).
 
     Совпадает только последняя строка ``message`` целиком (см. ``marker_line``).
     Два и более совпадения - неоднозначность: привязать нельзя ни одно.
     """
-    want = marker_line(reservation_id, task_id)
+    if not nonce:
+        return None, False
+    want = marker_line(reservation_id, task_id, nonce)
     jobs = await asyncio.to_thread(plugins.dispatch.list_jobs, JOBS_SCANNED)
     found = [j for j in jobs if isinstance(j, dict) and _last_line(j) == want]
     if len(found) > 1:
@@ -328,7 +344,7 @@ async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
                 reason=f"задача ушла из needs_decision (статус {task.get('status')})",
             )
         return state
-    job, ambiguous = await _find_job(rid, task_id)
+    job, ambiguous = await _find_job(rid, task_id, str(held.get("nonce") or ""))
     job_id = _job_id_of(job) if job else ""
     if job_id:
         if not await settle_launched(db, rid, task_id, job_id):
