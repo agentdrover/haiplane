@@ -223,3 +223,40 @@ def test_the_database_path_fixture_survives_a_monkeypatch_undo(monkeypatch):
     monkeypatch.undo()
 
     assert config.HUB_DB_PATH == before, "undo() вернул реальный путь базы"
+
+
+async def test_a_symlinked_database_shares_one_lock(tmp_path, monkeypatch):
+    from hub.services import rework_launch
+
+    real = tmp_path / "real.db"
+    link = tmp_path / "link.db"
+    link.symlink_to(real)
+    assert rework_launch.claim_process(real, "a") is True
+
+    assert rework_launch.claim_process(link, "b") is True  # тот же процесс
+    probe_path = f"{real}.owner.lock"
+    with pytest.raises(BlockingIOError):
+        fd = open(probe_path, "a+")  # noqa: SIM115
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            fd.close()
+    assert not (tmp_path / "link.db.owner.lock").exists(), "второй lock-файл"
+    rework_launch.release_all()
+
+
+async def test_a_failed_startup_does_not_leak_its_registration(monkeypatch):
+    from hub import app as app_mod
+    from hub.services import rework_launch
+
+    async def broken():
+        raise RuntimeError("база недоступна")
+
+    monkeypatch.setattr(app_mod, "get_db", broken)
+    registered = {k: list(v) for k, v in rework_launch._APPS.items()}
+
+    with pytest.raises(RuntimeError, match="база недоступна"):
+        async with app_mod.lifespan(app_mod.app):
+            pass
+
+    assert rework_launch._APPS == registered, "заявка приложения осталась"
