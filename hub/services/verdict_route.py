@@ -29,6 +29,7 @@ from typing import Any
 import aiosqlite
 
 from hub.mcp_envelope import route_line
+from hub.services import verdict_owner
 from hub.services.steward_apply import CeilingUnavailable
 from hub.services.result_kind import (
     AUTOMATION_REFUSAL,
@@ -49,6 +50,7 @@ CODE_STEWARD_ACT = "steward_act"
 CODE_ADVISOR_SKIPPED = "steward_advisor_skipped"
 CODE_APPLY_FAILED = "steward_apply_failed"
 CODE_NOT_IN_REVIEW = "not_in_review"
+CODE_OWNER_WRITTEN = "verdict_owner_human"
 
 # Коды стойки, после которых стюарда спрашивать не о чем: сдачи, отчёта или
 # политики нет, и судить нечего и некому.
@@ -309,6 +311,20 @@ async def verdict_route(
     )
 
 
+async def _cap_handoff_ended(
+    db: aiosqlite.Connection, task: dict[str, Any], owner_reason: str
+) -> bool:
+    """Запись о суточном потолке кончилась вместе с сутками: потолок временный."""
+    from hub.services import steward_cap
+
+    if not owner_reason.startswith(steward_cap.CODE_DAILY_CAP):
+        return False
+    handoff = await steward_cap.cap_handoff(
+        db, int(task["id"]), int(task.get("submission_generation") or 0)
+    )
+    return handoff is None
+
+
 async def _decide_route(
     db: aiosqlite.Connection, task_id: int, *, observe: bool = False
 ) -> VerdictRoute:
@@ -334,6 +350,17 @@ async def _decide_route(
         # автопилота не доходим: она ищет машинный отчёт, которого у такой
         # задачи нет, и отвечала бы «нет отчёта» вместо настоящей причины.
         return _human(AUTOMATION_REFUSAL_CODE, AUTOMATION_REFUSAL)
+    # #2052: записанный владелец раньше любого прогноза. Актор, сложивший
+    # решение, сказал это вслух; стойка автопилота «одобрил бы» не отменяет
+    # того, что стюард уже передал сдачу человеку.
+    owner, owner_reason = verdict_owner.written_owner(task)
+    if owner == verdict_owner.OWNER_HUMAN and not await _cap_handoff_ended(
+        db, task, owner_reason
+    ):
+        code, _, detail = owner_reason.partition(": ")
+        if not code.replace("_", "").isalnum() or not code.islower():
+            code, detail = CODE_OWNER_WRITTEN, owner_reason
+        return _human(code, detail or owner_reason)
     stance = await auto_verdict.autopilot_stance(db, task_id, observe=observe)
     if stance.outcome == auto_verdict.OUTCOME_APPROVE:
         return VerdictRoute(
