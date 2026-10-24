@@ -103,6 +103,16 @@ async def _make_outcome(db, monkeypatch, scene: str):
         monkeypatch.setattr(steward_apply, "apply_refusals", ladder)
         assert await _apply_outcome(db, case) == "escalated"
         return case, "ladder_surface"
+    if scene == "not_converged":
+        # восемь признаков не сошлись: ``_hand_to_the_human_because``
+        case = await _approved_case(db, monkeypatch, "own-converged")
+
+        async def missing(*_a, **_k):
+            return steward_applied.SelfApproval(missing=(("ci_green", "CI красный"),))
+
+        monkeypatch.setattr(steward_applied, "self_approval_for", missing)
+        assert await _apply_outcome(db, case) == "escalated"
+        return case, "self_approval_not_converged"
     if scene == "advisor_object":
         case = await _approved_case(db, monkeypatch, "own-object", concur="object")
         assert await _apply_outcome(db, case) == "escalated"
@@ -160,6 +170,7 @@ async def _make_outcome(db, monkeypatch, scene: str):
     "scene",
     [
         "ladder_surface",
+        "not_converged",
         "advisor_object",
         "advisor_timeout",
         "skipped",
