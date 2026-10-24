@@ -80,7 +80,7 @@ def _live_actor_sql() -> str:
     from hub.services.steward_advisor import PICKED_APPROVE_SQL
 
     return (
-        "COALESCE(tasks.review_job_id, '') = '' "
+        "COALESCE(tasks.review_job_id, '') = '' "  # nosec B608 - constant fragments only
         "AND COALESCE(tasks.review_verdict_generation, -1) "
         "!= tasks.submission_generation "
         "AND NOT EXISTS (SELECT 1 FROM steward_runs r "
@@ -131,7 +131,7 @@ async def write_owner(
     text = reason.strip()[:_REASON_MAX]
     temporary = " OR ".join("verdict_owner_reason LIKE ?" for _ in TEMPORARY_REASONS)
     cursor = await db.execute(
-        "UPDATE tasks SET verdict_owner=?, verdict_owner_reason=?, "
+        "UPDATE tasks SET verdict_owner=?, verdict_owner_reason=?, "  # nosec B608 - constant fragments only
         "verdict_owner_since=strftime('%Y-%m-%d %H:%M:%f', 'now'), "
         "verdict_owner_generation=? WHERE id=? AND submission_generation=? "
         "AND NOT (verdict_owner=? AND verdict_owner_generation=? "
@@ -205,7 +205,7 @@ async def _stalled_candidates(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     """Задачи в review без живого исполнителя дольше срока и без записи «человек»."""
     rows = await fetchall(
         db,
-        "SELECT tasks.* FROM tasks WHERE tasks.status='review' AND tasks.archived=0 "
+        "SELECT tasks.* FROM tasks WHERE tasks.status='review' AND tasks.archived=0 "  # nosec B608 - constant fragments only
         "AND tasks.submission_generation > 0 "
         f"AND {_live_actor_sql()} "
         "AND NOT (tasks.verdict_owner='human' "

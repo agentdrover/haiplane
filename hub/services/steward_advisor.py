@@ -217,7 +217,7 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
         return 0
     rows = await fetchall(
         db,
-        "SELECT j.task_id, j.generation, t.result_kind FROM steward_judgements j "
+        "SELECT j.task_id, j.generation, t.result_kind FROM steward_judgements j "  # nosec B608 - constant fragments only
         "JOIN tasks t ON t.id = j.task_id "
         f"WHERE {PICKED_APPROVE_SQL} "
         "AND t.status='review' AND t.submission_generation = j.generation "
@@ -981,7 +981,7 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
         return 0
     rows = await fetchall(
         db,
-        "SELECT j.id, j.task_id, j.generation FROM steward_judgements j "
+        "SELECT j.id, j.task_id, j.generation FROM steward_judgements j "  # nosec B608 - constant fragments only
         "JOIN tasks t ON t.id = j.task_id "
         f"WHERE {PICKED_APPROVE_SQL} "
         "AND j.advisor_outcome='' AND t.status='review' "
