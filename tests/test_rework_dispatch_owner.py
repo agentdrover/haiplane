@@ -184,3 +184,41 @@ async def test_a_forked_child_inherits_neither_ownership_nor_boot_id(
     monkeypatch.undo()
     os.close(parent_copy)
     rework_launch.release_all()
+
+
+async def test_a_lazily_taken_lock_is_released_with_its_last_app(lock_path):
+    """A ушёл после двух отказов B1 и B2; lock взят лениво и закрывается с B2."""
+    from hub.services import rework_launch
+
+    holder = _other_process_holds(lock_path)
+    first, second = object(), object()
+    assert rework_launch.claim_process(lock_path, first) is False
+    assert rework_launch.claim_process(lock_path, second) is False
+    rework_launch.release_process(lock_path, first)
+    holder.close()  # A освободил блокировку
+
+    assert rework_launch.owns_db() is True, "второе приложение вправе взять lock"
+    rework_launch.release_process(lock_path, second)
+
+    probe = _other_process_holds(lock_path)  # BlockingIOError, если дескриптор жив
+    probe.close()
+
+
+async def test_owns_db_takes_no_lock_without_a_registered_app(lock_path):
+    from hub.services import rework_launch
+
+    rework_launch.release_all()
+
+    assert rework_launch.owns_db() is False
+    probe = _other_process_holds(lock_path)
+    probe.close()
+
+
+def test_the_database_path_fixture_survives_a_monkeypatch_undo(monkeypatch):
+    before = config.HUB_DB_PATH
+    assert "hubdb" in str(before)
+
+    monkeypatch.setattr(config, "HUB_DB_PATH", before.parent / "other.db")
+    monkeypatch.undo()
+
+    assert config.HUB_DB_PATH == before, "undo() вернул реальный путь базы"
