@@ -186,3 +186,48 @@ async def test_archiving_closes_an_unproven_outcome_but_not_a_live_booking(db):
 
     assert await _states(db, done) == ["closed"]
     assert await _states(db, live) == ["reserved"]
+
+
+async def test_a_finished_sender_is_reconciled_without_a_restart(db, monkeypatch):
+    """Submit вернул ошибку: отправителя больше нет, ждать перезапуска незачем."""
+    from hub.services import rework_launch
+
+    task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=True)
+
+    await rework_launch.sweep(db)
+
+    assert await _states(db, task_id) == ["launched"]
+    assert (await repo.get_task(db, task_id))["job_id"] == "job-77"
+    assert len(jobs["calls"]) == 1
+
+
+async def test_a_stale_sweep_does_not_link_a_job_to_a_superseded_booking(
+    db, monkeypatch
+):
+    """Пока сверка искала задание, человек повторил решение: старый исход не нужен."""
+    from hub.services import rework_launch
+
+    task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=False)
+    await _restart(db, task_id)
+    await rework_launch.sweep(db)
+    old = (await db.execute_fetchall("SELECT * FROM rework_launches"))[-1]
+    held = dict(old)
+    jobs["job-old"] = {"id": "job-old", "message": jobs["calls"][0]}
+
+    real_find = rework_launch._find_job
+
+    async def find_then_supersede(*args: Any) -> Any:
+        found = await real_find(*args)
+        await db.execute(
+            "INSERT INTO rework_launches (task_id, state) VALUES (?, 'needs_human')",
+            (task_id,),
+        )
+        await db.commit()
+        return found
+
+    monkeypatch.setattr(rework_launch, "_find_job", find_then_supersede)
+
+    result = await rework_launch._lift_unproven(db, held)
+
+    assert result == "needs_human"
+    assert (await repo.get_task(db, task_id))["job_id"] in (None, "")

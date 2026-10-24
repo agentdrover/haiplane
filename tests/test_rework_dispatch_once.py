@@ -303,22 +303,6 @@ async def test_a_crash_after_acceptance_links_the_existing_job(db, monkeypatch):
     assert [tuple(r) for r in rows] == [("launched", "job-77")]
 
 
-async def test_a_fresh_reservation_is_left_alone_by_the_sweep(db, monkeypatch):
-    """Заказ мог ещё идти в сети: свежую бронь сверка не трогает."""
-    from hub.services import rework_launch
-
-    task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=True)
-
-    await rework_launch.sweep(db)
-
-    task = dict(await repo.get_task(db, task_id))
-    assert task["status"] == "needs_decision" and not task["job_id"]
-    rows = await db.execute_fetchall(
-        "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
-    )
-    assert [r[0] for r in rows] == ["reserved"]
-
-
 async def test_a_merge_run_is_refused_while_a_rework_is_reserved(db, monkeypatch):
     """Прогон «слей базу» (#1445) и доработка по решению не идут на одну задачу."""
     from hub.services import executor_launch as el
