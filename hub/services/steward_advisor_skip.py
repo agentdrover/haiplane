@@ -37,6 +37,7 @@ import re
 import aiosqlite
 
 from hub import repository as repo
+from hub.services import verdict_owner
 from hub.db import fetchall
 
 log = logging.getLogger(__name__)
@@ -194,6 +195,13 @@ async def record_skip(
     if cursor.rowcount != 1:
         return False
     await repo.add_task_update(db, task_id, "hub", "status", text, author_kind="hub")
+    # #2052: пропуск советника - вердикт за человеком, пока причина не снята.
+    await verdict_owner.hand_to_human(
+        db,
+        task_id,
+        verdict_owner.reason_of(EVENT_SKIPPED, f"{code}: {detail}"),
+        generation=generation,
+    )
     return True
 
 

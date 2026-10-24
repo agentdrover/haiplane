@@ -31,6 +31,7 @@ import aiosqlite
 
 from hub import config
 from hub import repository as repo
+from hub.services import verdict_owner
 from hub.db import fetchall
 
 EVENT_REFUSED = "steward_run_refused"
@@ -202,6 +203,18 @@ async def record_refusal(
         "alert",
         alert_text(kind, generation, detail, utc_day(moment)),
         author_kind="hub",
+    )
+    # #2052: потолок исчерпан - вердикт сдачи у человека (запись временная:
+    # новый заказ на этой сдаче вернёт стюарда).
+    # Причина - та же строка с временем сброса, что показывает маршрут.
+    handoff = await cap_handoff(db, task_id, generation)
+    await verdict_owner.hand_to_human(
+        db,
+        task_id,
+        verdict_owner.reason_of(
+            CODE_DAILY_CAP, handoff.reason if handoff is not None else detail
+        ),
+        generation=generation,
     )
     return True
 

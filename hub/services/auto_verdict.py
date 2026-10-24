@@ -48,7 +48,7 @@ from hub import config
 from hub import repository as repo
 from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict, text_origin_of
 from hub.services import gate_grounds as grounds
-from hub.services import ci_integrity, ci_trust
+from hub.services import ci_integrity, ci_trust, verdict_owner
 from hub.services.ci_report import VALIDATION_PASS
 from hub.services.result_kind import task_automation_not_applicable
 
@@ -74,6 +74,10 @@ async def _escalate(db: aiosqlite.Connection, task_id: int, reason: str) -> None
         task_id=task_id,
         actor=_POLICY_ACTOR,
         payload={"reason": reason},
+    )
+    # #2052: автопилот сложил решение - владелец записан, а не выведен позже.
+    await verdict_owner.hand_to_human(
+        db, task_id, verdict_owner.reason_of("autopilot_escalated", reason)
     )
     await db.commit()
 

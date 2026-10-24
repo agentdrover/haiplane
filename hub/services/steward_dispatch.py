@@ -51,7 +51,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
-from hub.services import steward_cap
+from hub.services import steward_cap, verdict_owner
 from hub.services.steward_review_gate import (  # noqa: F401 - реэкспорт
     DEFER_KIND_REVIEW,
     EVENT_DEFERRED,
@@ -104,6 +104,8 @@ RUN_REFUSED = "refused"
 # мелочь формулировки. Ни один читатель терминальные статусы не
 # перечисляет — проверено поимённо, все сравнивают только с RUN_OPEN.
 RUN_NEVER_STARTED = "never_started"
+#: Статусы закрытия, после которых суждения не будет и вердикт у человека.
+_RUN_ENDS_WITHOUT_ANSWER = frozenset({RUN_TIMEOUT, RUN_NEVER_STARTED})
 
 # The lock is taken BEFORE the provider is called and holds this marker until
 # the real agent id replaces it. Anything else would pay first and claim
@@ -429,6 +431,10 @@ async def order_run(
             **({"why": why} if why else {}),
         },
     )
+    if kind in (KIND_VERDICT, KIND_ADVISOR):
+        # #2052: передача человеку по потолку или пропуску временная; новый
+        # заказ на этой сдаче снимает её, и маршрут снова называет стюарда.
+        await verdict_owner.reclaim_for_steward(db, task_id, generation)
     await db.commit()
     log.info("steward run ordered: task #%s gen %s kind %s", task_id, generation, kind)
     rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run_id,))
@@ -542,6 +548,18 @@ async def close_run(
             "reason": reason,
         },
     )
+    if status in _RUN_ENDS_WITHOUT_ANSWER and run.get("kind") in (
+        KIND_VERDICT,
+        KIND_ADVISOR,
+    ):
+        # #2052: прогон кончился без суждения - решать больше некому, кроме
+        # человека; код статуса становится кодом маршрута.
+        await verdict_owner.hand_to_human(
+            db,
+            int(run["task_id"]),
+            verdict_owner.reason_of(status, reason),
+            generation=int(run["generation"]),
+        )
     await db.commit()
     if run.get("kind") == KIND_ADVISOR:
         # Локальный советник (#1649): за закрытой строкой может стоять живое
@@ -1004,6 +1022,14 @@ async def _close_generation_as_refused(
             "kind": kind,
         },
     )
+    if kind in (KIND_VERDICT, KIND_ADVISOR):
+        # #2052: генерация закрыта отказом, заказа не будет - вердикт за человеком.
+        await verdict_owner.hand_to_human(
+            db,
+            task_id,
+            verdict_owner.reason_of(RUN_REFUSED, f"{reason}: {detail}"),
+            generation=generation,
+        )
     await db.commit()
 
 
@@ -1376,3 +1402,9 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     # Применение approve судьи — только после ответа советника и только в act.
     await apply_advisor_outcomes(db)
     await check_escalation_corridor(db)
+    # #2052: сторож «забыли записать» - после заказов, чтобы заказ этого
+    # прохода уже считался живым исполнителем. Сбой не роняет проход.
+    try:
+        await verdict_owner.hand_over_stalled_reviews(db)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("verdict owner watchdog failed: %s", exc)

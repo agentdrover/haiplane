@@ -56,7 +56,7 @@ from hub.services.result_kind import (
 )
 from hub.services import steward_advisor_skip as advisor_skip
 from hub.services.refusal_reason import CAP_HANDOFF, exception_facts, reason_line
-from hub.services import steward_cap
+from hub.services import steward_cap, verdict_owner
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
     KIND_VERDICT,
@@ -841,6 +841,14 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
             "применяется.",
             author_kind="hub",
         )
+        await verdict_owner.hand_to_human(
+            db,
+            int(item["task_id"]),
+            verdict_owner.reason_of(
+                "advisor_apply_interrupted", "метка применения не снята"
+            ),
+            generation=int(item["generation"]),
+        )
         moved += 1
     await db.commit()
     return moved
@@ -914,6 +922,20 @@ async def _finish_outcome(
                 "reason": detail,
                 **(exception_facts(error) if error is not None else {}),
             },
+        )
+    if final.rowcount == 1 and outcome != OUTCOME_APPROVED:
+        # #2052: исход, после которого стюард вердикт не вынесет, - в владельца,
+        # в той же транзакции, что и сам исход.
+        await verdict_owner.hand_to_human(
+            db,
+            int(item["task_id"]),
+            verdict_owner.reason_of(
+                EVENT_APPLY_FAILED
+                if outcome == OUTCOME_FAILED
+                else f"advisor_outcome_{outcome}",
+                detail,
+            ),
+            generation=int(item["generation"]),
         )
     if final.rowcount == 1 and outcome == OUTCOME_FAILED and detail:
         recorded = await _approve_recorded(db, item)

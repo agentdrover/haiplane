@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from hub import repository as repo
+from hub.services import verdict_owner
 from hub.actionable_errors import (
     steward_advisor_channel_detail,
     steward_advisor_not_ordered_detail,
@@ -420,6 +421,20 @@ async def record_steward_judgement(
         db, dict(row), body, effective_verdict, effective_reason
     )
     await _emit_events(db, task_id, body, effective_verdict, judged_id)
+    if body.kind == "verdict" and effective_verdict in (
+        "changes_requested",
+        "escalate",
+    ):
+        # #2052: судья вердикта не вынесет ни approve, ни применением - сдача
+        # за человеком, и это записано, а не выведено из суждения при показе.
+        await verdict_owner.hand_to_human(
+            db,
+            task_id,
+            verdict_owner.reason_of(
+                f"judge_{effective_verdict}", effective_reason or ""
+            ),
+            generation=body.generation,
+        )
     await _close_the_order(db, task_id, body.generation, body.kind)
     # Запись суждения судьи САМА вердикта не ставит ни в одном пути (#1601):
     # approve применяется поллером после ответа советника, а не отсюда.
