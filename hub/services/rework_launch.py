@@ -54,7 +54,8 @@ CLOSED = "closed"
 # живого хаба на той же базе нет. Владение - явный объект: PID, открытый дескриптор
 # с удерживаемым flock и список зарегистрированных приложений. Владельцем считается
 # только тот, кто такой дескриптор держит; отсутствие отказа владением не является.
-_IMPLICIT = "implicit"
+#: Заявители по пути базы: приложения процесса, включая не получившие lock.
+_APPS: dict[str, list[Any]] = {}
 _OWNERS: dict[str, _Ownership] = {}
 _BOOT: dict[str, Any] = {"pid": 0, "id": ""}
 
@@ -63,7 +64,6 @@ class _Ownership:
     def __init__(self, handle: Any) -> None:
         self.pid = os.getpid()
         self.handle = handle
-        self.apps: list[Any] = []
 
     def valid(self) -> bool:
         return self.pid == os.getpid() and not self.handle.closed
@@ -85,60 +85,66 @@ def _drop(key: str) -> None:
         owner.handle.close()
 
 
-def claim_process(db_path: Any, app: Any = None) -> bool:
-    """Взять исключительное право на базу для этого процесса; ``app`` - заявитель."""
-    key = str(db_path)
+def _acquire(key: str) -> bool:
     owner = _OWNERS.get(key)
-    if owner is not None and not owner.valid():
+    if owner is not None and owner.valid():
+        return True
+    if owner is not None:
         _drop(key)
-        owner = None
-    if owner is None:
-        try:
-            Path(key).parent.mkdir(parents=True, exist_ok=True)
-            handle = open(f"{key}.owner.lock", "a+")  # noqa: SIM115
-        except OSError:
-            # Не доказали единственность - владения нет (повтор при следующей попытке).
-            log.warning("блокировка владельца базы %s недоступна: владения нет", key)
-            return False
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.close()
-            return False
-        owner = _Ownership(handle)
-        _OWNERS[key] = owner
-    owner.apps.append(app if app is not None else "anon")
+    try:
+        Path(key).parent.mkdir(parents=True, exist_ok=True)
+        handle = open(f"{key}.owner.lock", "a+")  # noqa: SIM115
+    except OSError:
+        # Не доказали единственность - владения нет (повтор при следующей попытке).
+        log.warning("блокировка владельца базы %s недоступна: владения нет", key)
+        return False
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    _OWNERS[key] = _Ownership(handle)
     return True
 
 
-def release_process(db_path: Any, app: Any = None) -> None:
-    """Снять заявку приложения; без владения (приложение lock не получало) - ничего."""
+def claim_process(db_path: Any, app: Any = None) -> bool:
+    """Зарегистрировать приложение и взять право на базу, если оно свободно."""
     key = str(db_path)
-    owner = _OWNERS.get(key)
-    if owner is None:
+    _APPS.setdefault(key, []).append(app if app is not None else "anon")
+    return _acquire(key)
+
+
+def release_process(db_path: Any, app: Any = None) -> None:
+    """Снять заявку приложения; с уходом последнего закрывается и дескриптор."""
+    key = str(db_path)
+    apps = _APPS.get(key)
+    if apps is None:
         return
     token = app if app is not None else "anon"
-    if token in owner.apps:
-        owner.apps.remove(token)
-    if not owner.apps:
+    if token in apps:
+        apps.remove(token)
+    if not apps:
+        del _APPS[key]
         _drop(key)
 
 
 def release_all() -> None:
-    """Снять все владения процесса (остановка, чистка в тестах)."""
+    """Снять все заявки и владения процесса (остановка, чистка в тестах)."""
+    _APPS.clear()
     for key in list(_OWNERS):
         _drop(key)
 
 
 def owns_db() -> bool:
-    """Этот процесс держит дескриптор с flock и вправе сверять брони и заказывать."""
+    """Процесс держит дескриптор с flock и вправе сверять брони и заказывать.
+
+    Без зарегистрированного приложения lock не берётся; зарегистрированное, но
+    не получившее lock, повторяет попытку здесь.
+    """
     from hub import config
 
     key = str(config.HUB_DB_PATH)
-    owner = _OWNERS.get(key)
-    if owner is not None and owner.valid():
-        return True
-    return claim_process(key, _IMPLICIT)
+    return key in _APPS and _acquire(key)
 
 
 def marker(reservation_id: int) -> str:

@@ -40,6 +40,7 @@ def _other_process_holds(path):
 async def test_a_second_instance_neither_sweeps_nor_orders(db, monkeypatch, lock_path):
     from hub.services import rework_launch
 
+    rework_launch.claim_process(lock_path, "test")  # приложение на этой базе
     task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=True)
     await db.execute(
         "UPDATE rework_launches SET boot_id='previous-boot' WHERE task_id=?",

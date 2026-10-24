@@ -94,7 +94,7 @@ def _fresh_mcp_session_manager():
 
 
 @pytest.fixture(autouse=True)
-def _own_database_lock(tmp_path_factory, monkeypatch):
+def _own_database_lock(tmp_path_factory):
     """Блокировка владельца базы (#1991) - на каталог теста, не на общий HOME.
 
     Иначе воркеры xdist спорили бы за один файл блокировки, а дескриптор
@@ -103,9 +103,12 @@ def _own_database_lock(tmp_path_factory, monkeypatch):
     from hub.services import rework_launch
 
     path = tmp_path_factory.mktemp("hubdb") / "hub.db"
-    monkeypatch.setattr(config, "HUB_DB_PATH", path)
-    yield
-    rework_launch.release_all()
+    # Свой контекст подмены: monkeypatch.undo() в теле теста путь не возвращает.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(config, "HUB_DB_PATH", path)
+        rework_launch.claim_process(path, "pytest")
+        yield
+        rework_launch.release_all()
 
 
 @pytest.fixture(autouse=True)
