@@ -1,0 +1,171 @@
+"""Бронь доработки #1991: сверка по границе процесса, а не по таймеру.
+
+Время не доказывает, что прежний отправитель остановился. Бронь закрывает
+сверка только после перезапуска хаба (другой boot id), а исход ``needs_human``
+снимается найденным заданием с собственной меткой.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+
+from hub import repository as repo
+from hub import services
+from hub.integrations import dispatch as dispatch_mod
+from hub.integrations.registry import plugins
+from hub.models import TaskDecide
+from tests.test_decision_brief import _task_in
+from tests.test_rework_dispatch_once import LONG_AGO, REWORK, _crash_on_submit
+
+
+async def _restart(db, task_id: int) -> None:
+    """Хаб перезапущен: бронь принадлежит прежнему процессу (и давно)."""
+    cols = {
+        r[1] for r in await db.execute_fetchall("PRAGMA table_info(rework_launches)")
+    }
+    if "boot_id" in cols:
+        await db.execute(
+            "UPDATE rework_launches SET boot_id='previous-boot' WHERE task_id=?",
+            (task_id,),
+        )
+    await db.execute(
+        "UPDATE rework_launches SET reserved_at=? WHERE task_id=?", (LONG_AGO, task_id)
+    )
+    await db.commit()
+
+
+async def _states(db, task_id: int) -> list[str]:
+    rows = await db.execute_fetchall(
+        "SELECT state FROM rework_launches WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    return [r[0] for r in rows]
+
+
+async def test_a_delayed_sender_in_a_live_process_is_never_swept(
+    client, db, monkeypatch
+):
+    """Отправитель завис в сети дольше любого таймера: бронь держится, заказ один."""
+    from hub.services import rework_launch
+
+    in_net, release, sent = asyncio.Event(), asyncio.Event(), []
+
+    async def submit(message: str, **_kwargs: Any) -> dict[str, Any]:
+        sent.append(message)
+        in_net.set()
+        await asyncio.wait_for(release.wait(), 10)
+        return {"job_id": "job-1"}
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", submit)
+    monkeypatch.setattr(plugins.dispatch, "list_jobs", lambda limit=50: [])
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    attempt = asyncio.create_task(
+        client.post(f"/api/tasks/{task_id}/decide", json=REWORK)
+    )
+    await asyncio.wait_for(in_net.wait(), 10)
+    await db.execute(
+        "UPDATE rework_launches SET reserved_at=? WHERE task_id=?", (LONG_AGO, task_id)
+    )
+    await db.commit()
+
+    await rework_launch.sweep(db)
+    again = await client.post(
+        f"/api/tasks/{task_id}/decide", json={**REWORK, "confirm_no_job": True}
+    )
+
+    assert await _states(db, task_id) == ["reserved"]
+    assert again.status_code == 409
+    release.set()
+    assert (await asyncio.wait_for(attempt, 10)).status_code == 200
+    assert len(sent) == 1
+    assert (await repo.get_task(db, task_id))["job_id"] == "job-1"
+
+
+async def test_sweep_reconciles_a_booking_of_a_previous_process(db, monkeypatch):
+    from hub.services import rework_launch
+
+    task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=True)
+    await rework_launch.sweep(db)
+    assert await _states(db, task_id) == ["reserved"], "тот же процесс: не трогать"
+
+    await _restart(db, task_id)
+    await rework_launch.sweep(db)
+
+    assert await _states(db, task_id) == ["launched"]
+    assert (await repo.get_task(db, task_id))["job_id"] == "job-77"
+
+
+async def test_a_found_job_lifts_an_unproven_outcome(db, monkeypatch):
+    """needs_human, затем у диспетчера появилось задание с точной меткой."""
+    from hub.services import rework_launch
+
+    task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=False)
+    await _restart(db, task_id)
+    await rework_launch.sweep(db)
+    assert await _states(db, task_id) == ["needs_human"]
+    jobs["job-late"] = {"id": "job-late", "message": jobs["calls"][0]}
+
+    await rework_launch.sweep(db)
+
+    assert await _states(db, task_id) == ["launched"]
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "fix_requested" and task["job_id"] == "job-late"
+    assert len(jobs["calls"]) == 1, "нового submit нет"
+
+
+async def test_accept_closes_an_unproven_outcome(db):
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    await db.execute(
+        "INSERT INTO rework_launches (task_id, state) VALUES (?, 'needs_human')",
+        (task_id,),
+    )
+    await db.commit()
+
+    await services.decide_task(db, task_id, TaskDecide(action="accept"))
+
+    assert await _states(db, task_id) == ["closed"]
+
+
+async def test_force_complete_closes_an_unproven_outcome(client, db):
+    task_id = await _task_in(db, "needs_decision", submission_generation=1)
+    await db.execute(
+        "INSERT INTO rework_launches (task_id, state) VALUES (?, 'needs_human')",
+        (task_id,),
+    )
+    await db.commit()
+
+    forced = await client.post(
+        f"/api/tasks/{task_id}/force-complete", json={"comment": "закрыть"}
+    )
+
+    assert forced.status_code == 200, forced.text
+    assert await _states(db, task_id) == ["closed"]
+
+
+async def test_a_timed_out_submit_kills_its_child(monkeypatch):
+    killed: list[str] = []
+
+    class Proc:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(30)
+
+        def kill(self):
+            killed.append("kill")
+
+        async def wait(self):
+            killed.append("wait")
+
+    async def spawn(*_a, **_k):
+        return Proc()
+
+    monkeypatch.setattr(dispatch_mod, "SUBMIT_TIMEOUT", 0.05, raising=False)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await dispatch_mod.DispatchIntegration().submit_task("m", task_id=1)
+
+    assert killed == ["kill", "wait"]
