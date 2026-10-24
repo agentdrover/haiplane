@@ -5870,7 +5870,25 @@ async def _dispatch_rework(
     instructions: str,
     reservation_id: int,
 ) -> None:
-    """Rework commit-задачи после арбитража: fix-задание или, без него, open."""
+    """Rework commit-задачи после арбитража: fix-задание или, без него, open.
+
+    Любой сбой по пути (сеть, отмена, запись результата) освобождает бронь для
+    сверки: отправитель закончил, и висеть ей до перезапуска хаба незачем.
+    """
+    try:
+        await _order_rework(db, task_id, task, instructions, reservation_id)
+    except BaseException:
+        await rework_launch.release_sender(db, reservation_id)
+        raise
+
+
+async def _order_rework(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    instructions: str,
+    reservation_id: int,
+) -> None:
     message = plugins.dispatch.build_fix_message(
         task_id=task_id,
         title=task["title"],

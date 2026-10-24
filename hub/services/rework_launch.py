@@ -316,6 +316,23 @@ async def settle_launched(
     return False
 
 
+async def release_sender(db: aiosqlite.Connection, reservation_id: int) -> None:
+    """Отправитель заказа закончил (вызов вернулся, оборвался или запись упала).
+
+    Живого, кто мог бы создать задание, больше нет, и сверка вправе решать без
+    перезапуска хаба. Сбой самой записи не скрывает исходную ошибку: бронь тогда
+    дождётся перезапуска.
+    """
+    try:
+        await db.execute(
+            "UPDATE rework_launches SET boot_id='' WHERE id=? AND state=?",
+            (reservation_id, RESERVED),
+        )
+        await db.commit()
+    except Exception:
+        log.exception("rework launch #%s: не удалось освободить бронь", reservation_id)
+
+
 async def note_unknown_outcome(
     db: aiosqlite.Connection, task_id: int, reservation_id: int, error: BaseException
 ) -> None:
