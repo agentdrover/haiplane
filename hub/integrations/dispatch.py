@@ -27,6 +27,21 @@ def _read_job_file(path: Path) -> dict[str, Any] | None:
         return None
 
 
+async def _finish(coro: Any) -> None:
+    """Довести очистку до конца, сколько бы раз ни отменяли вызывающего."""
+    task = asyncio.ensure_future(coro)
+    while not task.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(task)
+    with contextlib.suppress(Exception):
+        task.result()
+
+
+async def _reap_spawned(spawn: Any) -> None:
+    spawned = await spawn
+    await kill_process_group(spawned, pgid=spawned.pid)
+
+
 class DispatchIntegration:
     """Concrete dispatch plugin backed by the oc-dev-dispatch CLI binary."""
 
@@ -395,9 +410,7 @@ class DispatchIntegration:
             except asyncio.CancelledError:
                 # Отмена в момент spawn: процесс уже может работать. Дожидаемся
                 # его и снимаем всю группу, иначе он остаётся сиротой.
-                with contextlib.suppress(Exception):
-                    spawned = await spawn
-                    await kill_process_group(spawned, pgid=spawned.pid)
+                await _finish(_reap_spawned(spawn))
                 raise
         except (FileNotFoundError, PermissionError):
             log.warning("oc-dev-dispatch binary not found at %s", DISPATCH_BIN)
@@ -409,7 +422,7 @@ class DispatchIntegration:
         except (TimeoutError, asyncio.CancelledError):
             # Закрывает transport и ждёт не дольше потолка: на полной трубе
             # голый wait() после kill не возвращается.
-            await kill_process_group(proc, pgid=proc.pid)
+            await _finish(kill_process_group(proc, pgid=proc.pid))
             raise
         raw = stdout.decode(errors="replace").strip()
         if proc.returncode != 0:
