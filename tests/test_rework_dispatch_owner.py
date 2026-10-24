@@ -411,6 +411,8 @@ async def test_a_forked_child_lazy_owner_releases_with_its_last_app(lock_path):
 
     def child_without_app(chan: _Chan) -> None:
         chan.hear()
+        # Первый вход потомка - снятие заявки родителя: чужого он не освобождает.
+        rework_launch.release_process(lock_path, "A")
         assert rework_launch.owns_db() is False
         chan.say(json.dumps(_state(rework_launch, inherited)))
         chan.hear()  # родитель отпустил A
@@ -434,7 +436,6 @@ async def test_a_forked_child_lazy_owner_releases_with_its_last_app(lock_path):
     # (б) заявка B есть, но отказ: после ухода родителя владение берётся лениво.
     assert rework_launch.claim_process(lock_path, "A") is True
     inherited = [o.handle for o in rework_launch._OWNERS.values()]
-    seen: dict[str, Any] = {}
 
     def child_refused(chan: _Chan) -> None:
         chan.hear()
@@ -445,8 +446,7 @@ async def test_a_forked_child_lazy_owner_releases_with_its_last_app(lock_path):
         taken = [o.handle for o in rework_launch._OWNERS.values()]
         chan.say(json.dumps(_state(rework_launch, taken)))
         rework_launch.release_process(lock_path, "B")
-        seen_closed = [h.closed for h in taken]
-        chan.say(json.dumps({**_state(rework_launch, taken), "closed": seen_closed}))
+        chan.say(json.dumps(_state(rework_launch, taken)))
         chan.hear()
 
     pid, chan = _run_forked(child_refused)
@@ -459,7 +459,6 @@ async def test_a_forked_child_lazy_owner_releases_with_its_last_app(lock_path):
         lazy = chan.report()
         assert lazy["owners"] == [key] and lazy["apps"] == {key: 1}
         gone = chan.report()
-        seen.update(gone)
         assert gone["apps"] == {} and gone["owners"] == []
         assert all(gone["closed"]), "уход B не закрыл дескриптор"
         assert _can_take_lock(lock_path) is True, "претендент не допущен"

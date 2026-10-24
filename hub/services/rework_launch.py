@@ -58,6 +58,8 @@ CLOSED = "closed"
 _APPS: dict[str, list[Any]] = {}
 _OWNERS: dict[str, _Ownership] = {}
 _BOOT: dict[str, Any] = {"pid": 0, "id": ""}
+#: Процесс, которому принадлежат _APPS и _OWNERS; после fork это уже процесс родителя.
+_STATE: dict[str, int] = {"pid": os.getpid()}
 
 
 class _Ownership:
@@ -80,6 +82,26 @@ def boot_id() -> str:
     if _BOOT["pid"] != pid:
         _BOOT["pid"], _BOOT["id"] = pid, secrets.token_hex(8)
     return str(_BOOT["id"])
+
+
+def _forget_inherited() -> None:
+    """В потомке fork отбросить всё, что принадлежит родителю: и дескрипторы, и заявки.
+
+    Дескрипторы только закрываются, без LOCK_UN: открытое описание файла общее с
+    родителем, и снятие блокировки сняло бы её у него. Заявки родителя - не наши:
+    оставшись, они держали бы lock потомка после ухода его последнего приложения.
+    Проверка по PID стоит на каждом входе, а не в хуке fork: так достаточно одного
+    правила для любого пути, которым потомок впервые зашёл в модуль.
+    """
+    pid = os.getpid()
+    if _STATE["pid"] == pid:
+        return
+    _STATE["pid"] = pid
+    for owner in _OWNERS.values():
+        if not owner.handle.closed:
+            owner.handle.close()
+    _OWNERS.clear()
+    _APPS.clear()
 
 
 def _drop(key: str) -> None:
@@ -114,6 +136,7 @@ def _acquire(key: str) -> bool:
 
 def claim_process(db_path: Any, app: Any = None) -> bool:
     """Зарегистрировать приложение и взять право на базу, если оно свободно."""
+    _forget_inherited()
     key = _key(db_path)
     _APPS.setdefault(key, []).append(app if app is not None else "anon")
     return _acquire(key)
@@ -121,6 +144,7 @@ def claim_process(db_path: Any, app: Any = None) -> bool:
 
 def release_process(db_path: Any, app: Any = None) -> None:
     """Снять заявку приложения; с уходом последнего закрывается и дескриптор."""
+    _forget_inherited()
     key = _key(db_path)
     apps = _APPS.get(key)
     if apps is None:
@@ -148,6 +172,7 @@ def owns_db() -> bool:
     """
     from hub import config
 
+    _forget_inherited()
     key = _key(config.HUB_DB_PATH)
     return key in _APPS and _acquire(key)
 
