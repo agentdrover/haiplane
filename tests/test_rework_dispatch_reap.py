@@ -126,3 +126,29 @@ async def test_a_cancel_during_spawn_still_reaps_the_group(flooding_child, monke
         await _within(task, CEILING)
     await asyncio.sleep(0.3)
     assert not _alive(int(flooding_child.read_text())), "дочерний процесс жив"
+
+
+async def test_a_second_cancel_does_not_skip_the_group_reap(
+    flooding_child, monkeypatch
+):
+    """Повторная отмена во время очистки: kill группы всё равно выполняется."""
+    real = asyncio.create_subprocess_exec
+
+    async def slow_attach(*args, **kwargs):
+        proc = await real(*args, **kwargs)
+        await asyncio.sleep(1.0)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", slow_attach)
+    task = asyncio.ensure_future(
+        dispatch_mod.DispatchIntegration().submit_task("m", task_id=1)
+    )
+    await asyncio.sleep(0.4)
+    task.cancel()
+    await asyncio.sleep(0.1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _within(task, CEILING)
+    await asyncio.sleep(0.3)
+    assert not _alive(int(flooding_child.read_text())), "дочерний процесс жив"
