@@ -775,12 +775,10 @@ def latest_review_projection(task: dict[str, Any]) -> LatestReview | None:
         verdict=verdict,
         submission_generation=verdict_generation,
         is_current=review_verdict_covers_current_submission(task),
-        # The closure speaks about the submission it closed, and only while
-        # that submission is still the current one (#1286). Once the executor
-        # resubmits, the generation moves on: the verdict stops being current
-        # because the work changed, not because a human called it back, and a
-        # card still flying the rework flag would ask for a resubmission that
-        # has already happened.
+        # The closure speaks about the submission it closed, and only while that submission is
+        # still current (#1286). After a resubmission the verdict is stale because the work
+        # changed, not because a human called it back; a card still flying the rework flag would
+        # ask for a resubmission that already happened.
         closed_by_decision=(
             closed_generation == verdict_generation and closed_generation == generation
         ),
@@ -923,11 +921,9 @@ async def enrich_task_view(
 
             task_view.cause_suggestion = await suggest_causes(db, task_view.id)
 
-    # #1235: круг ревью читается ТОЙ ЖЕ функцией, которой его считают бриф и
-    # сигнал. Второе выражение того же счёта здесь означало бы, что карточка
-    # и бриф расходятся в числе. Стоит в обогащении, а не в row_to_task:
-    # счёт идёт по отчётам и исходам, а списки задач за него платить не
-    # должны (#485).
+    # #1235: the review circle is read by the SAME function the brief and the signal use, so the
+    # card and the brief cannot disagree on the number. Done in enrichment, not row_to_task:
+    # task lists must not pay for the report/outcome count (#485).
     from hub.models import ReviewCircleView
     from hub.services.review_dispatch import review_circle
 
@@ -1129,14 +1125,10 @@ async def create_subtasks_bulk(
     if body.task_type == TaskType.subtask:
         auto_review = False
 
-    # Check every item's locators BEFORE opening the write lock: the batch
-    # promises all-or-nothing, and refusing after the first rows are written
-    # would rely on the rollback to keep that promise instead of never
-    # breaking it. This path writes ACs straight through the repository, so
-    # the service-layer guard on add/upsert/replace does not cover it — it is
-    # the fifth write path, found in review of submission #1 after I had
-    # enumerated four by reading one module instead of following the
-    # repository calls (#596).
+    # Check every item's locators BEFORE opening the write lock: the batch is all-or-nothing,
+    # and refusing after rows are written would lean on rollback instead of never breaking the
+    # promise. This path writes ACs straight through the repository, so the service-layer guard
+    # on add/upsert/replace does not cover it (#596).
     for item in body.items:
         if item.acceptance_criteria is not None:
             _guard_ac_locator(item.acceptance_criteria)
@@ -1299,14 +1291,10 @@ async def _open_draft_under_lock(
                         "task_id": task_id,
                         "score": readiness.score,
                         "missing_required": missing,
-                        # Dump the whole Recommendation instead of re-typing a
-                        # subset of its fields (#1172). The hand-built dict here
-                        # silently dropped ``defect_code``, so the one refusal a
-                        # caller actually receives carried human prose and no
-                        # vocabulary code — exactly the thing the closed
-                        # vocabulary exists to prevent. model_dump also means the
-                        # next field added to Recommendation reaches this payload
-                        # without anyone remembering to widen it.
+                        # Dump the whole Recommendation, not a hand-built subset (#1172): the
+                        # subset dropped ``defect_code``, so the one refusal a caller receives
+                        # carried prose and no vocabulary code. model_dump also carries any
+                        # field added later.
                         "recommendations": [
                             r.model_dump() for r in readiness.recommendations
                         ],
@@ -1351,11 +1339,9 @@ async def _open_draft_under_lock(
             await repo.update_task(db, task_id, runtime=body.runtime.value)
             task["runtime"] = body.runtime.value
 
-        # Atomic conditional transition: a concurrent second approve will see
-        # ``rowcount == 0`` and get a 409 instead of being silently double-
-        # processed. Even though aiosqlite serializes a shared connection
-        # today, this guards us when someone moves to a per-request connection
-        # or a pool. Review I5.
+        # Atomic conditional transition: a concurrent second approve sees ``rowcount == 0`` and
+        # gets a 409 instead of being double-processed. Holds even if the shared connection
+        # becomes per-request or pooled.
         transitioned = await repo.transition_status_if(
             db, task_id, expected_from="draft", new_status="open"
         )
@@ -1701,10 +1687,9 @@ async def warn_about_undelivered_blockers(
     #481, not this task.
     """
     blockers = await repo.undelivered_blockers(db, task_id)
-    # #885: the gate's own merges are not the only way code reaches the base
-    # branch. Ask the branch itself before calling a blocker undelivered —
-    # otherwise the warning is wrong exactly where it is easiest to check,
-    # and a reader who catches it lying once stops reading it.
+    # #885: the gate's own merges are not the only way code reaches the base branch. Ask the
+    # branch itself before calling a blocker undelivered, or the warning is wrong exactly where
+    # it is easiest to check.
     from hub.services.delivery_state import with_delivery
 
     blockers = [b for b in await with_delivery(db, blockers) if not b.get("delivered")]
@@ -2049,13 +2034,11 @@ async def _pair_start_write(
             "status",
             f"Plan: {body.plan}",
         )
-    # #365 K4: the status was written unconditionally, and everything between
-    # the check above and this line is a window — branch preparation talks to
-    # git and can take seconds. Another claim, a human decision or the poller
-    # could move the task meanwhile, and the last writer simply won. Transition
-    # from the status we actually read, so a lost race is reported instead of
-    # overwriting somebody else's move. expected_from is that status and not a
-    # literal: pair-start legitimately begins from `open` or from `claimed`.
+    # #365: the status was written unconditionally, but branch preparation talks to git and can
+    # take seconds; another claim, a human decision or the poller could move the task meanwhile.
+    # Transition from the status actually read, so a lost race is reported instead of
+    # overwriting. expected_from is that status, not a literal: pair-start begins from `open` or
+    # `claimed`.
     if not await repo.transition_status_if(
         db, task_id, expected_from=starting_status, new_status="running"
     ):
@@ -2426,10 +2409,8 @@ def _risk_recompute_on_submit(
     candidates = [p for p in diff_paths if p not in commit_scope.ROUTINE_PATHS]
     new_class, reasons = derive_risk_class(candidates, project_map)
     if new_class is None:
-        # An observation, not a degradation: the branch really does change
-        # nothing the class cares about. Until #762 this printed the same way
-        # as an unreadable diff, so a stale ref in the workspace was
-        # indistinguishable from a branch with no changes in it.
+        # An observation, not a degradation: the branch really changes nothing the class cares
+        # about (#762). It must not read like an unreadable diff.
         return (
             {},
             "",
@@ -2628,12 +2609,9 @@ class SubmitContext:
     outcome_hint: Any = None
     outcome_writes: list[Any] = dc_field(default_factory=list)
     outcome_generation: int = 0
-    # Читается из политики при создании контекста, а НЕ внутри шага (#1067,
-    # находка ревью PR #247). Присваивание жило в теле _step_submit_rules, и
-    # при SUBMIT_RULES=off шаг пропускался целиком — заголовок отчёта выходил
-    # «режим правил: » с пустым местом там, где раньше стояло off. Режим
-    # политики есть всегда, даже когда шаг по ней не выполняется; это разные
-    # вещи, и путать их не должно.
+    # Read from policy when the context is created, NOT inside the step (#1067, review of #247):
+    # with SUBMIT_RULES=off the step is skipped entirely and the report header printed an empty
+    # mode. The policy mode always exists, even when the step does not run.
     rules_mode: str = dc_field(
         default_factory=lambda: (config.SUBMIT_RULES or "warn").strip().lower()
     )
@@ -2741,19 +2719,13 @@ async def _step_canonical_branch(state: SubmitContext) -> None:
 
 async def _step_branch_matches(state: SubmitContext) -> None:
     """Клиент работал в ветке, которой владеет задача (#533)."""
-    # #533: the task records a canonical branch; the client reports the one it
-    # worked in. A mismatch means the hub, CI and the reviewer are looking at
-    # a branch nobody wrote in.
+    # #533: the task records a canonical branch; the client reports the one it worked in. A
+    # mismatch means the hub, CI and the reviewer look at a branch nobody wrote in.
     #
-    # This compares a REPORT, not an observation. The hub has no working copy
-    # of the project to inspect — on production the workspace holds a single
-    # .placeholder file — so a client that names the right branch while
-    # sitting in another passes. It catches forgetting to switch, which is
-    # the failure that actually happens; it is not a guarantee, and the
-    # policy document says so in the same words.
-    #
-    # Pair path only: a headless task's branch belongs to the dispatch job,
-    # and the client never reports one.
+    # This compares a REPORT, not an observation: the hub has no working copy of the project
+    # (production holds a single .placeholder file), so a client naming the right branch while
+    # sitting in another passes. It catches forgetting to switch, not a lie; the policy document
+    # says so too. Pair path only: a headless branch belongs to the dispatch job.
     if state.reported and state.canonical and state.reported != state.canonical:
         raise HTTPException(
             409,
@@ -2826,15 +2798,11 @@ async def _step_surfaces(state: SubmitContext) -> None:
         if verdict == "undeclared":
             listed = ", ".join(undeclared[:10])
             if state.body.accept_areas:
-                # #890: affected_areas is written at DoR as a PREDICTION, and
-                # work discovers its own scope — #854 measured 46 of 104
-                # submissions changing files outside the declared set, and
-                # showed the residue is real surfaces, not routine noise.
-                # Refusing that punishes imprecise foresight; what review,
-                # commit-scope and the risk recompute actually need is that
-                # declared and actual agree AT SUBMISSION. So the submitter
-                # may accept the truth in one step — explicitly, and on the
-                # record below.
+                # #890: affected_areas is written at DoR as a PREDICTION and work discovers its
+                # own scope (#854: 46 of 104 submissions touched files outside it, real
+                # surfaces). Refusing punishes imprecise foresight; review and the risk
+                # recompute need declared and actual to agree AT SUBMISSION, so the submitter
+                # may accept the truth in one explicit, recorded step.
                 state.accepted_paths = list(undeclared)
                 # Deliberately NOT the "Вне объявленной области" wording: an
                 # accepted scope is a recorded fact, not an open divergence.
@@ -2869,20 +2837,17 @@ async def _step_surfaces(state: SubmitContext) -> None:
 
 async def _step_finding_outcomes(state: SubmitContext) -> None:
     """Исходы находок предыдущей сдачи (#911)."""
-    # #911: what became of the findings the PREVIOUS submission was sent back
-    # over. Placed with the other pre-transition gates for the same reason they
-    # are here — a refusal has to happen while there is still something to
-    # refuse — and before the paid layers, because it costs one indexed read.
+    # #911: what became of the findings the PREVIOUS submission was sent back over. A
+    # pre-transition gate (a refusal must happen while there is still something to refuse),
+    # before the paid layers because it costs one indexed read.
     #
-    # The generation asked about is the CURRENT one, before the bump below: the
-    # report for the submission being made does not exist yet. On a first
-    # submission there are no reports and the gate is silent, which is the
-    # point — it asks only where an answer is owed. If the current generation
-    # went unreviewed, the question is the newest earlier report's (#1331,
-    # finding_outcome.reports_owed_an_answer).
-    # Режим берётся у конвейера, если тот его назвал: done-путь объявляет
-    # потолок warn, и шаг обязан его соблюдать, а не перечитывать политику
-    # мимо потолка (#1122, #1155) — та же правка, что уже сделана у поверхностей.
+    # Asked about the CURRENT generation, before the bump below: the report for this submission
+    # does not exist yet. On a first submission there are no reports and the gate is silent. If
+    # the current generation went unreviewed, the question is the newest earlier report's
+    # (#1331, finding_outcome.reports_owed_an_answer).
+    #
+    # Режим берётся у конвейера, если тот его назвал: done-путь объявляет потолок warn, и шаг
+    # его соблюдает, а не перечитывает политику мимо потолка (#1122, #1155).
     outcome_mode = (
         (state.gate_mode or (config.FINDING_OUTCOME or "warn")).strip().lower()
     )
@@ -3073,12 +3038,9 @@ async def _step_submit_rules(state: SubmitContext) -> None:
                     "или назовите причину в сдаче."
                 )
             else:
-                # Silence on a clean run is deliberate. A line on every
-                # submission would be the noise this layer is supposed to
-                # replace — and #593 already names the failure mode: a gate
-                # that speaks constantly stops being read. What ran cleanly
-                # is listed below only when the report exists for some other
-                # reason.
+                # Silence on a clean run is deliberate: a line on every submission is the noise
+                # this layer replaces, and a gate that speaks constantly stops being read
+                # (#593). What ran cleanly is listed only when the report exists anyway.
                 state.clean_lines.append("Тесты рядом с кодом: проверено, чисто.")
             if (state.task.get("work_type") or "") == "bug" and commit_scope.tests_only(
                 state.diff_paths
@@ -3231,12 +3193,10 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
         state.db, state.task_id, state.task.get("branch") or ""
     )
     await expected_sha_gate.refuse_unless_head_is_expected(state)  # #1937
-    # #1687: the CI report for this commit is checked against GitHub NOW, also
-    # a rerun nobody reported, so the gates below and the adoption inside the
-    # lock read a standing that is current, not the one the last POST left.
-    # Never from inside a write transaction (the headless done path pins the
-    # tip there): the stored standing is what such a path reads, and the
-    # network refresh is done by the caller BEFORE it opens the transaction.
+    # #1687: the CI report for this commit is checked against GitHub NOW, also a rerun nobody
+    # reported, so the gates and the adoption inside the lock read a current standing. Never
+    # from inside a write transaction: such a path reads the stored standing, and the caller
+    # refreshes over the network BEFORE opening it.
     prepared = state.task.get(PREPARED_CI_SHA)
     if getattr(state, "dry_run", False):
         # #1975: the same question to GitHub, answered in memory; the gates read it.
@@ -3310,12 +3270,10 @@ async def _step_empty_resubmission(state: SubmitContext) -> None:
 
 async def _step_delivery_pr(state: SubmitContext) -> None:
     """PR, который повезёт работу (#605, #967, #975)."""
-    # #605: record which PR carries this work. The pair flow never sets
-    # pr_number — only headless create_pr does — so the delivery gate would
-    # have keyed on a field nobody fills. The hub looks it up itself; a
-    # discovery failure records nothing and the submission proceeds, because
-    # a task that genuinely has no PR (config work) must submit exactly as
-    # before — the gate then completes it untouched.
+    # #605: record which PR carries this work. The pair flow never sets pr_number (only headless
+    # create_pr does), so the delivery gate would key on a field nobody fills. A discovery
+    # failure records nothing and the submission proceeds: a task with no PR (config work) must
+    # submit as before.
     state.discovered_pr = None
     state.pr_opened_by_hub = False
     state.pr_ensure_note = ""
@@ -3337,13 +3295,10 @@ async def _step_delivery_pr(state: SubmitContext) -> None:
                 state.canonical,
                 exc,
             )
-        # #967: discovery finding nothing used to end the question — and four
-        # tasks in one week ended completed with commits stranded on a branch.
-        # When THIS submission's diff (#583, resolved once above) positively
-        # shows changes, the hub opens the PR itself: CI then runs in parallel
-        # with the review instead of starting after done. A refusal is a
-        # warning, never a failed submission — the review in the hub is valid
-        # without a PR; the done gate is where the missing PR becomes a block.
+        # #967: discovery finding nothing used to end the question, and commits stayed stranded
+        # on a branch. When THIS submission's diff (#583) shows changes, the hub opens the PR
+        # itself, so CI runs in parallel with review. A refusal is a warning, never a failed
+        # submission; the done gate is where a missing PR becomes a block.
         if not state.discovered_pr and state.diff_paths:
             state.discovered_pr, state.pr_ensure_note = await ensure_delivery_pr(
                 state.db, state.task, state.canonical, state.diff_paths
@@ -3372,22 +3327,16 @@ async def _step_delivery_pr(state: SubmitContext) -> None:
             )
 
 
-# Порядок сдачи. Он и был несущим — сетевые резолвы до транзакции, отказ до
-# записи, — но держался тем, что никто не переставил блоки. Теперь его можно
-# сверить тестом и сравнить с набором headless-пути.
+# Порядок сдачи. Он несущий — сетевые резолвы до транзакции, отказ до записи, — и теперь его
+# можно сверить тестом и сравнить с набором headless-пути.
 #
-# #1265, круг 2 (находка Codex #1 на 41159735): список расколот на ДВЕ
-# половины. surfaces/finding_outcomes/submit_rules — гейты, чей ответ
-# меняется НЕ от кода, а от времени: находка может лечь на поколение между
-# оригинальной сдачей и её точным повтором, и режим require может включиться
-# между ними же. Повтор запроса, который сдача уже приняла однажды, не
-# должен получить отказ, которого не получил оригинал — поэтому «тот же ли
-# это sha» распознаётся ДО них, сразу после дешёвых, неизменных во времени
-# отказов и пиннинга вершины (сам pin переехал раньше по той же причине —
-# без него сравнивать не с чем). submit_for_review прогоняет первую половину,
-# проверяет флаг и либо уходит в _same_sha_noop_response, либо продолжает
-# второй половиной — gate_pipeline.run_steps не трогается, деление снаружи
-# него.
+# #1265: список расколот на ДВЕ половины. surfaces/finding_outcomes/submit_rules — гейты, чей
+# ответ меняется со временем, а не от кода: находка может лечь на поколение между сдачей и её
+# точным повтором, режим require — включиться. Повтор принятой сдачи не должен получить отказ,
+# которого не получил оригинал, поэтому «тот же ли sha» распознаётся ДО них, сразу после дешёвых
+# неизменных отказов и пиннинга вершины. submit_for_review прогоняет первую половину, проверяет
+# флаг и уходит в _same_sha_noop_response либо продолжает второй; gate_pipeline.run_steps не
+# тронут.
 SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("task_is_submittable", _step_task_is_submittable),
     Step("canonical_branch", _step_canonical_branch, refuses=False),
@@ -3430,19 +3379,13 @@ SUBMIT_STEPS: tuple[Step[SubmitContext], ...] = (
 )
 
 
-# Порядок headless-пути (#1122). Тот же список шагов и те же функции, что у
-# сдачи pair-задачи: общий SubmitContext с пустым телом позволяет обоим путям
-# исполнять ОДНИ шаги, и только поэтому наборы можно сравнивать по существу, а
-# не по совпадению названий.
+# Порядок headless-пути (#1122; матрица решений — #5206). Те же шаги и функции, что у сдачи
+# pair-задачи: общий SubmitContext с пустым телом даёт исполнять ОДНИ шаги, поэтому наборы
+# сравниваются по существу.
 #
-# Решение по каждому гейту принято владельцем 01.09.2026 (матрица в апдейте
-# #5206 задачи #1122). Два шага объявлены и НЕ выполняются — с причиной прямо
-# здесь: молчание в списке неотличимо от «забыли», и именно так расхождение
-# двух путей прожило незамеченным до #1067.
-#
-# Поверхности и правила стоят под потолком warn: путь получает эти гейты
-# впервые, и включить их сразу отказом значит остановить поток на первой же
-# задаче, которая раньше проходила.
+# Два шага объявлены и НЕ выполняются — с причиной прямо здесь: молчание в списке неотличимо от
+# «забыли». Поверхности и правила стоят под потолком warn: путь получает эти гейты впервые, и
+# отказ сразу остановил бы поток на первой же прежде проходившей задаче.
 HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
     Step("canonical_branch", _step_canonical_branch, refuses=False),
     Step(
@@ -3482,11 +3425,9 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
     ),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
     Step("surfaces", _step_surfaces, mode=capped_at_warn("SDD_SURFACES")),
-    # #1155: поле у done-отчёта появилось, отвечать теперь есть чем — шаг
-    # включён, и причина неактивности снята вместе с ней, а не оставлена
-    # ссылаться на закрытую задачу. Под потолком warn, как поверхности и
-    # правила: решение «warn против require» на этом пути остаётся за
-    # владельцем, и снятие потолка будет правкой одной строки в этом списке.
+    # #1155: у done-отчёта появилось поле, отвечать есть чем — шаг включён. Под потолком warn,
+    # как поверхности и правила; «warn против require» на этом пути решает владелец, снятие
+    # потолка — правка одной строки списка.
     Step(
         "finding_outcomes",
         _step_finding_outcomes,
@@ -3575,14 +3516,11 @@ async def submit_for_review(
     await run_steps(state, SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK)
 
     if state.same_sha_noop:
-        # #1265: the pipeline named this a duplicate of the current
-        # generation BEFORE the gates whose answer can drift between the
-        # original submission and this identical retry (finding_outcomes,
-        # submit_rules) — a repeat must not meet a refusal the original
-        # never faced (Codex finding #1 on 41159735). No transition, no
-        # push/PR (finding #3); the caller's payload still lands (finding
-        # #2, AC-5); the review-dispatch DECISION still runs on generation N
-        # exactly as #1150/#1152 always ran it (AC-1).
+        # #1265: the pipeline named this a duplicate of the current generation BEFORE the gates
+        # whose answer can drift between the original and this identical retry
+        # (finding_outcomes, submit_rules): a repeat must not meet a refusal the original never
+        # faced. No transition, no push/PR; the caller's payload still lands; the
+        # review-dispatch DECISION still runs on generation N as in #1150/#1152.
         return await _same_sha_noop_response(state)
 
     await run_steps(state, SUBMIT_STEPS_AFTER_SAME_SHA_CHECK)
@@ -3621,22 +3559,17 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
     agent = (body.agent or state.task.get("assigned_agent") or "").strip()
 
     if body.accept_areas:
-        # Код не менялся — дифф тот же, что видела бы обычная сдача, но он
-        # нигде не закэширован: читаем заново. ДО блокировки записи, как у
-        # обычной сдачи (resolve_diff стоит в конвейере до перехода): это
-        # сетевой git, и держать под ним BEGIN IMMEDIATE значит останавливать
-        # все записи хаба (#1265, Cursor #380, 8a892feff574a2a6).
+        # Код не менялся, но дифф нигде не закэширован: читаем заново, ДО блокировки записи, как
+        # у обычной сдачи. Это сетевой git, и держать под ним BEGIN IMMEDIATE значит
+        # останавливать все записи хаба (#1265, #380).
         await _step_resolve_diff(state)
-        # Тот же шаг сверки области, что у обычной сдачи: он сам отбрасывает
-        # ROUTINE_PATHS, признаёт только настоящий выход за объявленную
-        # область и называет «сверка НЕ выполнялась», когда дифф не прочитан,
-        # вместо молчаливого успеха (Cursor #383, 40af8ae7af0f7943). С
-        # accept_areas он не отказывает — признанный объём не расхождение.
-        # Шаг вызывается МИМО конвейера, а run_steps оставил в gate_mode режим
-        # последнего своего шага (always) — с ним SDD_SURFACES=off не
-        # действовал бы, и повтор расширял бы область, которую оригинал не
-        # трогал. Пустой режим — «вне конвейера, читай политику» (Cursor #386,
-        # f4ec12806d4c263e).
+        # Тот же шаг сверки области, что у обычной сдачи: он отбрасывает ROUTINE_PATHS, признаёт
+        # только настоящий выход за область и называет «сверка НЕ выполнялась», когда дифф не
+        # прочитан. С accept_areas он не отказывает.
+        #
+        # Шаг зовётся МИМО конвейера, а run_steps оставил в gate_mode режим последнего шага
+        # (always) — с ним SDD_SURFACES=off не действовал бы. Пустой режим значит «вне
+        # конвейера, читай политику».
         state.gate_mode = ""
         await _step_surfaces(state)
 
@@ -3650,15 +3583,13 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         # того, как решение о ревью уходит за пределы транзакции ниже.
         # Поколение, которому отвечают исходы, — ТЕКУЩЕЕ: здесь оно не растёт.
         open_items = await finding_outcome.open_findings(db, task_id, generation)
-        # AC-3: повтор тела, чьи исходы уже записал предыдущий такой же вызов,
-        # не становится ошибкой — такие uid отвечены на ЭТОМ поколении и
-        # просто пропускаются. Но uid, которого у поколения нет вовсе
-        # (опечатка), — не повтор: обычная сдача ответила бы на него 422, и
-        # здесь ответ тот же, а не молчаливый успех над выброшенными данными
-        # (AC-5; Cursor #380, 97ee0d78bda22c1c).
-        # Отчёты — те же, из которых собран open_items (#1331): у поколения
-        # без ревью это отчёты последнего поколения, где ревью было. Свой
-        # перебор поколения здесь развёл бы «отвечено» и «открыто».
+        # Повтор тела, чьи исходы уже записал такой же вызов, не ошибка: такие uid отвечены на
+        # ЭТОМ поколении и пропускаются. Но uid, которого у поколения нет вовсе (опечатка), — не
+        # повтор: обычная сдача ответила бы 422, и здесь то же, а не молчаливый успех над
+        # выброшенными данными.
+        #
+        # Отчёты — те же, из которых собран open_items (#1331): у поколения без ревью это отчёты
+        # последнего поколения с ревью, иначе «отвечено» и «открыто» разойдутся.
         pending = await finding_outcome.items_still_to_plan(
             db, task_id, generation, open_items, body.finding_outcomes
         )
@@ -3760,15 +3691,10 @@ def _submission_update_text(
     if state.submission_sha:
         content += f" Branch tip at submission: {state.submission_sha[:12]}."
     else:
-        # Unchecked is a state the reviewer must see, not an absence of
-        # news — the same rule the drift guard follows (#534, #572).
-        # #767: this line used to hang off ``if adopted`` — the CI-report
-        # branch — while speaking about pinning. A submission with a
-        # pinned sha and no CI report to adopt therefore printed both
-        # "Branch tip at submission: 97e4707248ee" and "Branch tip NOT
-        # pinned: " with an empty reason, contradicting itself in one
-        # sentence (seen on #725 and #763). It belongs to the sha, so it
-        # is bound to the sha.
+        # Unchecked is a state the reviewer must see, not an absence of news (#534, #572). This
+        # line is bound to the sha, not to ``if adopted`` (the CI-report branch, #767; seen on
+        # #725, #763): otherwise a pinned sha with no CI report printed both "Branch tip at
+        # submission" and "Branch tip NOT pinned: " in one sentence.
         content += f" Branch tip NOT pinned: {state.sha_reason}."
     if state.resubmitted_from_review:
         # #1054: someone may be reading the previous submission right now.
@@ -3792,10 +3718,8 @@ def _submission_update_text(
             f" CI run report NOT adopted for this commit: {adopted['not_adopted']}."
         )
     elif adopted:
-        # #1056: the count used to stand here, so five not_found results
-        # printed exactly like five passing ones. The reader of the feed —
-        # the human at the gate — got "5 AC result(s)" as if it were
-        # evidence. What is printed now is the outcome.
+        # #1056: print the outcome, not the count: five not_found results must not read like
+        # five passing ones to the human at the gate.
         from hub.services.ac_tests import describe_recorded_results
 
         ac_phrase = describe_recorded_results(adopted.get("ac_recorded"))
@@ -3862,12 +3786,10 @@ async def _record_accepted_scope(
         return
     declared = deserialize_str_list(task.get("affected_areas"))
     merged = list(declared) + [p for p in accepted_paths if p not in declared]
-    # #1592: NOT TaskRefine(affected_areas=...). Its max_length=20 is the limit
-    # on what an AGENT may send through refine; the accepted scope is a fact
-    # about the diff, and on a wide task declared+accepted passes 20 (28 on
-    # #1589 on 05.10 -> ValidationError -> bare 500). The hub's own write
-    # bypasses the input model; every reader takes the column as is. We are in
-    # the caller's transaction, so a failure here leaves the submission whole.
+    # #1592: NOT TaskRefine(affected_areas=...): its max_length=20 limits what an AGENT may send
+    # through refine, while the accepted scope is a fact about the diff and on a wide task
+    # declared+accepted passes 20 (bare 500 on #1589). The hub's own write bypasses the input
+    # model. We are in the caller's transaction, so a failure leaves the submission whole.
     await repo.update_task(
         db, task_id, affected_areas=db_module.serialize_str_list(merged)
     )
@@ -4084,14 +4006,14 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
                 f"Task #{task_id} left {task['status']} state during submit; "
                 "retry from its current status",
             )
-        # #911: only now, past every gate that could still refuse. The write
-        # goes to the process-wide connection, and a refusal after it would
-        # leave the author's outcomes recorded for a submission that never
-        # happened — their corrected retry would then be told the finding is
-        # already closed. Written BEFORE the bump so the rows belong to the
-        # generation they answer, not to the one starting here.
-        # Пишем В КОНТЕКСТ: заметку ниже печатает _write_submission_notices,
-        # и она читает его, а не локальную.
+        # #911: only now, past every gate that could still refuse. The write goes to the
+        # process-wide connection, and a refusal after it would leave outcomes recorded for a
+        # submission that never happened, so the corrected retry would be told the finding is
+        # already closed. Written BEFORE the bump so the rows belong to the generation they
+        # answer.
+        #
+        # Пишем В КОНТЕКСТ: заметку ниже печатает _write_submission_notices, и она читает его, а
+        # не локальную.
         await record_finding_outcomes(
             state,
             reported_by=(body.agent or task.get("assigned_agent") or ""),
@@ -4402,18 +4324,12 @@ async def _vstep_default_approval_is_the_stewards(state: VerdictContext) -> None
 
 async def _vstep_changes_requested_has_content(state: VerdictContext) -> None:
     """«Вернуть и переделать» обязано сказать, что переделать (#1010)."""
-    # #1010: "take it back and redo it" must say what to redo. On 28.08 a verdict
-    # came in with no findings and no comments: the task went back to running,
-    # the feed said "Review verdict: CHANGES_REQUESTED" and nothing else, and
-    # the developer's only options were to guess or to ask the human the gate
-    # exists to spare. Every neighbouring gate already demands content — DoR
-    # refuses a task without acceptance criteria, submission refuses a branch
-    # it cannot name, delivery refuses a task without a live verdict — and
-    # this one asked for nothing. Either field satisfies it: one sentence is a
-    # reason, and demanding structured findings for "tests are red" would buy
-    # a formality. APPROVED stays free of the requirement (it is
-    # self-sufficient), which is why it is now filed under its author instead
-    # — see the principal_id passed from the web form.
+    # #1010: "take it back and redo it" must say what to redo. A verdict with no findings and no
+    # comments sent the task back to running with nothing but "CHANGES_REQUESTED" in the feed,
+    # and the developer could only guess or ask the human the gate exists to spare. Either field
+    # satisfies the check: one sentence is a reason, and demanding structured findings for
+    # "tests are red" would buy a formality. APPROVED stays free of it (self-sufficient); it is
+    # filed under its author via the principal_id passed from the web form.
     if (
         state.body.verdict.value == "changes_requested"
         and not state.body.findings
@@ -4424,10 +4340,9 @@ async def _vstep_changes_requested_has_content(state: VerdictContext) -> None:
 
 async def _vstep_verdict_matches_its_text(state: VerdictContext) -> None:
     """Вердикт не противоречит собственному тексту (#1057)."""
-    # #1057: the same gate, two more things it can see. Both refusals happen
-    # here, before any write, so a rejected verdict leaves the task in review
-    # with its submission generation untouched — the property #1010 established
-    # and the reason these checks belong beside it rather than in the caller.
+    # #1057: the same gate, two more things it can see. Both refusals happen before any write,
+    # so a rejected verdict leaves the task in review with its submission generation untouched
+    # (the property #1010 established).
     state.body_text = verdict_text.verdict_body(
         state.body.comments, [f.message for f in state.body.findings]
     )
@@ -4593,13 +4508,11 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
 
 async def _vstep_branch_tip_matches(state: VerdictContext) -> None:
     """Ветка стоит там же, где на сдаче (#572). Не отказывает — называет."""
-    # #572: does the branch still stand where it stood at submission? Only
-    # APPROVED is checked — it is the verdict that creates the false safety of
-    # review_approved_current, while changes_requested returns the task to
-    # work anyway. Three outcomes, never collapsed: diverged / match /
-    # could-not-check with the reason. Resolved before the write lock (it
-    # walks to the network), and a resolution failure degrades to a visible
-    # "unchecked" — a verdict must not be hostage to the remote.
+    # #572: does the branch still stand where it stood at submission? Only APPROVED is checked:
+    # it creates the false safety of review_approved_current, while changes_requested returns
+    # the task to work anyway. Three outcomes, never collapsed: diverged / match /
+    # could-not-check with the reason. Resolved before the write lock (network); a resolution
+    # failure degrades to a visible "unchecked", never blocks the verdict.
     state.pinned_sha = (state.task.get("submission_sha") or "").strip()
     state.diverged_tip = ""
     state.sha_note = ""
@@ -4630,12 +4543,10 @@ async def _vstep_ci_integrity_scanned(state: VerdictContext) -> None:
 
 async def _vstep_approval_blind_spots(state: VerdictContext) -> None:
     """Что аппрув может молча перекрыть (#1012). Не отказывает — называет."""
-    # #1012: the other thing an approval can quietly override. The report is
-    # already bound to a submission and already knows whether the gate judged
-    # its findings; what was missing is anyone saying so at the moment the
-    # verdict is written. Read here, next to the sha check, for the same
-    # reason: both are questions about what the approver may not have seen,
-    # and neither may hold the write lock while it answers.
+    # #1012: the other thing an approval can quietly override. The report is bound to a
+    # submission and knows whether the gate judged its findings; nobody said so when the verdict
+    # is written. Read next to the sha check, outside the write lock, for the same reason: both
+    # are about what the approver may not have seen.
     state.undisposed_note = ""
     state.inflight_note = ""
     if state.body.verdict.value == "approved":
@@ -5081,14 +4992,12 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
                 db, task_id, expected_from="review", new_status="running"
             )
             if diverged_tip:
-                # The verdict stays recorded for the audit trail, but it must
-                # not read as covering code the reviewer never saw. Bumping
-                # the generation stales it by the SAME mechanism a
-                # resubmission uses — review_approved_current goes false —
-                # and the task is already back in running, so there is a
-                # legal way forward: resubmit and let review see the real
-                # tip (#572). A hard refusal would leave the task locked in
-                # review with no exit — the dead end #547 hit.
+                # The verdict stays recorded for audit but must not read as covering code the
+                # reviewer never saw. Bumping the generation stales it by the same mechanism as
+                # a resubmission (review_approved_current goes false), and the task is already
+                # back in running, so there is a legal way forward: resubmit and let review see
+                # the real tip (#572). A hard refusal would lock the task in review with no exit
+                # (#547).
                 ghost_generation = await repo.bump_submission_generation(db, task_id)
                 await repo.update_task(db, task_id, submission_sha="")
             if body.verdict.value == "changes_requested":
@@ -5758,13 +5667,14 @@ async def return_to_work(
     task = dict(row)
     from_status = task["status"]
     state_task = is_state(task)
-    # #1647: задачу-состояние возвращают и из running после отказного вердикта,
-    # и из needs_info, и из open (ушла по реестру сессий): без этой двери
-    # замороженную постановку нельзя было бы править.
-    # #1648: и из completed. Завершённую без действующего одобрения (force-
-    # complete, decide accept) state-задачу иначе нельзя ни сдать, ни одобрить:
-    # зависимые ждут принятия, а пути к нему нет. Вызывающий — человек (REST и
-    # веб-форма проверяют роль); commit-задача из completed по-прежнему 400.
+    # #1647: the state task is returned from running after a refusing verdict, from needs_info
+    # and from open (left by the session registry); without this door a frozen statement could
+    # not be edited.
+    #
+    # #1648: and from completed: a state task completed without a standing approval
+    # (force-complete, decide accept) can otherwise be neither submitted nor approved while
+    # dependents wait. The caller is a human (REST and web check the role); a commit task from
+    # completed is still 400.
     if from_status in RETURN_RUNNING_STATUSES and not state_task:
         return await return_running_to_open(db, task_id, body, actor=actor)
     allowed = RETURN_TO_WORK_STATUSES | (
@@ -6008,12 +5918,10 @@ async def decide_task(
                 actor="human",
                 payload={"via": "decide_accept"},
             )
-            # #737: the decision gate is a human gate like approve and verdict,
-            # but until this event it left no machine-readable trace of the
-            # OUTCOME — accept vs rework — so its override-rate was uncountable.
-            # entered_at is when the task hit needs_decision (status_entered_at
-            # advances only on real status changes, #416), which makes the queue
-            # wait computable.
+            # #737: the decision gate is a human gate like approve and verdict, but left no
+            # machine-readable trace of the OUTCOME (accept vs rework), so its override-rate was
+            # uncountable. entered_at is when the task hit needs_decision (status_entered_at
+            # moves only on real status changes, #416), which makes the queue wait computable.
             await repo.insert_event(
                 db,
                 kind="task_decided",
@@ -6618,14 +6526,12 @@ async def force_complete_task(
         await repo.update_task(db, task_id, **update_fields)
         await db.commit()
         await maybe_rollup_parent(db, task_id)
-    # Outside the write lock: this asks git and possibly GitHub, and holding a
-    # database lock across a network call is how a slow provider becomes an
-    # outage. The completion is already committed — this is a note about it.
+    # Outside the write lock: this asks git and possibly GitHub, and a database lock held across
+    # a network call turns a slow provider into an outage. The completion is already committed;
+    # this is a note about it.
     #
-    # #1037: force-complete writes the same pr_disposition as decide, so it
-    # gets the same delivery. Left out, it would stay the second door with the
-    # same silence behind it — and the one people reach for when the first
-    # refuses.
+    # #1037: force-complete writes the same pr_disposition as decide, so it gets the same
+    # delivery; otherwise it stays the second door with the same silence behind it.
     _, _, search_unanswered = await deliver_on_disposition(
         db,
         task_id,
@@ -6740,12 +6646,10 @@ async def deliver_on_disposition(
         await db.commit()
         return False, "no_approved_review", False
 
-    # #1261: the recorded pr_number is a cached observation (#959), same as
-    # on the sweep and the done-report path — a stacked PR can close when
-    # its base merges and its branch is deleted, with no action from this
-    # task at all (#774, #880, #1204). Resolving here reuses the one rule
-    # in pr_for_delivery rather than handing merge_before_completion a
-    # number that may no longer name anything mergeable.
+    # #1261: the recorded pr_number is a cached observation (#959), as on the sweep and the
+    # done-report path: a stacked PR can close when its base merges, with no action from this
+    # task (#774, #1204). Resolving here reuses the one rule in pr_for_delivery instead of
+    # handing merge_before_completion a number that may name nothing mergeable.
     task, delivery_pr = await resolve_delivery_pr(db, task)
     if delivery_pr.reason:
         # Said once, regardless of outcome, as the sweep and done-report do
@@ -6784,25 +6688,18 @@ async def deliver_on_disposition(
             merged=True,
         )
     elif delivery_pr.unusable and delivery_pr.search_unanswered:
-        # #1261 (Cursor/grok-4.6, report #376, finding 40adcc8f02f26c98): the
-        # "нет открытого PR" text just below is a FACT — the search for a
-        # replacement answered "none". Here it did not answer at all (it
-        # raised); reading that silence as "no open PR" is exactly what
-        # #725/#802/#959 forbid. The recorded PR is still named closed — that
-        # part IS known — but whether a replacement exists is not. No exit is
-        # named, because none exists on this path: decide/force-complete have
-        # already committed the task as completed before this runs, so a second
-        # decision is refused and the delivery sweep no longer picks it up
-        # (Cursor #378, 5a41a733cbb3e7be); and the undelivered-work registry
-        # (#1198) lists pr_open/unknown rows only, while this closed recorded
-        # PR is written as pr_closed right after (Cursor #379, f43a94d860cfc4e1).
+        # #1261: the "нет открытого PR" text below is a FACT (the search for a replacement
+        # answered "none"). Here the search raised (#376); reading that silence as "no open PR"
+        # is what #725/#802/#959 forbid. The recorded PR is known closed, a replacement is not.
+        # No exit is named, because none exists on this path: decide/force-complete already
+        # committed the task as completed, so a second decision is refused and the delivery
+        # sweep no longer picks it up (#378); the undelivered-work registry (#1198) lists only
+        # pr_open/unknown rows, while this PR was written as pr_closed (#379).
         #
-        # #1267 fixed the second half: note_completion_without_delivery now
-        # reads search_unanswered (returned by this function, below) and
-        # writes the row as unknown with a named cause instead of pr_closed
-        # "свернули намеренно". That row IS in the registry a reader can see
-        # (hub_undelivered_completed / hub_task_status), so the text below
-        # names it — it is no longer a place with nothing to find.
+        # #1267: note_completion_without_delivery reads search_unanswered (returned by this
+        # function, below) and writes the row as unknown with a named cause instead of
+        # pr_closed. That row IS in the registry a reader can see (hub_undelivered_completed /
+        # hub_task_status), so the text below names it.
         await repo.add_task_update(
             db,
             task_id,
@@ -6818,13 +6715,11 @@ async def deliver_on_disposition(
             "переспросит её сам, когда поиск ответит (#1267).",
         )
     elif delivery_pr.unusable:
-        # #1261 (Codex, P2): the generic "PR остался открытым" text below is
-        # false here — unusable means the recorded PR is closed or absent and
-        # the search for a replacement ANSWERED "none" (search_unanswered is
-        # False here — see the branch above for when it did not), so there is
-        # no open PR for a human to find. Closed is terminal (no reopening),
-        # so this must not read as a transient state either — mergeable is
-        # not "not yet merged".
+        # #1261: the generic "PR остался открытым" text below is false here: unusable means the
+        # recorded PR is closed or absent and the replacement search ANSWERED "none"
+        # (search_unanswered is False; see the branch above for when it did not), so no open PR
+        # exists for a human to find. Closed is terminal, so this must not read as a transient
+        # state either: mergeable is not "not yet merged".
         await repo.add_task_update(
             db,
             task_id,
