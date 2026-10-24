@@ -78,6 +78,7 @@ async def test_the_process_lock_is_taken_once_per_process(lock_path):
     assert rework_launch.claim_process(lock_path) is True
     assert rework_launch.claim_process(lock_path) is True  # второе приложение
     rework_launch.release_process(lock_path)
+    rework_launch.release_process(lock_path)
     holder = _other_process_holds(lock_path)
     try:
         assert rework_launch.claim_process(lock_path) is False

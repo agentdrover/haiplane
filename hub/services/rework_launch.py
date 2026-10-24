@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import secrets
 import sqlite3
@@ -49,6 +50,60 @@ LAUNCHED = "launched"
 DECLINED = "declined"
 NEEDS_HUMAN = "needs_human"
 CLOSED = "closed"
+
+
+# Единственность процесса на базе: восстановление по BOOT_ID верно, пока второго
+# живого хаба на той же базе нет. Блокировка берётся один раз на процесс и путь
+# (несколько приложений в одном процессе делят её); второй процесс не сверяет
+# брони и не заказывает доработку, пока не получит блокировку сам.
+_HELD: dict[str, list[Any]] = {}
+_FOREIGN: set[str] = set()
+
+
+def claim_process(db_path: Any) -> bool:
+    """Взять исключительное право на базу для этого процесса."""
+    key = str(db_path)
+    held = _HELD.get(key)
+    if held is not None:
+        held[1] += 1
+        _FOREIGN.discard(key)
+        return True
+    try:
+        handle = open(f"{key}.owner.lock", "a+")  # noqa: SIM115
+    except OSError:
+        log.warning(
+            "блокировка владельца базы %s недоступна: считаем себя владельцем", key
+        )
+        return True
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        _FOREIGN.add(key)
+        return False
+    _HELD[key] = [handle, 1]
+    _FOREIGN.discard(key)
+    return True
+
+
+def release_process(db_path: Any) -> None:
+    key = str(db_path)
+    held = _HELD.get(key)
+    if held is None:
+        _FOREIGN.discard(key)
+        return
+    held[1] -= 1
+    if held[1] <= 0:
+        del _HELD[key]
+        held[0].close()
+
+
+def owns_db() -> bool:
+    """Этот процесс вправе сверять брони и заказывать доработку (с повтором попытки)."""
+    from hub import config
+
+    key = str(config.HUB_DB_PATH)
+    return key not in _FOREIGN or claim_process(key)
 
 
 def marker(reservation_id: int) -> str:
@@ -219,6 +274,12 @@ async def reserve(
     """
     from hub.services import executor_launch
 
+    if not owns_db():
+        raise HTTPException(
+            503,
+            "Другой экземпляр хаба держит эту базу: доработку заказывает он. "
+            "Повторите запрос позже.",
+        )
     task = await require_entry(db, task_id)
     if not confirm_no_job:
         await refuse_unconfirmed_outcome(db, task_id)
@@ -484,6 +545,8 @@ async def sweep(db: aiosqlite.Connection) -> None:
     Бронь текущего процесса не трогается: его отправитель может ещё создать
     задание, и время этого не опровергает.
     """
+    if not owns_db():
+        return
     rows = await fetchall(
         db,
         "SELECT * FROM rework_launches r WHERE "

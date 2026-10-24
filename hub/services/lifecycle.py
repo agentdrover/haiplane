@@ -6050,39 +6050,44 @@ async def decide_task(
         update_content = f"Human requested rework after arbiter review: {instructions}"
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
-        async with write_transaction(db):
-            # #1991: вход needs_decision потребляется ВМЕСТЕ с записью решения;
-            # проигравший вход получает 409 и ничего не пишет.
-            task, reservation_id = await rework_launch.reserve(
-                db, task_id, confirm_no_job=body.confirm_no_job
-            )
-            await repo.add_task_update(db, task_id, "human", "decision", update_content)
-            closed_generation = await close_approval_for_rework(db, task_id, task)
-            # #737: same trace as the accept branch — rework is the "override"
-            # outcome of the decision gate.
-            await repo.insert_event(
-                db,
-                kind="task_decided",
-                task_id=task_id,
-                actor="human",
-                payload={
-                    "action": "rework",
-                    "entered_at": task.get("status_entered_at") or "",
-                    # #1286: how many approvals a rework revokes is a number
-                    # somebody will want; reading it out of feed prose is not a
-                    # way to count. Null when there was nothing to close.
-                    "closed_verdict_generation": closed_generation,
-                    **owner_minutes.stamp(who),
-                },
-            )
+        reservation_id = 0
         try:
+            async with write_transaction(db):
+                # #1991: вход needs_decision потребляется ВМЕСТЕ с записью решения;
+                # проигравший вход получает 409 и ничего не пишет.
+                task, reservation_id = await rework_launch.reserve(
+                    db, task_id, confirm_no_job=body.confirm_no_job
+                )
+                await repo.add_task_update(
+                    db, task_id, "human", "decision", update_content
+                )
+                closed_generation = await close_approval_for_rework(db, task_id, task)
+                # #737: same trace as the accept branch — rework is the "override"
+                # outcome of the decision gate.
+                await repo.insert_event(
+                    db,
+                    kind="task_decided",
+                    task_id=task_id,
+                    actor="human",
+                    payload={
+                        "action": "rework",
+                        "entered_at": task.get("status_entered_at") or "",
+                        # #1286: how many approvals a rework revokes is a number
+                        # somebody will want; reading it out of feed prose is not a
+                        # way to count. Null when there was nothing to close.
+                        "closed_verdict_generation": closed_generation,
+                        **owner_minutes.stamp(who),
+                    },
+                )
             await db.commit()
             await _after_rework_decision(
                 db, task_id, task, instructions, reservation_id
             )
         except BaseException:
-            # Решение записано, заказ не дошёл до диспетчера: отправителя нет.
-            await rework_launch.release_sender(db, reservation_id)
+            # Любой сбой или отмена после коммита брони, включая сам COMMIT:
+            # отправителя нет, бронь освобождается для сверки.
+            if reservation_id:
+                await rework_launch.release_sender(db, reservation_id)
             raise
         await log_activity(
             db,

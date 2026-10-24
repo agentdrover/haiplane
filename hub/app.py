@@ -160,7 +160,7 @@ from hub.mcp_catalog import (
 )
 from hub.services import accepted_delivery_retry
 from hub.services import admin as admin_svc
-from hub.services import chat_pair
+from hub.services import chat_pair, rework_launch
 from hub.services import owner_minutes, policy_change, project_policy, triage_inbox
 from hub.services.brief_failure import scrub_strings
 from hub.services.refusal_publish import update_views
@@ -445,6 +445,12 @@ async def lifespan(app: FastAPI):
     # корутины фиксирует незакоммиченное другой — хаб описал эту дыру сам в
     # docstring get_write_lock и отложил как hardening work.
     app.state.dsn = str(config.HUB_DB_PATH)
+    if not rework_launch.claim_process(config.HUB_DB_PATH):
+        log.warning(
+            "На базе %s работает другой экземпляр хаба: сверку броней и заказ "
+            "доработки он ведёт сам, этот экземпляр их не выполняет",
+            config.HUB_DB_PATH,
+        )
     app.state.db = await get_db()
     log.info("Hub database ready at %s", config.HUB_DB_PATH)
     # MCP usage telemetry (#780) writes through this connection. It is handed
@@ -481,6 +487,7 @@ async def lifespan(app: FastAPI):
         )
         set_telemetry_sink(None)
         await app.state.db.close()
+        rework_launch.release_process(config.HUB_DB_PATH)
 
 
 async def _provision_project_detached(app: FastAPI, pid: int, *, actor: str) -> None:
