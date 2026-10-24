@@ -113,6 +113,48 @@ async def _make_outcome(db, monkeypatch, scene: str):
         monkeypatch.setattr(steward_applied, "self_approval_for", missing)
         assert await _apply_outcome(db, case) == "escalated"
         return case, "self_approval_not_converged"
+    if scene == "daily_cap":
+        case = await build_case(
+            db,
+            monkeypatch,
+            "own-cap",
+            policy=policy_of("r2", None, None),
+            risk="R2",
+            order=False,
+        )
+        from hub import config
+        from hub.services.steward_dispatch import order_run
+
+        monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 0)
+        assert await order_run(db, case.task_id, 1) is None
+        return case, "steward_daily_cap"
+    if scene == "advisor_skipped":
+        from hub.services import steward_advisor_skip
+
+        case = await _approved_case(db, monkeypatch, "own-skip", concur=None)
+        assert await steward_advisor_skip.record_skip(
+            db, case.task_id, 1, "ci_integrity", "целостность CI"
+        )
+        await db.commit()
+        return case, "steward_advisor_skipped"
+    if scene == "apply_interrupted":
+        from hub.services import steward_advisor
+
+        case = await _approved_case(db, monkeypatch, "own-interrupted")
+        await db.execute(
+            "UPDATE steward_judgements SET advisor_outcome='applying', "
+            "advisor_claimed_at=datetime('now','-1 day') WHERE task_id=?",
+            (case.task_id,),
+        )
+        await db.commit()
+        assert await steward_advisor._escalate_interrupted(db) == 1
+        return case, "advisor_apply_interrupted"
+    if scene == "autopilot_escalated":
+        from hub.services import auto_verdict
+
+        case = await _approved_case(db, monkeypatch, "own-autopilot", concur=None)
+        await auto_verdict._escalate(db, case.task_id, "красный CI")
+        return case, "autopilot_escalated"
     if scene == "advisor_object":
         case = await _approved_case(db, monkeypatch, "own-object", concur="object")
         assert await _apply_outcome(db, case) == "escalated"
@@ -171,6 +213,10 @@ async def _make_outcome(db, monkeypatch, scene: str):
     [
         "ladder_surface",
         "not_converged",
+        "daily_cap",
+        "advisor_skipped",
+        "apply_interrupted",
+        "autopilot_escalated",
         "advisor_object",
         "advisor_timeout",
         "skipped",
@@ -185,7 +231,26 @@ async def test_an_outcome_that_ends_the_stewards_part_writes_a_human_owner(
     case, code = await _make_outcome(db, monkeypatch, scene)
 
     await _assert_handed_to_a_human(db, case.task_id, code)
+    if scene == "daily_cap":
+        await _a_new_order_takes_the_owner_back(db, monkeypatch, case.task_id)
     await _after_resubmission_the_owner_is_empty(db, case.task_id)
+
+
+async def _a_new_order_takes_the_owner_back(
+    db: aiosqlite.Connection, monkeypatch, task_id: int
+) -> None:
+    """Передача по потолку временная: заказ после сброса снимает её."""
+    from hub import config
+    from hub.services.steward_dispatch import order_run
+
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 20)
+    assert await order_run(db, task_id, 1) is not None
+    task = await _owner(db, task_id)
+    assert (task["verdict_owner"], task["verdict_owner_reason"]) == (
+        "steward",
+        "run_ordered",
+    )
+    assert (await verdict_route(db, task_id)).code != "steward_daily_cap"
 
 
 @pytest.mark.parametrize("status", ["timeout", "never_started", "refused"])
