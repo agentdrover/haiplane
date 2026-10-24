@@ -57,7 +57,9 @@ log = logging.getLogger(__name__)
 _POLICY_ACTOR = "policy"
 
 
-async def _escalate(db: aiosqlite.Connection, task_id: int, reason: str) -> None:
+async def _escalate(
+    db: aiosqlite.Connection, task_id: int, reason: str, generation: int
+) -> None:
     """A trigger fired: the verdict stays with the human, visibly."""
     await repo.add_task_update(
         db,
@@ -77,7 +79,10 @@ async def _escalate(db: aiosqlite.Connection, task_id: int, reason: str) -> None
     )
     # #2052: автопилот сложил решение - владелец записан, а не выведен позже.
     await verdict_owner.hand_to_human(
-        db, task_id, verdict_owner.reason_of("autopilot_escalated", reason)
+        db,
+        task_id,
+        verdict_owner.reason_of("autopilot_escalated", reason),
+        generation=generation,
     )
     await db.commit()
 
@@ -778,6 +783,10 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
 
 
 async def _decide(db: aiosqlite.Connection, task_id: int) -> bool:
+    # Поколение читается ДО оценки: пересдача во время неё не должна отдать
+    # человеку новую сдачу по доказательствам старой.
+    row = await repo.get_task(db, task_id)
+    evaluated = int(dict(row).get("submission_generation") or 0) if row else 0
     stance = await autopilot_stance(db, task_id)
     for alert in stance.audit_alerts:
         await repo.add_task_update(
@@ -785,7 +794,7 @@ async def _decide(db: aiosqlite.Connection, task_id: int) -> bool:
         )
         await db.commit()
     if stance.outcome == OUTCOME_ESCALATE:
-        await _escalate(db, task_id, stance.reason)
+        await _escalate(db, task_id, stance.reason, evaluated)
         return False
     if stance.outcome != OUTCOME_APPROVE:
         if stance.feed_note:

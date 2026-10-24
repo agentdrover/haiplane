@@ -90,6 +90,11 @@ REFUSED_ADVISOR_NOT_LAUNCHABLE = "advisor_not_launchable"
 
 #: Исходы применения approve судьи (метка ``advisor_outcome``).
 OUTCOME_APPROVED = "approved"
+#: Какой approve судьи подбирают и заказ советника, и применение исхода (строка
+#: ``j`` в ``steward_judgements``); сторож владельца вердикта считает его живым
+#: исполнителем по тому же условию, а не по своей копии.
+PICKED_APPROVE_SQL = "j.kind='verdict' AND j.verdict='approve' AND j.contour=2"
+
 OUTCOME_ESCALATED = "escalated"
 OUTCOME_SKIPPED = "skipped"
 OUTCOME_FAILED = "failed"
@@ -214,7 +219,7 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
         db,
         "SELECT j.task_id, j.generation, t.result_kind FROM steward_judgements j "
         "JOIN tasks t ON t.id = j.task_id "
-        "WHERE j.kind='verdict' AND j.verdict='approve' AND j.contour=2 "
+        f"WHERE {PICKED_APPROVE_SQL} "
         "AND t.status='review' AND t.submission_generation = j.generation "
         "AND NOT EXISTS (SELECT 1 FROM steward_runs r WHERE r.task_id=j.task_id "
         "AND r.generation=j.generation AND r.kind=?)",
@@ -978,7 +983,7 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
         db,
         "SELECT j.id, j.task_id, j.generation FROM steward_judgements j "
         "JOIN tasks t ON t.id = j.task_id "
-        "WHERE j.kind='verdict' AND j.verdict='approve' AND j.contour=2 "
+        f"WHERE {PICKED_APPROVE_SQL} "
         "AND j.advisor_outcome='' AND t.status='review' "
         "AND t.submission_generation = j.generation "
         "AND (t.review_verdict_generation IS NULL "

@@ -153,7 +153,7 @@ async def _make_outcome(db, monkeypatch, scene: str):
         from hub.services import auto_verdict
 
         case = await _approved_case(db, monkeypatch, "own-autopilot", concur=None)
-        await auto_verdict._escalate(db, case.task_id, "красный CI")
+        await auto_verdict._escalate(db, case.task_id, "красный CI", 1)
         return case, "autopilot_escalated"
     if scene == "advisor_object":
         case = await _approved_case(db, monkeypatch, "own-object", concur="object")
@@ -300,7 +300,9 @@ async def test_a_written_owner_wins_over_the_autopilot_stance(
     before = await verdict_route(db, task_id)
     assert (before.decider, before.final) == ("policy", "policy"), before
 
-    assert await verdict_owner.hand_to_human(db, task_id, "daily_cap: потолок")
+    assert await verdict_owner.hand_to_human(
+        db, task_id, "daily_cap: потолок", generation=1
+    )
     await db.commit()
 
     route = await verdict_route(db, task_id)
@@ -308,7 +310,9 @@ async def test_a_written_owner_wins_over_the_autopilot_stance(
     assert route.decider != "policy"
     assert await _in_inbox(db, task_id)
     # повтор того же владельца ничего не пишет
-    assert not await verdict_owner.hand_to_human(db, task_id, "daily_cap: потолок")
+    assert not await verdict_owner.hand_to_human(
+        db, task_id, "daily_cap: потолок", generation=1
+    )
     assert len(await _events(db, task_id)) == 1
 
 
@@ -374,3 +378,135 @@ async def test_the_watchdog_hands_a_review_without_an_actor_to_a_human(
     route = await verdict_route(db, task_id)
     assert (route.final, route.code) == ("human", "no_actor")
     assert await _in_inbox(db, task_id)
+
+
+# --- разбор ревью: временные передачи, живой исполнитель, поколение, гонка ----
+
+
+async def _owner_state(db: aiosqlite.Connection, task_id: int) -> tuple[str, str]:
+    task = await _owner(db, task_id)
+    return task["verdict_owner"], task["verdict_owner_reason"]
+
+
+@pytest.mark.parametrize("temporary", ["steward_daily_cap", "steward_advisor_skipped"])
+async def test_a_terminal_reason_replaces_a_temporary_one_and_never_the_reverse(
+    db: aiosqlite.Connection, monkeypatch, temporary: str
+) -> None:
+    from hub.services.verdict_owner import hand_to_human
+
+    case = await _approved_case(db, monkeypatch, f"own-repl-{temporary}", concur=None)
+    task_id = case.task_id
+    assert await hand_to_human(db, task_id, f"{temporary}: до сброса", generation=1)
+    assert not await hand_to_human(db, task_id, f"{temporary}: ещё раз", generation=1)
+
+    assert await hand_to_human(db, task_id, "refused: заказа не будет", generation=1)
+    assert await _owner_state(db, task_id) == ("human", "refused: заказа не будет")
+    assert len(await _events(db, task_id)) == 2
+
+    assert not await hand_to_human(db, task_id, f"{temporary}: поздно", generation=1)
+    assert (await _owner_state(db, task_id))[1] == "refused: заказа не будет"
+    assert len(await _events(db, task_id)) == 2
+    # потолок кончился, а владелец остался терминальным: маршрут за человеком
+    route = await verdict_route(db, task_id)
+    assert (route.final, route.code) == ("human", "refused")
+
+
+@pytest.mark.parametrize("contour", [1, 2])
+async def test_the_watchdog_counts_only_the_approve_the_advisor_path_picks(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, contour: int
+) -> None:
+    from hub.services.verdict_owner import hand_over_stalled_reviews
+
+    _steward_on(monkeypatch)
+    task_id = await _ready(
+        client, db, monkeypatch, f"own-contour-{contour}", {"verdict": "steward"}
+    )
+    await _age(db, task_id)
+    await db.execute(
+        "INSERT INTO steward_judgements (task_id, generation, kind, "
+        "submitted_verdict, verdict, contour, advisor_outcome) "
+        "VALUES (?, 1, 'verdict', 'approve', 'approve', ?, '')",
+        (task_id, contour),
+    )
+    await db.commit()
+
+    # contour=1 никто не подберёт: исполнителя нет; contour=2 подберёт применение
+    assert await hand_over_stalled_reviews(db) == (1 if contour == 1 else 0)
+
+
+@pytest.mark.parametrize("path", ["direct", "decide"])
+async def test_an_escalation_is_written_only_on_the_generation_it_judged(
+    db: aiosqlite.Connection, monkeypatch, path: str
+) -> None:
+    from hub.services import auto_verdict
+
+    case = await _approved_case(db, monkeypatch, f"own-gen-{path}", concur=None)
+    if path == "direct":
+        await repo.update_task(db, case.task_id, submission_generation=2)
+        await db.commit()
+        await auto_verdict._escalate(db, case.task_id, "красный CI", 1)
+    else:
+
+        async def resubmitted_meanwhile(_db, task_id, **_k):
+            await repo.update_task(_db, task_id, submission_generation=2)
+            await _db.commit()
+            return auto_verdict.AutoStance(
+                auto_verdict.OUTCOME_ESCALATE, "x", "красный CI"
+            )
+
+        monkeypatch.setattr(auto_verdict, "autopilot_stance", resubmitted_meanwhile)
+        assert await auto_verdict._decide(db, case.task_id) is False
+
+    assert await _owner_state(db, case.task_id) == ("", "")
+    assert await _events(db, case.task_id) == []
+
+
+@pytest.mark.parametrize(
+    ("reason", "reclaimed"),
+    [
+        ("steward_daily_cap: потолок", True),
+        ("steward_advisor_skipped: пропуск", True),
+        ("autopilot_escalated: красный CI", False),
+        ("judge_escalate: precondition_failed", False),
+    ],
+)
+async def test_a_new_order_reclaims_only_the_temporary_hand_offs(
+    db: aiosqlite.Connection, monkeypatch, reason: str, reclaimed: bool
+) -> None:
+    from hub.services.verdict_owner import hand_to_human, reclaim_for_steward
+
+    case = await _approved_case(db, monkeypatch, f"own-rec-{reclaimed}-{len(reason)}")
+    await hand_to_human(db, case.task_id, reason, generation=1)
+
+    assert await reclaim_for_steward(db, case.task_id, 1) is reclaimed
+    expected = ("steward", "run_ordered") if reclaimed else ("human", reason)
+    assert await _owner_state(db, case.task_id) == expected
+
+
+async def test_a_live_actor_created_after_the_check_cancels_the_watchdog_write(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    from hub.services import verdict_route as route_module
+    from hub.services.verdict_owner import hand_over_stalled_reviews
+
+    _steward_on(monkeypatch)
+    task_id = await _ready(client, db, monkeypatch, "own-race", {"verdict": "steward"})
+    await _age(db, task_id)
+    real = route_module.verdict_route
+
+    async def route_then_a_dispatch(_db, tid, **kwargs):
+        route = await real(_db, tid, **kwargs)
+        # исполнитель появляется между выборкой кандидата и записью
+        await _db.execute(
+            "INSERT INTO review_dispatches (task_id, submission_generation, "
+            "agent_id, model, status) VALUES (?, 1, 'a', 'm', 'active')",
+            (tid,),
+        )
+        await _db.commit()
+        return route
+
+    monkeypatch.setattr(route_module, "verdict_route", route_then_a_dispatch)
+
+    assert await hand_over_stalled_reviews(db) == 0
+    assert await _owner_state(db, task_id) == ("", "")
+    assert await _events(db, task_id) == []

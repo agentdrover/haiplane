@@ -864,7 +864,7 @@ async def _hand_to_the_human_because(
     db: aiosqlite.Connection,
     task_id: int,
     decision: SelfApproval,
-    generation: int | None = None,
+    generation: int,
 ) -> None:
     """Набор не сошёлся: к человеку, и с ИМЕНЕМ того, что не сошлось.
 
@@ -1032,8 +1032,8 @@ async def _hand_to_the_human_named(
     reason: str,
     who: str = "Привратник применения возражает",
     *,
+    generation: int,
     code: str = "apply_gate_refused",
-    generation: int | None = None,
 ) -> None:
     """Отказ привратника — в карточку своими словами, а не словами правила.
 
