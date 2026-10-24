@@ -23,9 +23,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import re
 import sqlite3
 from typing import Any
 
@@ -290,9 +288,11 @@ def _job_id_of(job: dict[str, Any]) -> str:
 
 def _last_line(job: dict[str, Any]) -> str:
     text = job.get("message")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()] if isinstance(
-        text, str
-    ) else []
+    lines = (
+        [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if isinstance(text, str)
+        else []
+    )
     return lines[-1] if lines else ""
 
 
