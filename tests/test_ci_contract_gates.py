@@ -45,9 +45,15 @@ async def test_a_contract_change_between_the_decision_and_the_apply_refuses_the_
 
     from hub import config
     from hub.models import ReviewVerdict, TaskReviewVerdict
-    from hub.services import lifecycle
+    from hub.services import lifecycle, steward_shadow
 
     monkeypatch.setattr(config, "SDD_AC_TESTS", ac_mode)
+    if steward:  # #2040: the global act grant is read in the transaction
+
+        async def _granted_now(_db):
+            return True
+
+        monkeypatch.setattr(steward_shadow, "act_granted_now", _granted_now)
     pid, task_id = await satellite_task(db)
     await base._post(db, task_id, base._sat_attempt(task_id))
     await repo.update_task(db, task_id, status="review")

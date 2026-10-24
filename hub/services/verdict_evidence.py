@@ -95,6 +95,9 @@ def _steward_part(row: Any) -> dict[str, Any] | None:
         "truncated": truncated or cut,
         "model": data.get("model") or "",
         "advisor_outcome": data.get("advisor_outcome") or "",
+        "advisor_outcome_detail": _clean(
+            data.get("advisor_outcome_detail"), REASON_LIMIT
+        )[0],
         "judged_at": to_iso_utc(data.get("created_at")),
     }
 
@@ -245,6 +248,10 @@ def _steward_lines(steward: dict[str, Any] | None) -> list[str]:
     if steward["advisor_outcome"]:
         head += f", исход применения: {steward['advisor_outcome']}"
     lines = [head]
+    if steward["advisor_outcome_detail"]:
+        lines.append(
+            f"    причина отказа применения: {steward['advisor_outcome_detail']}"
+        )
     if steward["escalate_reason"]:
         lines.append(f"    причина эскалации: {steward['escalate_reason']}")
     shown = len(steward["grounds"])
