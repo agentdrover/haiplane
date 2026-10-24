@@ -42,11 +42,12 @@ from contextvars import ContextVar
 from typing import Any
 
 import aiosqlite
+from fastapi import HTTPException
 
 from hub import config
 from hub.db import fetchall
 from hub.services import gate_grounds as grounds
-from hub.services.refusal_reason import ACT_REVOKED
+from hub.services.refusal_reason import ACT_REVOKED, CEILING_CHECK_FAILED, CodedRefusal
 from hub.models import RiskClass
 from hub.services.auto_approve import ladder_hits
 from hub.services.project_policy import STEWARD_CEILING_UNREADABLE
@@ -281,6 +282,26 @@ _CLEAN: ContextVar[dict[int, dict[str, Any]] | None] = ContextVar(
     "steward_double_clean", default=None
 )
 STEWARD_CEILING_KEY = "steward_approve_max_class"
+
+
+@asynccontextmanager
+async def ceiling_check_guard() -> AsyncIterator[None]:
+    """Исключение проверки потолка - отказ со своим кодом, а не безымянная ошибка.
+
+    Ворота и отказы (``HTTPException``) проходят как есть; всё остальное -
+    «проверить не смогли» (``ceiling_check_failed``), причина остаётся в
+    ``__cause__`` для события.
+    """
+    try:
+        yield
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise CodedRefusal(
+            503,
+            f"{CEILING_CHECK_FAILED}: {type(exc).__name__}",
+            code=CEILING_CHECK_FAILED,
+        ) from exc
 
 
 @asynccontextmanager
@@ -1100,7 +1121,8 @@ async def apply_refusals(
     out.extend(await text_origin_refusals(db, task_id, generation))
     out.extend(await integrity_refusals(db, task_id))
     out.extend(precondition_refusals(packet))
-    out.extend(await ceiling_refusals(db, task_id, packet, statement))
+    async with ceiling_check_guard():
+        out.extend(await ceiling_refusals(db, task_id, packet, statement))
     self_authored = await self_authored_refusal(db, task_id)
     if self_authored:
         out.append(self_authored)

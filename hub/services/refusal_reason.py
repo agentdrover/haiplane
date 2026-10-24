@@ -15,12 +15,17 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
+from hub.integrations.cursor_cloud import scrub_secrets
+
 #: Код отказа ворот транзакции записи при снятом допуске ``act`` (#2040). Не код
 #: эскалации судьи: словарь #1022 закрыт, поэтому и назван не ``REFUSED_*``.
 ACT_REVOKED = "act_revoked"
 #: Сдача передана человеку из-за суточного потолка: согласие советника при этом
 #: может быть действительным, поэтому это не ``advisor_not_concurred``.
 CAP_HANDOFF = "steward_cap_handoff"
+#: Проверка потолка класса бросила исключение: «не смогли проверить» - не то же
+#: самое, что «класс выше потолка» (``class_above_policy_ceiling``).
+CEILING_CHECK_FAILED = "ceiling_check_failed"
 WHERE = "подробности в журнале хаба"
 
 #: Окончание каждого текста: перечень причин устаревает и врёт, как только ворота
@@ -36,6 +41,7 @@ _CLAIMS: dict[str, str] = {
     "ci_not_green": "CI закреплённого коммита не подтверждён зелёным",
     "ci_integrity": "проверка входов CI не пройдена",
     "class_above_policy_ceiling": "класс сдачи не прошёл проверку потолка политики проекта",
+    CEILING_CHECK_FAILED: "проверка потолка класса не выполнена из-за сбоя",
     "precondition_failed": "не выполнено предусловие применения",
     "verdict_already_stands": "на эту сдачу вердикт уже стоит",
     "verdict_generation_moved": "поколение сдачи уже другое",
@@ -81,3 +87,24 @@ def reason_line(exc: Exception) -> str:
     if code in REASON_TEXTS:
         return f"{code}: {REASON_TEXTS[code]}"
     return f"отказ {exc.status_code}, {WHERE}"
+
+
+#: Длина текста исключения в событии: сообщение нужно для разбора, а не для архива.
+_EXCEPTION_TEXT_LIMIT = 500
+
+
+def exception_facts(exc: Exception) -> dict[str, str]:
+    """Факты об исключении для СОБЫТИЯ (не для карточки): код, тип и очищенный текст.
+
+    Текст берётся у первопричины (``__cause__``): обёртка ``CodedRefusal`` несёт
+    код, а настоящая причина - в исключении под ней. Секреты вырезает
+    ``scrub_secrets``, длина ограничена.
+    """
+    root = exc.__cause__ if isinstance(exc.__cause__, Exception) else exc
+    text = str(root.detail) if isinstance(root, HTTPException) else str(root)
+    code = _code_of(exc) if isinstance(exc, HTTPException) else "internal_error"
+    return {
+        "code": code if code in REASON_TEXTS else "unlisted",
+        "exception_type": type(root).__name__,
+        "exception_text": scrub_secrets(text)[:_EXCEPTION_TEXT_LIMIT],
+    }
