@@ -124,12 +124,12 @@ async def _ceiling(db: aiosqlite.Connection, task: dict) -> tuple[str, str] | No
     from hub.models import RiskClass
     from hub.services import project_policy
     from hub.services.steward_act_readiness import BLOCKED, ceiling_reason
-    from hub.services.steward_apply import current_ceiling
+    from hub.services.steward_apply import read_ceiling
     from hub.services.steward_double_clean import frozen_pair, may_apply_to_class
 
     key = "steward_approve_max_class"
     task_id = int(task["id"])
-    ceiling = await current_ceiling(db, task_id, key)
+    ceiling = await read_ceiling(db, task_id, key)
     if ceiling is None or ceiling == project_policy.STEWARD_CEILING_UNREADABLE:
         return None
     try:
