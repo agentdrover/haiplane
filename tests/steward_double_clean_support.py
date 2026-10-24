@@ -181,7 +181,11 @@ async def grant_act(monkeypatch) -> None:
     async def _act(_db):
         return "act"
 
+    async def _granted_now(_db):
+        return True
+
     monkeypatch.setattr(sh, "effective_mode", _act)
+    monkeypatch.setattr(sh, "act_granted_now", _granted_now)  # #2040
     monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
     monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 50)
     monkeypatch.setattr(config, "STEWARD_ADVISOR_WAIT_MAX", 60)

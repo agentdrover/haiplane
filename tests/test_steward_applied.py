@@ -103,6 +103,7 @@ async def _concur(
 
     if configured_mode() == "off":
         monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    _grant_act_in_the_write(monkeypatch)
     await db.execute(
         "UPDATE steward_judgements SET packet_hash='pkt' "
         "WHERE task_id=? AND generation=? AND kind='verdict'",
@@ -986,6 +987,16 @@ async def test_the_card_never_records_an_approval_the_judgement_did_not_give(
 # ---------------------------------------------------------------------------
 
 
+def _grant_act_in_the_write(monkeypatch) -> None:
+    """Транзакция записи approve стюарда читает допуск ``act`` чистым чтением (#2040)."""
+    from hub.services import steward_shadow
+
+    async def _granted_now(_db):
+        return True
+
+    monkeypatch.setattr(steward_shadow, "act_granted_now", _granted_now)
+
+
 def _grant_act(monkeypatch) -> None:
     """Выдать режим act ТЕМ ЖЕ читателем, который его выдаёт в бою.
 
@@ -998,7 +1009,11 @@ def _grant_act(monkeypatch) -> None:
     async def _act(_db):
         return "act"
 
+    async def _granted_now(_db):
+        return True
+
     monkeypatch.setattr(steward_shadow, "effective_mode", _act)
+    monkeypatch.setattr(steward_shadow, "act_granted_now", _granted_now)  # #2040
 
 
 async def _steward_lines(db: aiosqlite.Connection, task_id: int) -> list[str]:

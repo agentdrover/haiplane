@@ -46,6 +46,7 @@ import aiosqlite
 from hub import config
 from hub.db import fetchall
 from hub.services import gate_grounds as grounds
+from hub.services.refusal_reason import ACT_REVOKED
 from hub.models import RiskClass
 from hub.services.auto_approve import ladder_hits
 from hub.services.project_policy import STEWARD_CEILING_UNREADABLE
@@ -998,17 +999,30 @@ async def policy_refusal(
 async def write_refusal(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> tuple[str, str] | None:
-    """Право на автономное одобрение, как оно есть СЕЙЧАС (#2037): отказ или ``None``.
+    """Право на автономное одобрение, как оно есть СЕЙЧАС (#2037, #2040): отказ или ``None``.
 
     Зовётся внутри write-транзакции, что записывает approve стюарда
     (``lifecycle._automation_ci_gate``): ранние проверки читали делегирование и
     cap-handoff до неё, а между ними и записью вердикт могли забрать себе
-    (``verdict=human``) или сдачу передали человеку из-за потолка. Читатели те
-    же, что у ранних проверок (``policy_refusal`` и ``cap_refusal``), без копий
-    условий; причина отказа - та же строка. Только чтение базы, сети нет.
+    (``verdict=human``), сдачу передали человеку из-за потолка или стюарда
+    выключили (#2040: глобальный допуск ``act``, чистое чтение
+    ``steward_shadow.act_granted_now``). Читатели те же, что у ранних проверок
+    (``policy_refusal`` и ``cap_refusal``), без копий условий; причина отказа -
+    та же строка. Только чтение базы, сети нет.
     """
     from hub.services.steward_advisor import cap_refusal
+    from hub.services.steward_shadow import act_granted_now, act_unmet_now
 
+    # #2040: глобальный допуск act - тот же вопрос, что у ранних проверок
+    # (``effective_mode``), но чистым чтением: стюарда могли выключить между
+    # ними и записью.
+    if not await act_granted_now(db):
+        return (
+            ACT_REVOKED,
+            f"STEWARD_MODE={config.STEWARD_MODE!r}: автономия act сейчас не "
+            "выдана - применять нечего"
+            + "".join(f" [{item}]" for item in await act_unmet_now(db)),
+        )
     return await policy_refusal(db, task_id) or await cap_refusal(
         db, task_id, generation
     )

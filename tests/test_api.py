@@ -4628,7 +4628,7 @@ async def test_a_spoofed_steward_name_is_not_a_steward_verdict(
     import json
 
     from hub.models import ReviewVerdict
-    from hub.services import steward_applied, steward_exit
+    from hub.services import steward_applied, steward_exit, steward_shadow
     from tests.test_auto_verdict import _submitted_task
 
     spoofed = await _submitted_task(client, db, "spike-spoof", {"verdict": "human"})
@@ -4646,6 +4646,11 @@ async def test_a_spoofed_steward_name_is_not_a_steward_verdict(
         db, project["id"], gate_policy=json.dumps({"verdict": "steward"})
     )  # #2037: the steward's right to approve is read in the write transaction
     await db.commit()
+
+    async def _granted_now(_db):  # #2040: so is the global act grant
+        return True
+
+    monkeypatch.setattr(steward_shadow, "act_granted_now", _granted_now)
     await steward_applied._record(db, real, ReviewVerdict.approved, 1)
     assert await steward_exit.actual_steward_verdicts(db) == {"spike-real": 1}
 
