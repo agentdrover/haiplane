@@ -1779,6 +1779,11 @@ async def test_the_ceiling_is_rechecked_inside_the_verdict_transaction(
 
     monkeypatch.setattr("hub.services.steward_apply.build_evidence_packet", _packet)
 
+    async def _granted_now(_db):  # #2040: the write reads the global act grant
+        return True
+
+    monkeypatch.setattr("hub.services.steward_shadow.act_granted_now", _granted_now)
+
     async def set_ceiling(value):
         policy = {"verdict": "steward"}
         if value:
