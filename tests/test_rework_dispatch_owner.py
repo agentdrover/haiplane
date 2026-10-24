@@ -413,6 +413,7 @@ async def test_a_forked_child_lazy_owner_releases_with_its_last_app(lock_path):
         chan.hear()
         # Первый вход потомка - снятие заявки родителя: чужого он не освобождает.
         rework_launch.release_process(lock_path, "A")
+        chan.say(json.dumps(_state(rework_launch, inherited)))
         assert rework_launch.owns_db() is False
         chan.say(json.dumps(_state(rework_launch, inherited)))
         chan.hear()  # родитель отпустил A
@@ -423,6 +424,8 @@ async def test_a_forked_child_lazy_owner_releases_with_its_last_app(lock_path):
     pid, chan = _run_forked(child_without_app)
     try:
         chan.say("go")
+        stray = chan.report()
+        assert stray["apps"] == {} and stray["owners"] == [], "release не очистил"
         before = chan.report()
         assert before["apps"] == {} and before["owners"] == [] and all(before["closed"])
         rework_launch.release_process(lock_path, "A")
