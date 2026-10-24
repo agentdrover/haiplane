@@ -55,7 +55,7 @@ from hub.services.result_kind import (
     task_automation_not_applicable,
 )
 from hub.services import steward_advisor_skip as advisor_skip
-from hub.services.refusal_reason import CAP_HANDOFF, reason_line
+from hub.services.refusal_reason import CAP_HANDOFF, exception_facts, reason_line
 from hub.services import steward_cap
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
@@ -93,6 +93,7 @@ OUTCOME_APPROVED = "approved"
 OUTCOME_ESCALATED = "escalated"
 OUTCOME_SKIPPED = "skipped"
 OUTCOME_FAILED = "failed"
+EVENT_APPLY_FAILED = "steward_apply_failed"
 _OUTCOME_CLAIMED = "applying"
 
 EVENT_ADVISOR_ORDERED_REFUSED = "steward_advisor_refused"
@@ -884,13 +885,16 @@ async def _finish_outcome(
     stamp: str,
     outcome: str,
     detail: str,
+    error: Exception | None = None,
 ) -> bool:
     """Финальная запись исхода, условная ТОЙ ЖЕ меткой; ``True`` - исход записан.
 
     Если применение уже переведено в escalated (прервано и названо вслух),
     чужой исход не перезаписывается. Исход ``failed`` с причиной (#2040) -
     ровно одна строка в ленте задачи: запись условна, а ``failed`` поллер
-    больше не выбирает, поэтому повторные тики её не дублируют.
+    больше не выбирает, поэтому повторные тики её не дублируют. Каждый ``failed``
+    пишет и событие ``steward_apply_failed`` с причиной и очищенным текстом
+    исключения: в карточке текста исключения нет, в событии он есть.
     """
     final = await db.execute(
         "UPDATE steward_judgements SET advisor_outcome=?, "
@@ -898,6 +902,19 @@ async def _finish_outcome(
         "WHERE id=? AND advisor_outcome=? AND advisor_claimed_at=?",
         (outcome, detail, item["id"], _OUTCOME_CLAIMED, stamp),
     )
+    if final.rowcount == 1 and outcome == OUTCOME_FAILED:
+        await repo.insert_event(
+            db,
+            kind=EVENT_APPLY_FAILED,
+            task_id=int(item["task_id"]),
+            actor="hub",
+            payload={
+                "judgement_id": int(item["id"]),
+                "generation": int(item["generation"]),
+                "reason": detail,
+                **(exception_facts(error) if error is not None else {}),
+            },
+        )
     if final.rowcount == 1 and outcome == OUTCOME_FAILED and detail:
         recorded = await _approve_recorded(db, item)
         head = (
@@ -958,6 +975,7 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
             continue  # #1915: сдача у человека до reset_at — исход не применяется
         stamp = await _stamp_now(db)
         detail = ""
+        error: Exception | None = None
         cursor = await db.execute(
             "UPDATE steward_judgements SET advisor_outcome=?, "
             "advisor_claimed_at=? "
@@ -974,6 +992,7 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
             log.warning("advisor outcome not applied for #%s: %s", task_id, exc)
             outcome = OUTCOME_FAILED
             detail = failure_reason(exc)  # #2040: причина не остаётся в логе
+            error = exc
         else:
             if result is None:
                 outcome = OUTCOME_SKIPPED
@@ -985,6 +1004,6 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
                     if result[0] == ESCALATED_TO_HUMAN
                     else OUTCOME_SKIPPED
                 )
-        if await _finish_outcome(db, item, stamp, outcome, detail):
+        if await _finish_outcome(db, item, stamp, outcome, detail, error):
             applied += 1
     return applied
