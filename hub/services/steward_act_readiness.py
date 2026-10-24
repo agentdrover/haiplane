@@ -128,7 +128,7 @@ def _advisor_reason(state: Any) -> tuple[str, dict[str, str]] | None:
 
 
 async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | None:
-    from hub.services.steward_advisor import advisor_state
+    from hub.services.steward_advisor import advisor_state, cap_refusal
     from hub.services.steward_apply import policy_refusal
     from hub.services.steward_double_clean import may_apply_to_class
 
@@ -162,7 +162,14 @@ async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | Non
         )
     elif ceiling:
         (blocked if ceiling[0] == BLOCKED else unknown).append(ceiling[1])
-    advised = _advisor_reason(await advisor_state(db, task_id, generation))
+    # Передача по суточному потолку - известный запрет и при действительном
+    # согласии; спрашивается тем же читателем, что и применение (чистое чтение).
+    handoff = await cap_refusal(db, task_id, generation)
+    if handoff:
+        blocked.append(_reason(*handoff))
+        advised = None
+    else:
+        advised = _advisor_reason(await advisor_state(db, task_id, generation))
     if advised:
         (blocked if advised[0] == BLOCKED else unknown).append(advised[1])
     state = BLOCKED if blocked else UNKNOWN if unknown else READY

@@ -199,7 +199,7 @@ async def apply_judgement(
         if refusal is not None:
             raise CodedRefusal(
                 409,
-                f"approve судьи не применяется без согласия советника "
+                f"{_refusal_claim(refusal[0], 'approve судьи не применяется без согласия советника')} "
                 f"({refusal[0]}): {refusal[1]}",
                 code=refusal[0],
             )
@@ -977,9 +977,13 @@ async def _apply_self_approval(
             db,
             task_id,
             f"{advisor[0]}: {advisor[1]}",
-            who="Второго мнения нет: approve судьи без согласия советника",
+            who=_refusal_claim(
+                advisor[0], "Второго мнения нет: approve судьи без согласия советника"
+            ),
         )
-        return ESCALATED_TO_HUMAN, "советник не согласен — " + advisor[1]
+        return ESCALATED_TO_HUMAN, (
+            _refusal_claim(advisor[0], "советник не согласен") + " — " + advisor[1]
+        )
 
     from hub.services.steward_apply import apply_refusals
 
@@ -996,6 +1000,17 @@ async def _apply_self_approval(
 
     decision = await self_approval_for(db, task_id, generation)
     return await approve_without_a_human(db, task_id, generation, decision, claim=claim)
+
+
+def _refusal_claim(code: str, no_consent_claim: str) -> str:
+    """Префикс отказа: при передаче по потолку - её текст, иначе «нет согласия».
+
+    Согласие советника при передаче по потолку может быть действительным,
+    поэтому утверждать его отсутствие нельзя.
+    """
+    from hub.services.refusal_reason import CAP_HANDOFF, REASON_TEXTS
+
+    return REASON_TEXTS[CAP_HANDOFF] if code == CAP_HANDOFF else no_consent_claim
 
 
 async def _hand_to_the_human_named(
