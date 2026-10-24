@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import os
 from typing import Any
 
 import pytest
@@ -146,3 +147,35 @@ async def test_the_lock_creates_its_directory_and_never_grants_ownership_on_erro
     blocker.write_text("x")
     assert rework_launch.claim_process(blocker / "hub.db") is False
     rework_launch.release_process(blocker / "hub.db")
+
+
+async def test_an_app_that_never_held_the_lock_cannot_grant_ownership(lock_path):
+    """Два приложения без блокировки; уход одного не делает оставшееся владельцем."""
+    from hub.services import rework_launch
+
+    holder = _other_process_holds(lock_path)
+    try:
+        first, second = object(), object()
+        assert rework_launch.claim_process(lock_path, first) is False
+        assert rework_launch.claim_process(lock_path, second) is False
+        rework_launch.release_process(lock_path, first)
+
+        assert rework_launch.owns_db() is False
+    finally:
+        holder.close()
+    rework_launch.release_process(lock_path, second)
+
+
+async def test_a_forked_child_inherits_neither_ownership_nor_boot_id(
+    lock_path, monkeypatch
+):
+    from hub.services import rework_launch
+
+    assert rework_launch.claim_process(lock_path) is True
+    parent_boot = rework_launch.boot_id()
+    monkeypatch.setattr(rework_launch.os, "getpid", lambda: os.getpid() + 100000)
+
+    assert rework_launch.owns_db() is False, "потомок унаследовал владение"
+    assert rework_launch.boot_id() != parent_boot, "потомок унаследовал boot id"
+    monkeypatch.undo()
+    rework_launch.release_process(lock_path)
