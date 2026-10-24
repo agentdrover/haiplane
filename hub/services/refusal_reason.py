@@ -16,6 +16,7 @@ from __future__ import annotations
 from fastapi import HTTPException
 
 from hub.integrations.cursor_cloud import scrub_secrets
+from hub.services.brief_failure import public_reason
 
 #: Код отказа ворот транзакции записи при снятом допуске ``act`` (#2040). Не код
 #: эскалации судьи: словарь #1022 закрыт, поэтому и назван не ``REFUSED_*``.
@@ -97,8 +98,9 @@ def exception_facts(exc: Exception) -> dict[str, str]:
     """Факты об исключении для СОБЫТИЯ (не для карточки): код, тип и очищенный текст.
 
     Текст берётся у первопричины (``__cause__``): обёртка ``CodedRefusal`` несёт
-    код, а настоящая причина - в исключении под ней. Секреты вырезает
-    ``scrub_secrets``, длина ограничена.
+    код, а настоящая причина - в исключении под ней. События - публикационная
+    граница (#2006): текст идёт через ``public_reason`` (пути и адреса с учётными
+    данными заменены) ДО обрезки по длине; сырой текст остаётся в журнале хаба.
     """
     root = exc.__cause__ if isinstance(exc.__cause__, Exception) else exc
     text = str(root.detail) if isinstance(root, HTTPException) else str(root)
@@ -106,5 +108,5 @@ def exception_facts(exc: Exception) -> dict[str, str]:
     return {
         "code": code if code in REASON_TEXTS else "unlisted",
         "exception_type": type(root).__name__,
-        "exception_text": scrub_secrets(text)[:_EXCEPTION_TEXT_LIMIT],
+        "exception_detail": public_reason(scrub_secrets(text))[:_EXCEPTION_TEXT_LIMIT],
     }

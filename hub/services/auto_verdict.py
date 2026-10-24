@@ -544,11 +544,11 @@ async def _stored_ceiling_stage(
     диффу ещё не виден, и это условие ответа, а не «чисто».
     """
     from hub.services.steward_act_readiness import BLOCKED, ceiling_reason
-    from hub.services.steward_apply import current_ceiling
+    from hub.services.steward_apply import read_ceiling
 
     key = "auto_approve_max_class"
     found = ceiling_reason(
-        await current_ceiling(db, task_id, key),
+        await read_ceiling(db, task_id, key),
         ctx.task.get("risk_class"),
         key=key,
     )
@@ -648,13 +648,13 @@ async def _ceiling_stage(
     """
     from hub.services.steward_apply import (
         class_ceiling_refusal,
-        current_ceiling,
+        read_ceiling,
         remember_risk_fact,
     )
     from hub.services.steward_evidence import present
 
     key = "auto_approve_max_class"
-    ceiling = await current_ceiling(db, task_id, key)
+    ceiling = await read_ceiling(db, task_id, key)
     fact = present(
         "risk_class",
         "класс автовердикта",

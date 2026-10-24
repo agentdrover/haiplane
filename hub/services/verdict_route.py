@@ -29,6 +29,7 @@ from typing import Any
 import aiosqlite
 
 from hub.mcp_envelope import route_line
+from hub.services.steward_apply import CeilingUnavailable
 from hub.services.result_kind import (
     AUTOMATION_REFUSAL,
     AUTOMATION_REFUSAL_CODE,
@@ -228,7 +229,7 @@ async def _steward_route(
 
     key = "steward_approve_max_class"
     found = ceiling_reason(
-        await steward_apply.current_ceiling(db, int(task["id"]), key),
+        await steward_apply.read_ceiling(db, int(task["id"]), key),
         task.get("risk_class"),
         key=key,
     )
@@ -287,7 +288,12 @@ async def verdict_route(
     from hub import repository as repo
     from hub.services import ci_integrity
 
-    route = await _decide_route(db, task_id, observe=observe)
+    try:
+        route = await _decide_route(db, task_id, observe=observe)
+    except CeilingUnavailable as exc:
+        # Потолок не прочитать (автопилот, стюард, советник читают его одним
+        # читателем): маршрут не падает, вердикт за человеком с названной причиной.
+        route = _human(exc.code, exc.reason)
     if route.decider == DECIDER_NONE:
         return route
     task = dict(await repo.get_task(db, task_id) or {})

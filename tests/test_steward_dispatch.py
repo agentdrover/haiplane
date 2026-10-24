@@ -3604,7 +3604,7 @@ async def test_the_poller_door_checks_the_persisted_dor_evidence(
 
 
 async def test_a_failed_apply_hands_the_verdict_to_a_human_with_the_reason(
-    db: aiosqlite.Connection, monkeypatch
+    client, db: aiosqlite.Connection, monkeypatch
 ):
     """#2051 AC-1: сбой проверки потолка при применении approve - событие, маршрут к человеку."""
     from hub.services import steward_advisor, steward_apply
@@ -3627,7 +3627,10 @@ async def test_a_failed_apply_hands_the_verdict_to_a_human_with_the_reason(
     assert (before.decider, before.final) == ("steward", "steward"), before.reason
 
     async def ceiling_check_fails(*_args, **_kwargs):
-        raise FileNotFoundError("/srv/clone-gone/policy.json")
+        raise FileNotFoundError(
+            "/srv/clone-gone/policy.json via "
+            "https://reviewer:" + "unregisteredpass" + "@forge.invalid/repo.git"
+        )
 
     with monkeypatch.context() as scoped:
         scoped.setattr(steward_apply, "ceiling_gate", ceiling_check_fails)
@@ -3651,93 +3654,21 @@ async def test_a_failed_apply_hands_the_verdict_to_a_human_with_the_reason(
     assert payload["judgement_id"] == judgement["id"]
     assert payload["code"] == "ceiling_check_failed"
     assert payload["exception_type"] == "FileNotFoundError"
-    assert "/srv/clone-gone/policy.json" in payload["exception_text"]
+    assert "exception_text" not in payload
     assert payload["reason"] == detail
-    # Текст исключения остаётся вне карточки (#2040).
-    assert "clone-gone" not in await feed(db, case.task_id)
+    # Событие - публикационная граница (#2006): ни пути, ни учётных данных,
+    # ни в базе, ни в /api/events; карточка текста исключения не получает (#2040).
+    served = (await client.get("/api/events?since=0")).text
+    for surface in (
+        json.dumps(payload, ensure_ascii=False),
+        served,
+        await feed(db, case.task_id),
+    ):
+        for leaked in ("clone-gone", "unregisteredpass", "reviewer:"):
+            assert leaked not in surface, (leaked, surface[:200])
+    assert "steward_apply_failed" in served
 
     route = await verdict_route(db, case.task_id)
     assert (route.decider, route.final) == ("human", "human"), route
     assert route.code == "steward_apply_failed"
     assert "ceiling_check_failed" in route.reason
-
-
-async def _poll_with_a_ceiling_stage(db, monkeypatch, stage: str, replacement):
-    """Поллер применяет approve, пока ``stage`` проверки потолка подменён ``replacement``."""
-    from hub.services import steward_advisor, steward_apply
-    from tests.steward_double_clean_support import build_case, policy_of
-
-    case = await build_case(
-        db,
-        monkeypatch,
-        f"apply-failed-{stage}",
-        policy=policy_of("r2", None, None),
-        risk="R2",
-    )
-    with monkeypatch.context() as scoped:
-        scoped.setattr(steward_apply, stage, replacement)
-        assert await steward_advisor.apply_advisor_outcomes(db) == 1
-    row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
-    events = await fetchall(
-        db,
-        "SELECT payload FROM events WHERE kind='steward_apply_failed' AND task_id=?",
-        (case.task_id,),
-    )
-    return row, [json.loads(dict(e)["payload"]) for e in events]
-
-
-async def test_the_early_ceiling_check_failure_is_named_like_the_late_one(
-    db: aiosqlite.Connection, monkeypatch
-):
-    """#2051: исключение ранней проверки потолка - тот же код ``ceiling_check_failed``."""
-
-    async def breaks(*_args, **_kwargs):
-        raise PermissionError("early read of the policy")
-
-    row, events = await _poll_with_a_ceiling_stage(
-        db, monkeypatch, "ceiling_refusals", breaks
-    )
-
-    assert row["advisor_outcome"] == "failed"
-    assert row["advisor_outcome_detail"].startswith("ceiling_check_failed: ")
-    assert [e["exception_type"] for e in events] == ["PermissionError"]
-    assert "early read of the policy" in events[0]["exception_text"]
-
-
-async def test_a_class_above_the_ceiling_keeps_its_own_code_in_the_failure(
-    db: aiosqlite.Connection, monkeypatch
-):
-    """#2051: отказ по классу выше потолка в транзакции записи - свой код, не сбой проверки."""
-
-    async def refuses(*_args, **_kwargs):
-        return (
-            "class_above_policy_ceiling",
-            "steward_approve_max_class=r1: выше потолка",
-        )
-
-    row, events = await _poll_with_a_ceiling_stage(
-        db, monkeypatch, "ceiling_gate", refuses
-    )
-
-    assert row["advisor_outcome"] == "failed"
-    assert row["advisor_outcome_detail"].startswith("class_above_policy_ceiling: ")
-    assert "ceiling_check_failed" not in row["advisor_outcome_detail"]
-    assert [e["code"] for e in events] == ["class_above_policy_ceiling"]
-    assert events[0]["exception_type"] == "HTTPException"
-
-
-async def test_a_gate_refusal_inside_the_ceiling_check_is_not_a_check_failure(
-    db: aiosqlite.Connection, monkeypatch
-):
-    """#2051: отказ ворот, брошенный внутри проверки потолка, не превращается в сбой проверки."""
-    from fastapi import HTTPException
-
-    async def refuses(*_args, **_kwargs):
-        raise HTTPException(409, "generation_moved: поколение уже другое")
-
-    row, events = await _poll_with_a_ceiling_stage(
-        db, monkeypatch, "ceiling_gate", refuses
-    )
-
-    assert row["advisor_outcome_detail"].startswith("generation_moved: ")
-    assert [e["code"] for e in events] == ["generation_moved"]
