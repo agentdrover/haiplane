@@ -774,3 +774,34 @@ async def test_an_attempt_holding_the_right_to_submit_is_not_swept(
     release.set()
     assert (await asyncio.wait_for(attempt, 10)).status_code == 200
     assert (await repo.get_task(db, task_id))["job_id"] == "job-1"
+
+
+@pytest.mark.parametrize("accepted", [False, True], ids=["no-job", "job-found"])
+async def test_a_sweep_snapshot_does_not_close_a_booking_renewed_after_it(
+    db, monkeypatch, accepted
+):
+    """Сверка выбрала бронь, затем попытка взяла право заказать: сверка отступает."""
+    from hub.services import rework_launch
+
+    task_id, jobs = await _crash_on_submit(db, monkeypatch, accepted=accepted)
+    await _age_reservations(db, task_id)
+    rows = await db.execute_fetchall(
+        "SELECT * FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    snapshot = dict(rows[0])
+    if accepted:
+        jobs["job-77"]["message"] = jobs["calls"][0]
+    # Тот же срок в секундах, но уже новый: право попытки продлило бронь.
+    await db.execute(
+        "UPDATE rework_launches SET reserved_at=datetime('now') WHERE id=?",
+        (snapshot["id"],),
+    )
+    await db.commit()
+
+    await rework_launch._reconcile(db, snapshot)
+
+    rows = await db.execute_fetchall(
+        "SELECT state FROM rework_launches WHERE task_id=?", (task_id,)
+    )
+    assert [r[0] for r in rows] == ["reserved"]
+    assert not dict(await repo.get_task(db, task_id))["job_id"]

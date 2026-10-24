@@ -129,6 +129,15 @@ async def refuse_if_unresolved(db: aiosqlite.Connection, task_id: int) -> None:
     await refuse_unconfirmed_outcome(db, task_id)
 
 
+async def is_current(db: aiosqlite.Connection, reservation_id: int) -> bool:
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM rework_launches WHERE id=? AND state=?",
+        (reservation_id, RESERVED),
+    )
+    return bool(rows)
+
+
 async def claim_submit(db: aiosqlite.Connection, reservation_id: int) -> str | None:
     """Право попытки заказать задание: токен брони или ``None``, если бронь закрыта.
 
@@ -222,13 +231,22 @@ async def resolve(
     *,
     job_id: str = "",
     reason: str = "",
+    seen_at: str | None = None,
 ) -> bool:
-    """Закрыть бронь условно: только из ``reserved``. Коммит - за вызывающим."""
-    cur = await db.execute(
+    """Закрыть бронь условно: только из ``reserved``. Коммит - за вызывающим.
+
+    ``seen_at`` - срок брони в снимке сверки: бронь, которую попытка успела
+    продлить (``claim_submit``), уже не та, что сверка сочла оборванной.
+    """
+    sql = (
         "UPDATE rework_launches SET state=?, job_id=?, reason=?, "
-        "resolved_at=datetime('now') WHERE id=? AND state=?",
-        (state, job_id, reason, reservation_id, RESERVED),
+        "resolved_at=datetime('now') WHERE id=? AND state=?"
     )
+    args: tuple[Any, ...] = (state, job_id, reason, reservation_id, RESERVED)
+    if seen_at is not None:
+        sql += " AND reserved_at=?"
+        args += (seen_at,)
+    cur = await db.execute(sql, args)
     return (cur.rowcount or 0) > 0
 
 
@@ -241,7 +259,12 @@ async def close_for_task(db: aiosqlite.Connection, task_id: int, reason: str) ->
 
 
 async def settle_launched(
-    db: aiosqlite.Connection, reservation_id: int, task_id: int, job_id: str
+    db: aiosqlite.Connection,
+    reservation_id: int,
+    task_id: int,
+    job_id: str,
+    *,
+    seen_at: str | None = None,
 ) -> bool:
     """Задание принято: статус fix_requested и job_id пишутся вместе с бронью.
 
@@ -259,10 +282,13 @@ async def settle_launched(
             LAUNCHED if moved else NEEDS_HUMAN,
             job_id=job_id,
             reason="" if moved else "задача вышла из needs_decision, пока заказ шёл",
+            seen_at=seen_at,
         )
         if won and moved:
             await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
             return True
+        if seen_at is not None and await is_current(db, reservation_id):
+            return False  # бронь продлена живой попыткой: она свяжет задание сама
         why = (
             "задача уже не в needs_decision"
             if won
@@ -331,24 +357,26 @@ async def _find_job(
 async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
     """Определить исход одной оборванной брони; вернуть итоговое состояние."""
     rid, task_id = int(held["id"]), int(held["task_id"])
+    seen = str(held["reserved_at"])
     row = await repo.get_task(db, task_id)
     task = dict(row) if row is not None else {}
     if task.get("status") != "needs_decision":
         state = LAUNCHED if task.get("job_id") else CLOSED
         async with write_transaction(db):
-            await resolve(
+            closed = await resolve(
                 db,
                 rid,
                 state,
                 job_id=str(task.get("job_id") or ""),
                 reason=f"задача ушла из needs_decision (статус {task.get('status')})",
+                seen_at=seen,
             )
-        return state
+        return state if closed else RESERVED
     job, ambiguous = await _find_job(rid, task_id, str(held.get("nonce") or ""))
     job_id = _job_id_of(job) if job else ""
     if job_id:
-        if not await settle_launched(db, rid, task_id, job_id):
-            return NEEDS_HUMAN
+        if not await settle_launched(db, rid, task_id, job_id, seen_at=seen):
+            return RESERVED if await is_current(db, rid) else NEEDS_HUMAN
         await repo.add_task_update(
             db,
             task_id,
@@ -366,7 +394,8 @@ async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
     else:
         reason = "среди последних заданий диспетчера задания с меткой брони нет"
     async with write_transaction(db):
-        await resolve(db, rid, NEEDS_HUMAN, reason=reason)
+        if not await resolve(db, rid, NEEDS_HUMAN, reason=reason, seen_at=seen):
+            return RESERVED  # бронь продлена или закрыта другим путём: не наша
         await repo.add_task_update(
             db,
             task_id,
