@@ -232,7 +232,7 @@ async def test_double_tap_on_rework_dispatches_once(client, db, monkeypatch):
     form, data = sheet_form(page, "sh-rework")
     calls: list[int] = []
 
-    async def slow_dispatch(conn, tid, task, instructions):
+    async def slow_dispatch(conn, tid, task, instructions, *_booking):
         calls.append(tid)
         await asyncio.sleep(0.05)
         await repo.update_task(conn, tid, status="open")
