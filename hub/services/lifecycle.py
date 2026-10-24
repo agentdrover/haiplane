@@ -4072,7 +4072,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
             db, lambda: _step_bug_red_test(state), lambda: _step_ci_before_submit(state)
         )
         if task["status"] == "needs_decision":
-            await rework_launch.refuse_if_reserved(db, task_id)  # #1991
+            await rework_launch.refuse_if_unresolved(db, task_id)  # #1991
         if not await repo.transition_status_if(
             db,
             task_id,
@@ -5864,7 +5864,11 @@ async def return_to_work(
 
 
 async def _dispatch_rework(
-    db: aiosqlite.Connection, task_id: int, task: dict[str, Any], instructions: str
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    instructions: str,
+    reservation_id: int,
 ) -> None:
     """Rework commit-задачи после арбитража: fix-задание или, без него, open."""
     message = plugins.dispatch.build_fix_message(
@@ -5876,18 +5880,29 @@ async def _dispatch_rework(
         max_cycles=config.MAX_REVIEW_CYCLES,
     )
     runtime = task.get("runtime", "auto")
-    held = await rework_launch.reserved_row(db, task_id)
-    reservation_id = int(held["id"]) if held else 0
-    if reservation_id:
-        message += f"\n\n(метка заказа {rework_launch.marker(reservation_id)})"
+    message += "\n\n" + rework_launch.marker_line(reservation_id, task_id)
+    # Бронь этой попытки могли закрыть, пока она стояла (сверка, повтор человека):
+    # заказывает только та, чья бронь ещё действует.
+    async with write_transaction(db):
+        current = await rework_launch.is_current(db, reservation_id)
+    if not current:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Бронь №{reservation_id} закрыта, пока этот запрос стоял: он задание "
+            "не заказывает (заказ ведёт другая бронь).",
+        )
+        await db.commit()
+        return
     try:
         result = await plugins.dispatch.submit_task(
             message, runtime=runtime, task_id=task_id
         )
     except Exception as exc:
         # Принял ли диспетчер задание, неизвестно: бронь остаётся и держит повтор.
-        if reservation_id:
-            await rework_launch.note_unknown_outcome(db, task_id, reservation_id, exc)
+        await rework_launch.note_unknown_outcome(db, task_id, reservation_id, exc)
         raise
     job_id = result.get("job_id")
     if job_id:
@@ -6001,7 +6016,7 @@ async def decide_task(
         async with write_transaction(db):
             # #1991: вход needs_decision потребляется ВМЕСТЕ с записью решения;
             # проигравший вход получает 409 и ничего не пишет.
-            task, _reservation = await rework_launch.reserve(
+            task, reservation_id = await rework_launch.reserve(
                 db, task_id, confirm_no_job=body.confirm_no_job
             )
             await repo.add_task_update(db, task_id, "human", "decision", update_content)
@@ -6035,7 +6050,7 @@ async def decide_task(
             await rework_without_dispatch(db, task_id)
             await rework_launch.close_for_task(db, task_id, "state-задача: без задания")
         else:
-            await _dispatch_rework(db, task_id, task, instructions)
+            await _dispatch_rework(db, task_id, task, instructions, reservation_id)
         await log_activity(
             db,
             "task_decided",

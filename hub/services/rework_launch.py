@@ -52,8 +52,18 @@ CLOSED = "closed"
 
 
 def marker(reservation_id: int) -> str:
-    """Метка брони: уходит в текст заказа и по ней сверка узнаёт своё задание."""
+    """Метка брони: номер, по которому сверка узнаёт своё задание."""
     return f"rework-launch:{reservation_id}"
+
+
+def marker_line(reservation_id: int, task_id: int) -> str:
+    """Последняя строка текста заказа: метка и задача, которой заказ принадлежит.
+
+    Узнаётся только как ЦЕЛАЯ последняя строка поля ``message`` задания. Цитата
+    метки в описании чужой задачи стоит в середине текста и за свою не
+    сходит; строка с чужим номером задачи тоже.
+    """
+    return f"(метка заказа {marker(reservation_id)}, задача #{task_id})"
 
 
 def _taken(task_id: int, why: str) -> HTTPException:
@@ -107,6 +117,27 @@ async def launch_block(db: aiosqlite.Connection, task_id: int) -> str:
             "решите rework с confirm_no_job"
         )
     return ""
+
+
+async def refuse_if_unresolved(db: aiosqlite.Connection, task_id: int) -> None:
+    """409 для выхода из needs_decision (пересдача #1362): бронь или неснятый исход.
+
+    Исход заказа, который сверка не установила (``needs_human``), снимает только
+    решение человека rework с ``confirm_no_job``, а оно принимается лишь в
+    needs_decision. Выход оттуда пересдачей оставил бы блок запуска навсегда.
+    """
+    await refuse_if_reserved(db, task_id)
+    await refuse_unconfirmed_outcome(db, task_id)
+
+
+async def is_current(db: aiosqlite.Connection, reservation_id: int) -> bool:
+    """Эта самая бронь ещё ``reserved``: попытка, чью бронь закрыли, не заказывает."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM rework_launches WHERE id=? AND state=?",
+        (reservation_id, RESERVED),
+    )
+    return bool(rows)
 
 
 async def require_entry(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
@@ -257,14 +288,28 @@ def _job_id_of(job: dict[str, Any]) -> str:
     return str(job.get("id") or job.get("job_id") or "")
 
 
-async def _find_job(reservation_id: int) -> dict[str, Any] | None:
-    # Номер - целиком: метка №1 не должна совпасть с №10 и №100.
-    needle = re.compile(re.escape(marker(reservation_id)) + r"(?!\d)")
+def _last_line(job: dict[str, Any]) -> str:
+    text = job.get("message")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()] if isinstance(
+        text, str
+    ) else []
+    return lines[-1] if lines else ""
+
+
+async def _find_job(
+    reservation_id: int, task_id: int
+) -> tuple[dict[str, Any] | None, bool]:
+    """Задание этой брони: (задание, неоднозначно ли совпадение).
+
+    Совпадает только последняя строка ``message`` целиком (см. ``marker_line``).
+    Два и более совпадения - неоднозначность: привязать нельзя ни одно.
+    """
+    want = marker_line(reservation_id, task_id)
     jobs = await asyncio.to_thread(plugins.dispatch.list_jobs, JOBS_SCANNED)
-    for job in jobs:
-        if needle.search(json.dumps(job, ensure_ascii=False, default=str)):
-            return job
-    return None
+    found = [j for j in jobs if isinstance(j, dict) and _last_line(j) == want]
+    if len(found) > 1:
+        return None, True
+    return (found[0] if found else None), False
 
 
 async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
@@ -283,7 +328,7 @@ async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
                 reason=f"задача ушла из needs_decision (статус {task.get('status')})",
             )
         return state
-    job = await _find_job(rid)
+    job, ambiguous = await _find_job(rid, task_id)
     job_id = _job_id_of(job) if job else ""
     if job_id:
         if not await settle_launched(db, rid, task_id, job_id):
@@ -298,11 +343,12 @@ async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
         )
         await db.commit()
         return LAUNCHED
-    reason = (
-        "задание у диспетчера найдено без id"
-        if job
-        else "среди последних заданий диспетчера задания с меткой брони нет"
-    )
+    if ambiguous:
+        reason = "меткой брони помечено несколько заданий диспетчера"
+    elif job:
+        reason = "задание у диспетчера найдено без id"
+    else:
+        reason = "среди последних заданий диспетчера задания с меткой брони нет"
     async with write_transaction(db):
         await resolve(db, rid, NEEDS_HUMAN, reason=reason)
         await repo.add_task_update(

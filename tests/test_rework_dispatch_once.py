@@ -466,17 +466,21 @@ async def test_an_unparsed_dispatcher_answer_is_not_a_refusal(db, monkeypatch):
     assert [r[0] for r in rows] == ["reserved"]
 
 
-async def test_the_booking_marker_matches_the_whole_number(db, monkeypatch):
+async def test_the_booking_marker_matches_the_whole_line(db, monkeypatch):
     from hub.services import rework_launch
 
     monkeypatch.setattr(
         plugins.dispatch,
         "list_jobs",
-        lambda limit=50: [{"id": "other", "message": "rework-launch:10 и :100"}],
+        lambda limit=50: [
+            {"id": "other", "message": rework_launch.marker_line(10, 5)},
+            {"id": "wrong-task", "message": rework_launch.marker_line(1, 6)},
+        ],
     )
 
-    assert await rework_launch._find_job(1) is None
-    assert (await rework_launch._find_job(10))["id"] == "other"
+    assert await rework_launch._find_job(1, 5) == (None, False)
+    found, ambiguous = await rework_launch._find_job(10, 5)
+    assert found["id"] == "other" and not ambiguous
 
 
 async def test_force_complete_and_resubmission_wait_for_a_booking(client, db, net):
