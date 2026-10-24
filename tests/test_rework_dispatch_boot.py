@@ -169,3 +169,20 @@ async def test_a_timed_out_submit_kills_its_child(monkeypatch):
         await dispatch_mod.DispatchIntegration().submit_task("m", task_id=1)
 
     assert killed == ["kill", "wait"]
+
+
+async def test_archiving_closes_an_unproven_outcome_but_not_a_live_booking(db):
+    done = await _task_in(db, "needs_decision", submission_generation=1)
+    live = await _task_in(db, "needs_decision", submission_generation=1)
+    await db.execute(
+        "INSERT INTO rework_launches (task_id, state) VALUES (?, 'needs_human')",
+        (done,),
+    )
+    await db.execute("INSERT INTO rework_launches (task_id) VALUES (?)", (live,))
+    await db.commit()
+
+    for task_id in (done, live):
+        await services.archive_task(db, task_id, reason="уборка")
+
+    assert await _states(db, done) == ["closed"]
+    assert await _states(db, live) == ["reserved"]

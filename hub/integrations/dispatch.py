@@ -13,6 +13,10 @@ from hub.config import DISPATCH_BIN, DISPATCH_JOBS_DIR, DISPATCH_LOGS_DIR
 
 log = logging.getLogger(__name__)
 
+#: Жёсткий срок submit: по истечении дочерний процесс убивается, чтобы отправитель
+#: не мог создать задание позже, чем хаб решил, что заказа нет.
+SUBMIT_TIMEOUT = 30
+
 
 def _read_job_file(path: Path) -> dict[str, Any] | None:
     try:
@@ -383,7 +387,14 @@ class DispatchIntegration:
         except (FileNotFoundError, PermissionError):
             log.warning("oc-dev-dispatch binary not found at %s", DISPATCH_BIN)
             return {"error": f"dispatch binary not found: {DISPATCH_BIN}"}
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=SUBMIT_TIMEOUT
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            proc.kill()
+            await proc.wait()
+            raise
         raw = stdout.decode(errors="replace").strip()
         if proc.returncode != 0:
             log.warning(

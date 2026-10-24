@@ -22,7 +22,6 @@ from tests.card_sheet_support import SHEET_HEADERS, sheet_form
 from tests.test_decision_brief import _task_in
 
 REWORK = {"action": "rework", "instructions": "починить"}
-#: Достаточно, чтобы пройти срок ожидания сверки; сама граница — в модуле.
 LONG_AGO = "2000-01-01 00:00:00"
 
 
@@ -252,8 +251,10 @@ async def _feed(db, task_id: int) -> str:
 
 
 async def _age_reservations(db, task_id: int) -> None:
+    """Хаб перезапущен: бронь принадлежит прежнему процессу."""
     await db.execute(
-        "UPDATE rework_launches SET reserved_at=? WHERE task_id=?", (LONG_AGO, task_id)
+        "UPDATE rework_launches SET boot_id='previous-boot' WHERE task_id=?",
+        (task_id,),
     )
     await db.commit()
 

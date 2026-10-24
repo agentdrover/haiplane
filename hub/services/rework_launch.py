@@ -37,9 +37,10 @@ from hub.integrations.registry import plugins
 
 log = logging.getLogger("hub")
 
-#: Сколько бронь может ждать ответа диспетчера (его вызов длится до 30 с),
-#: прежде чем сверка сочтёт заказ оборванным.
-GRACE_SECONDS = 180
+#: Идентификатор процесса хаба. Бронь помнит процесс, который её завёл: пока тот
+#: жив, его отправитель может ещё создать задание, и сверка бронь не трогает.
+#: После перезапуска прежнего отправителя нет - тогда сверка вправе решать.
+BOOT_ID = secrets.token_hex(8)
 #: Сколько заданий диспетчера сверка просматривает в поисках метки.
 JOBS_SCANNED = 200
 
@@ -139,25 +140,35 @@ async def is_current(db: aiosqlite.Connection, reservation_id: int) -> bool:
 
 
 async def claim_submit(db: aiosqlite.Connection, reservation_id: int) -> str | None:
-    """Право попытки заказать задание: токен брони или ``None``, если бронь закрыта.
+    """Токен брони для заказа или ``None``, если бронь уже закрыта.
 
-    Один условный UPDATE (``reserved`` -> ``reserved``) обновляет срок брони: сверка
-    и попытка делят одну строку, и выигрывает та, чей UPDATE прошёл раньше. Закрытая
-    сверкой бронь права не даёт (попытка не заказывает); взявшая право попытка
-    удерживает бронь от сверки на ``GRACE_SECONDS``, а вызов диспетчера короче.
+    Закрыть бронь при живом отправителе сверка не может (см. ``BOOT_ID``), так что
+    ``None`` - это бронь, закрытую другим путём (задача завершена, процесс
+    перезапущен): такая попытка задание не заказывает.
     """
     async with write_transaction(db):
-        cur = await db.execute(
-            "UPDATE rework_launches SET reserved_at=datetime('now') "
-            "WHERE id=? AND state=?",
+        rows = await fetchall(
+            db,
+            "SELECT nonce FROM rework_launches WHERE id=? AND state=?",
             (reservation_id, RESERVED),
         )
-        if not cur.rowcount:
-            return None
-        rows = await fetchall(
-            db, "SELECT nonce FROM rework_launches WHERE id=?", (reservation_id,)
-        )
-    return str(rows[0]["nonce"])
+    return str(rows[0]["nonce"]) if rows else None
+
+
+async def close_open(
+    db: aiosqlite.Connection, task_id: int, reason: str, *, reserved: bool = True
+) -> None:
+    """Завершение задачи человеком: открытая бронь и неснятый исход закрываются.
+
+    Иначе ``needs_human`` оставался бы блоком запуска у задачи, которой запуск
+    уже не нужен. ``reserved=False`` оставляет действующую бронь (архив не
+    останавливает живого отправителя). Коммит - за вызывающим.
+    """
+    await db.execute(
+        "UPDATE rework_launches SET state=?, reason=?, resolved_at=datetime('now') "
+        "WHERE task_id=? AND state IN (?, ?)",
+        (CLOSED, reason, task_id, RESERVED if reserved else NEEDS_HUMAN, NEEDS_HUMAN),
+    )
 
 
 async def require_entry(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
@@ -216,8 +227,8 @@ async def reserve(
         raise _taken(task_id, live)
     try:
         cur = await db.execute(
-            "INSERT INTO rework_launches (task_id, nonce) VALUES (?, ?)",
-            (task_id, secrets.token_hex(8)),
+            "INSERT INTO rework_launches (task_id, nonce, boot_id) VALUES (?, ?, ?)",
+            (task_id, secrets.token_hex(8), BOOT_ID),
         )
     except sqlite3.IntegrityError as exc:
         raise _taken(task_id, "запуск доработки уже заказан") from exc
@@ -231,22 +242,14 @@ async def resolve(
     *,
     job_id: str = "",
     reason: str = "",
-    seen_at: str | None = None,
+    from_state: str = RESERVED,
 ) -> bool:
-    """Закрыть бронь условно: только из ``reserved``. Коммит - за вызывающим.
-
-    ``seen_at`` - срок брони в снимке сверки: бронь, которую попытка успела
-    продлить (``claim_submit``), уже не та, что сверка сочла оборванной.
-    """
-    sql = (
+    """Закрыть бронь условно: только из ``from_state``. Коммит - за вызывающим."""
+    cur = await db.execute(
         "UPDATE rework_launches SET state=?, job_id=?, reason=?, "
-        "resolved_at=datetime('now') WHERE id=? AND state=?"
+        "resolved_at=datetime('now') WHERE id=? AND state=?",
+        (state, job_id, reason, reservation_id, from_state),
     )
-    args: tuple[Any, ...] = (state, job_id, reason, reservation_id, RESERVED)
-    if seen_at is not None:
-        sql += " AND reserved_at=?"
-        args += (seen_at,)
-    cur = await db.execute(sql, args)
     return (cur.rowcount or 0) > 0
 
 
@@ -264,7 +267,7 @@ async def settle_launched(
     task_id: int,
     job_id: str,
     *,
-    seen_at: str | None = None,
+    from_state: str = RESERVED,
 ) -> bool:
     """Задание принято: статус fix_requested и job_id пишутся вместе с бронью.
 
@@ -282,13 +285,11 @@ async def settle_launched(
             LAUNCHED if moved else NEEDS_HUMAN,
             job_id=job_id,
             reason="" if moved else "задача вышла из needs_decision, пока заказ шёл",
-            seen_at=seen_at,
+            from_state=from_state,
         )
         if won and moved:
             await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
             return True
-        if seen_at is not None and await is_current(db, reservation_id):
-            return False  # бронь продлена живой попыткой: она свяжет задание сама
         why = (
             "задача уже не в needs_decision"
             if won
@@ -316,7 +317,7 @@ async def note_unknown_outcome(
         "alert",
         f"Заказ доработки оборвался ({type(error).__name__}): принял ли диспетчер "
         f"задание, неизвестно. Бронь №{reservation_id} не даёт заказать второе; "
-        f"через {GRACE_SECONDS} с хаб сверит задания диспетчера и либо свяжет "
+        "после перезапуска хаба сверка проверит задания диспетчера и либо свяжет "
         "задачу с найденным, либо вернёт решение человеку.",
     )
     await db.commit()
@@ -357,7 +358,6 @@ async def _find_job(
 async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
     """Определить исход одной оборванной брони; вернуть итоговое состояние."""
     rid, task_id = int(held["id"]), int(held["task_id"])
-    seen = str(held["reserved_at"])
     row = await repo.get_task(db, task_id)
     task = dict(row) if row is not None else {}
     if task.get("status") != "needs_decision":
@@ -369,14 +369,13 @@ async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
                 state,
                 job_id=str(task.get("job_id") or ""),
                 reason=f"задача ушла из needs_decision (статус {task.get('status')})",
-                seen_at=seen,
             )
         return state if closed else RESERVED
     job, ambiguous = await _find_job(rid, task_id, str(held.get("nonce") or ""))
     job_id = _job_id_of(job) if job else ""
     if job_id:
-        if not await settle_launched(db, rid, task_id, job_id, seen_at=seen):
-            return RESERVED if await is_current(db, rid) else NEEDS_HUMAN
+        if not await settle_launched(db, rid, task_id, job_id):
+            return NEEDS_HUMAN
         await repo.add_task_update(
             db,
             task_id,
@@ -394,8 +393,8 @@ async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
     else:
         reason = "среди последних заданий диспетчера задания с меткой брони нет"
     async with write_transaction(db):
-        if not await resolve(db, rid, NEEDS_HUMAN, reason=reason, seen_at=seen):
-            return RESERVED  # бронь продлена или закрыта другим путём: не наша
+        if not await resolve(db, rid, NEEDS_HUMAN, reason=reason):
+            return RESERVED  # бронь закрыта другим путём: не наша
         await repo.add_task_update(
             db,
             task_id,
@@ -409,18 +408,65 @@ async def _reconcile(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
     return NEEDS_HUMAN
 
 
+async def _lift_unproven(db: aiosqlite.Connection, held: dict[str, Any]) -> str:
+    """Исход ``needs_human``: задание с собственной меткой появилось - блок снят.
+
+    Нового заказа нет: бронь связывается с найденным заданием. Нет задания или
+    совпадение неоднозначно - исход остаётся за человеком.
+    """
+    rid, task_id = int(held["id"]), int(held["task_id"])
+    job, _ambiguous = await _find_job(rid, task_id, str(held.get("nonce") or ""))
+    job_id = _job_id_of(job) if job else ""
+    if not job_id:
+        return NEEDS_HUMAN
+    row = await repo.get_task(db, task_id)
+    if row is not None and dict(row)["status"] == "needs_decision":
+        if not await settle_launched(db, rid, task_id, job_id, from_state=NEEDS_HUMAN):
+            return NEEDS_HUMAN
+    else:
+        async with write_transaction(db):
+            if not await resolve(
+                db,
+                rid,
+                LAUNCHED,
+                job_id=job_id,
+                reason="задание найдено сверкой после неустановленного исхода",
+                from_state=NEEDS_HUMAN,
+            ):
+                return NEEDS_HUMAN
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"Сверка брони №{rid}: задание {job_id} найдено у диспетчера, исход "
+        "установлен, блок запуска снят. Второго запуска нет.",
+    )
+    await db.commit()
+    return LAUNCHED
+
+
 async def sweep(db: aiosqlite.Connection) -> None:
-    """Сверка оборванных броней: старше ``GRACE_SECONDS`` и всё ещё ``reserved``."""
+    """Сверка: брони прежнего процесса и неснятые исходы ``needs_human``.
+
+    Бронь текущего процесса не трогается: его отправитель может ещё создать
+    задание, и время этого не опровергает.
+    """
     rows = await fetchall(
         db,
-        "SELECT * FROM rework_launches WHERE state=? "
-        "AND reserved_at <= datetime('now', ?) ORDER BY id",
-        (RESERVED, f"-{GRACE_SECONDS} seconds"),
+        "SELECT * FROM rework_launches r WHERE "
+        "(state=? AND boot_id != ?) OR "
+        "(state=? AND id=(SELECT MAX(id) FROM rework_launches WHERE task_id=r.task_id)) "
+        "ORDER BY id",
+        (RESERVED, BOOT_ID, NEEDS_HUMAN),
     )
     for row in rows:
         held = dict(row)
         try:
-            await _reconcile(db, held)
+            if held["state"] == NEEDS_HUMAN:
+                await _lift_unproven(db, held)
+            else:
+                await _reconcile(db, held)
         except Exception:
             log.exception("rework launch #%s: сверка не удалась", held["id"])
             if db.in_transaction:

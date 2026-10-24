@@ -5957,6 +5957,7 @@ async def decide_task(
             # #1991: вход потребляется под write-локом: принять нельзя, пока
             # доработка заказана, и второе принятие не пишется.
             await rework_launch.require_entry(db, task_id)
+            await rework_launch.close_open(db, task_id, "задача принята человеком")
             await repo.add_task_update(db, task_id, "human", "decision", update_content)
             await prevention_gate.note_close_without_prevention(
                 db, task, via="decide_accept", actor="human"
@@ -6570,6 +6571,7 @@ async def force_complete_task(
                 f"Task #{task_id} changed while being force-completed "
                 f"(status now {fresh.get('status')}); nothing was changed",
             )
+        await rework_launch.close_open(db, task_id, "задача закрыта force-complete")
         await repo.add_task_update(db, task_id, "human", "done", comment)
         await prevention_gate.note_close_without_prevention(
             db, task, via="force_complete", actor="human"
@@ -7041,6 +7043,10 @@ async def archive_task(
                 ),
             )
         await repo.set_tasks_archived(db, ids, 1)
+        for archived_id in ids:
+            await rework_launch.close_open(
+                db, archived_id, "задача архивирована", reserved=False
+            )
         for entry in blocking:
             await repo.add_task_update(
                 db,

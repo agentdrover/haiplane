@@ -13,7 +13,8 @@
 ушла из needs_decision другим путём). Строка живёт, пока живёт задача.
 
 ``nonce`` - случайный токен брони: уходит только в текст её заказа, и по нему
-сверка отличает своё задание от чужого, цитирующего метку.
+сверка отличает своё задание от чужого, цитирующего метку. ``boot_id`` - процесс
+хаба, завёдший бронь: сверка трогает только брони прежнего процесса.
 """
 
 MIGRATIONS = [
@@ -39,5 +40,9 @@ MIGRATIONS = [
     (
         "add_rework_launches_nonce",
         "ALTER TABLE rework_launches ADD COLUMN nonce TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_rework_launches_boot_id",
+        "ALTER TABLE rework_launches ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''",
     ),
 ]
