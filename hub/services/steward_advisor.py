@@ -56,7 +56,7 @@ from hub.services.result_kind import (
 )
 from hub.services import steward_advisor_skip as advisor_skip
 from hub.services.refusal_reason import CAP_HANDOFF, exception_facts, reason_line
-from hub.services import steward_cap
+from hub.services import steward_cap, verdict_owner
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
     KIND_VERDICT,
@@ -90,6 +90,11 @@ REFUSED_ADVISOR_NOT_LAUNCHABLE = "advisor_not_launchable"
 
 #: Исходы применения approve судьи (метка ``advisor_outcome``).
 OUTCOME_APPROVED = "approved"
+#: Какой approve судьи подбирают и заказ советника, и применение исхода (строка
+#: ``j`` в ``steward_judgements``); сторож владельца вердикта считает его живым
+#: исполнителем по тому же условию, а не по своей копии.
+PICKED_APPROVE_SQL = "j.kind='verdict' AND j.verdict='approve' AND j.contour=2"
+
 OUTCOME_ESCALATED = "escalated"
 OUTCOME_SKIPPED = "skipped"
 OUTCOME_FAILED = "failed"
@@ -212,9 +217,9 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
         return 0
     rows = await fetchall(
         db,
-        "SELECT j.task_id, j.generation, t.result_kind FROM steward_judgements j "
+        "SELECT j.task_id, j.generation, t.result_kind FROM steward_judgements j "  # nosec B608 - constant fragments only
         "JOIN tasks t ON t.id = j.task_id "
-        "WHERE j.kind='verdict' AND j.verdict='approve' AND j.contour=2 "
+        f"WHERE {PICKED_APPROVE_SQL} "
         "AND t.status='review' AND t.submission_generation = j.generation "
         "AND NOT EXISTS (SELECT 1 FROM steward_runs r WHERE r.task_id=j.task_id "
         "AND r.generation=j.generation AND r.kind=?)",
@@ -841,6 +846,14 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
             "применяется.",
             author_kind="hub",
         )
+        await verdict_owner.hand_to_human(
+            db,
+            int(item["task_id"]),
+            verdict_owner.reason_of(
+                "advisor_apply_interrupted", "метка применения не снята"
+            ),
+            generation=int(item["generation"]),
+        )
         moved += 1
     await db.commit()
     return moved
@@ -915,6 +928,20 @@ async def _finish_outcome(
                 **(exception_facts(error) if error is not None else {}),
             },
         )
+    if final.rowcount == 1 and outcome != OUTCOME_APPROVED:
+        # #2052: исход, после которого стюард вердикт не вынесет, - в владельца,
+        # в той же транзакции, что и сам исход.
+        await verdict_owner.hand_to_human(
+            db,
+            int(item["task_id"]),
+            verdict_owner.reason_of(
+                EVENT_APPLY_FAILED
+                if outcome == OUTCOME_FAILED
+                else f"advisor_outcome_{outcome}",
+                detail,
+            ),
+            generation=int(item["generation"]),
+        )
     if final.rowcount == 1 and outcome == OUTCOME_FAILED and detail:
         recorded = await _approve_recorded(db, item)
         head = (
@@ -954,9 +981,9 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
         return 0
     rows = await fetchall(
         db,
-        "SELECT j.id, j.task_id, j.generation FROM steward_judgements j "
+        "SELECT j.id, j.task_id, j.generation FROM steward_judgements j "  # nosec B608 - constant fragments only
         "JOIN tasks t ON t.id = j.task_id "
-        "WHERE j.kind='verdict' AND j.verdict='approve' AND j.contour=2 "
+        f"WHERE {PICKED_APPROVE_SQL} "
         "AND j.advisor_outcome='' AND t.status='review' "
         "AND t.submission_generation = j.generation "
         "AND (t.review_verdict_generation IS NULL "
