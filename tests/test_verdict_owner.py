@@ -587,3 +587,24 @@ async def test_the_watchdog_write_rechecks_the_owner_and_the_grace(
     assert not reason.startswith("no_actor")
     if interleaved == "temporary_handoff":
         assert (owner, reason) == ("human", "steward_daily_cap: до сброса")
+
+
+async def test_a_real_escalation_at_report_intake_writes_the_judged_generation(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    from hub import config
+    from tests.test_auto_verdict import _post_review, _submitted_task
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "own-sec", {"verdict": "auto"})
+    await _post_review(
+        client,
+        task_id,
+        findings_rejected=[
+            {"title": "possible auth bypass", "category": "security", "reason": "n/a"}
+        ],
+    )
+
+    owner, reason = await _owner_state(db, task_id)
+    assert owner == "human" and reason.startswith("autopilot_escalated")
+    assert [e["generation"] for e in await _events(db, task_id)] == [1]
