@@ -505,19 +505,26 @@ class _PausingOwners(dict):
     def __init__(self, items, entered, resume, *, after_first=False):
         super().__init__(items)
         self.entered, self.resume, self.after_first = entered, resume, after_first
+        self.overtaken: bool | None = None
+        self.walkers: list[str] = []
+
+    def _pause(self):
+        name = threading.current_thread().name
+        self.walkers.append(name)
+        if name == "first":
+            self.entered.set()
+            self.overtaken = self.resume.wait(0.5)
 
     def values(self):
         live = super().values()
         if not self.after_first:
-            self.entered.set()
-            self.resume.wait(0.5)
+            self._pause()
             return live
         return self._paused(iter(live))
 
     def _paused(self, live):
         yield next(live)
-        self.entered.set()
-        self.resume.wait(0.5)
+        self._pause()
         yield from live
 
 
@@ -527,25 +534,27 @@ def _race_in_child(rework_launch, first_call, second_call, *, after_first):
     rework_launch._OWNERS = _PausingOwners(
         rework_launch._OWNERS, entered, resume, after_first=after_first
     )
-    out: dict[str, Any] = {"order": []}
+    out: dict[str, Any] = {}
 
     def run(name, call):
         try:
             out[name] = call()
         except BaseException as exc:  # noqa: BLE001 - ошибку потока отдаём тесту
             out[name] = f"{type(exc).__name__}: {exc}"
-        out["order"].append(name)
         if name == "second":
             resume.set()
 
-    first = threading.Thread(target=run, args=("first", first_call))
+    first = threading.Thread(target=run, args=("first", first_call), name="first")
     first.start()
     assert entered.wait(5), "поток 1 не дошёл до очистки"
-    second = threading.Thread(target=run, args=("second", second_call))
+    second = threading.Thread(target=run, args=("second", second_call), name="second")
     second.start()
     first.join(10)
     second.join(10)
     assert not first.is_alive() and not second.is_alive(), "поток завис"
+    # Второй поток закончил, пока первый стоял посреди очистки, - он её обогнал.
+    out["overtaken"] = rework_launch._OWNERS.overtaken
+    out["walkers"] = rework_launch._OWNERS.walkers
     return out
 
 
@@ -674,7 +683,8 @@ async def test_every_entry_waits_for_the_pid_transition(lock_path, second):
         rework_launch.release_process(lock_path, "A")
         chan.say("go")
         done = chan.report()
-        assert done["out"]["order"] == ["first", "second"], "вход обогнал переход PID"
+        assert done["out"]["overtaken"] is False, "вход обогнал переход PID"
+        assert done["out"]["walkers"] == ["first"], "очистку начал второй поток"
         assert done["out"]["second"] in (False, None)
         assert done["apps"] == {} and done["owners"] == []
     finally:
