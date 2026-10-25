@@ -28,6 +28,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,22 @@ CLOSED = "closed"
 _APPS: dict[str, list[Any]] = {}
 _OWNERS: dict[str, _Ownership] = {}
 _BOOT: dict[str, Any] = {"pid": 0, "id": ""}
+#: Процесс, которому принадлежат _APPS и _OWNERS; после fork это уже процесс родителя.
+_STATE: dict[str, int] = {"pid": os.getpid()}
+#: Один писатель реестров. Переход PID (очистка и публикация нового PID) и работа
+#: со _APPS/_OWNERS идут под ним, чтобы второй поток не обогнал очистку.
+_LOCK = threading.Lock()
+
+
+def _renew_lock_in_child() -> None:
+    """Замок, занятый в момент fork другим потоком родителя, в потомке не освободит
+    никто; а реестры, оставленные тем потоком на середине правки, потомок отбросит
+    переходом PID. Поэтому замок заводится заново."""
+    global _LOCK
+    _LOCK = threading.Lock()
+
+
+os.register_at_fork(after_in_child=_renew_lock_in_child)
 
 
 class _Ownership:
@@ -80,6 +97,28 @@ def boot_id() -> str:
     if _BOOT["pid"] != pid:
         _BOOT["pid"], _BOOT["id"] = pid, secrets.token_hex(8)
     return str(_BOOT["id"])
+
+
+def _forget_inherited() -> None:
+    """Под _LOCK. В потомке fork отбросить всё, что принадлежит родителю: и дескрипторы, и заявки.
+
+    Дескрипторы только закрываются, без LOCK_UN: открытое описание файла общее с
+    родителем, и снятие блокировки сняло бы её у него. Заявки родителя - не наши:
+    оставшись, они держали бы lock потомка после ухода его последнего приложения.
+    Проверка по PID стоит на каждом входе, а не в хуке fork: так достаточно одного
+    правила для любого пути, которым потомок впервые зашёл в модуль. Новый PID
+    публикуется только после очистки: иначе поток, вошедший следом, прошёл бы
+    проверку и работал бы с реестрами, которые очистка ещё сотрёт.
+    """
+    pid = os.getpid()
+    if _STATE["pid"] == pid:
+        return
+    for owner in _OWNERS.values():
+        if not owner.handle.closed:
+            owner.handle.close()
+    _OWNERS.clear()
+    _APPS.clear()
+    _STATE["pid"] = pid
 
 
 def _drop(key: str) -> None:
@@ -115,29 +154,34 @@ def _acquire(key: str) -> bool:
 def claim_process(db_path: Any, app: Any = None) -> bool:
     """Зарегистрировать приложение и взять право на базу, если оно свободно."""
     key = _key(db_path)
-    _APPS.setdefault(key, []).append(app if app is not None else "anon")
-    return _acquire(key)
+    with _LOCK:
+        _forget_inherited()
+        _APPS.setdefault(key, []).append(app if app is not None else "anon")
+        return _acquire(key)
 
 
 def release_process(db_path: Any, app: Any = None) -> None:
     """Снять заявку приложения; с уходом последнего закрывается и дескриптор."""
     key = _key(db_path)
-    apps = _APPS.get(key)
-    if apps is None:
-        return
-    token = app if app is not None else "anon"
-    if token in apps:
-        apps.remove(token)
-    if not apps:
-        del _APPS[key]
-        _drop(key)
+    with _LOCK:
+        _forget_inherited()
+        apps = _APPS.get(key)
+        if apps is None:
+            return
+        token = app if app is not None else "anon"
+        if token in apps:
+            apps.remove(token)
+        if not apps:
+            del _APPS[key]
+            _drop(key)
 
 
 def release_all() -> None:
     """Снять все заявки и владения процесса (остановка, чистка в тестах)."""
-    _APPS.clear()
-    for key in list(_OWNERS):
-        _drop(key)
+    with _LOCK:
+        _APPS.clear()
+        for key in list(_OWNERS):
+            _drop(key)
 
 
 def owns_db() -> bool:
@@ -149,7 +193,9 @@ def owns_db() -> bool:
     from hub import config
 
     key = _key(config.HUB_DB_PATH)
-    return key in _APPS and _acquire(key)
+    with _LOCK:
+        _forget_inherited()
+        return key in _APPS and _acquire(key)
 
 
 def marker(reservation_id: int) -> str:
