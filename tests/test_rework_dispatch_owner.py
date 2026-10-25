@@ -12,6 +12,7 @@ import json
 import os
 import select
 import signal
+import threading
 import time
 from typing import Any
 
@@ -491,5 +492,158 @@ async def test_a_forked_child_release_all_keeps_the_parent_lock(lock_path):
         assert _can_take_lock(lock_path) is False, "release_all потомка снял lock"
         rework_launch.release_process(lock_path, "A")
         assert _can_take_lock(lock_path) is True
+    finally:
+        assert _reap(pid, chan) == 0
+
+
+# --- fork: переход PID сериализован, второй поток потомка его не обгоняет --------
+
+
+class _PausingOwners(dict):
+    """Реестр владений, обход которого останавливается в заданной точке."""
+
+    def __init__(self, items, entered, resume, *, after_first=False):
+        super().__init__(items)
+        self.entered, self.resume, self.after_first = entered, resume, after_first
+
+    def values(self):
+        live = super().values()
+        if not self.after_first:
+            self.entered.set()
+            self.resume.wait(0.5)
+            return live
+        return self._paused(iter(live))
+
+    def _paused(self, live):
+        yield next(live)
+        self.entered.set()
+        self.resume.wait(0.5)
+        yield from live
+
+
+def _race_in_child(rework_launch, first_call, second_call, *, after_first):
+    """Поток 1 входит в модуль первым и встаёт посреди очистки; поток 2 входит следом."""
+    entered, resume = threading.Event(), threading.Event()
+    rework_launch._OWNERS = _PausingOwners(
+        rework_launch._OWNERS, entered, resume, after_first=after_first
+    )
+    out: dict[str, Any] = {}
+
+    def run(name, call):
+        try:
+            out[name] = call()
+        except BaseException as exc:  # noqa: BLE001 - ошибку потока отдаём тесту
+            out[name] = f"{type(exc).__name__}: {exc}"
+        if name == "second":
+            resume.set()
+
+    first = threading.Thread(target=run, args=("first", first_call))
+    first.start()
+    assert entered.wait(5), "поток 1 не дошёл до очистки"
+    second = threading.Thread(target=run, args=("second", second_call))
+    second.start()
+    first.join(10)
+    second.join(10)
+    assert not first.is_alive() and not second.is_alive(), "поток завис"
+    return out
+
+
+async def test_a_second_thread_cannot_overtake_the_pid_transition(lock_path):
+    from hub.services import rework_launch
+
+    key = rework_launch._key(lock_path)
+    assert rework_launch.claim_process(lock_path, "A") is True
+    rework_launch.release_process(lock_path, "A")
+    assert rework_launch.claim_process(lock_path, "A") is True
+    inherited = [o.handle for o in rework_launch._OWNERS.values()]
+
+    def child(chan: _Chan) -> None:
+        chan.hear()
+        out = _race_in_child(
+            rework_launch,
+            lambda: rework_launch.release_process(lock_path, "A"),
+            lambda: rework_launch.claim_process(lock_path, "B"),
+            after_first=False,
+        )
+        taken = [o.handle for o in rework_launch._OWNERS.values()]
+        chan.say(
+            json.dumps(
+                {
+                    **_state(rework_launch, taken),
+                    "out": out,
+                    "inherited_closed": [h.closed for h in inherited],
+                    "owns": rework_launch.owns_db(),
+                }
+            )
+        )
+        chan.hear()
+
+    pid, chan = _run_forked(child)
+    try:
+        rework_launch.release_process(lock_path, "A")  # родитель ушёл: lock свободен
+        chan.say("go")
+        done = chan.report()
+        assert done["out"]["second"] is True, done["out"]
+        assert done["owners"] == [key] and done["apps"] == {key: 1}, "B потеряно"
+        assert done["closed"] == [False], "поток 1 закрыл дескриптор B"
+        assert done["owns"] is True
+        assert all(done["inherited_closed"])
+    finally:
+        assert _reap(pid, chan) == 0
+
+
+async def test_a_new_key_during_the_pid_cleanup_does_not_break_the_walk(
+    lock_path, tmp_path
+):
+    from hub.services import rework_launch
+
+    other = tmp_path / "second" / "hub.db"
+    other_key = rework_launch._key(other)
+    assert rework_launch.claim_process(lock_path, "A") is True
+
+    def child(chan: _Chan) -> None:
+        chan.hear()
+        out = _race_in_child(
+            rework_launch,
+            lambda: rework_launch.release_process(lock_path, "A"),
+            lambda: rework_launch.claim_process(other, "B"),
+            after_first=True,
+        )
+        chan.say(json.dumps({**_state(rework_launch, []), "out": out}))
+        chan.hear()
+
+    pid, chan = _run_forked(child)
+    try:
+        chan.say("go")
+        done = chan.report()
+        assert done["out"]["first"] is None, done["out"]  # обход не упал
+        assert done["out"]["second"] is True, done["out"]
+        assert done["owners"] == [other_key] and done["apps"] == {other_key: 1}
+    finally:
+        assert _reap(pid, chan) == 0
+        rework_launch.release_process(lock_path, "A")
+
+
+async def test_a_lock_held_at_fork_time_does_not_hang_the_child(lock_path):
+    from hub.services import rework_launch
+
+    assert rework_launch.claim_process(lock_path, "A") is True
+    rework_launch.release_process(lock_path, "A")
+
+    def child(chan: _Chan) -> None:
+        chan.hear()
+        done = threading.Event()
+        threading.Thread(
+            target=lambda: (rework_launch.claim_process(lock_path, "B"), done.set()),
+            daemon=True,
+        ).start()
+        chan.say(json.dumps({"entered": done.wait(5)}))
+        chan.hear()
+
+    with rework_launch._LOCK:  # поток родителя держит замок в момент fork
+        pid, chan = _run_forked(child)
+    try:
+        chan.say("go")
+        assert chan.report()["entered"] is True, "потомок унаследовал занятый замок"
     finally:
         assert _reap(pid, chan) == 0
