@@ -48,7 +48,7 @@ import aiosqlite
 from fastapi import HTTPException
 
 from hub import repository as repo
-from hub.services import watch_notices
+from hub.services import verdict_owner, watch_notices
 from hub.services.refusal_reason import CodedRefusal
 from hub.models import ReviewVerdict, TaskReviewVerdict
 from hub.services.result_kind import (
@@ -829,7 +829,7 @@ async def approve_without_a_human(
     стюардом решения считаются в двух разных местах.
     """
     if not decision.allowed:
-        await _hand_to_the_human_because(db, task_id, decision)
+        await _hand_to_the_human_because(db, task_id, decision, generation)
         return ESCALATED_TO_HUMAN, (
             "самостоятельного одобрения нет — " + decision.reason
         )
@@ -861,7 +861,10 @@ async def approve_without_a_human(
 
 
 async def _hand_to_the_human_because(
-    db: aiosqlite.Connection, task_id: int, decision: SelfApproval
+    db: aiosqlite.Connection,
+    task_id: int,
+    decision: SelfApproval,
+    generation: int,
 ) -> None:
     """Набор не сошёлся: к человеку, и с ИМЕНЕМ того, что не сошлось.
 
@@ -883,6 +886,12 @@ async def _hand_to_the_human_because(
         + decision.reason
         + ".",
         author_kind="hub",
+    )
+    await verdict_owner.hand_to_human(
+        db,
+        task_id,
+        verdict_owner.reason_of("self_approval_not_converged", decision.reason),
+        generation=generation,
     )
     await db.commit()
 
@@ -980,6 +989,8 @@ async def _apply_self_approval(
             who=_refusal_claim(
                 advisor[0], "Второго мнения нет: approve судьи без согласия советника"
             ),
+            code=advisor[0],
+            generation=generation,
         )
         return ESCALATED_TO_HUMAN, (
             _refusal_claim(advisor[0], "советник не согласен") + " — " + advisor[1]
@@ -993,6 +1004,8 @@ async def _apply_self_approval(
             db,
             task_id,
             "; ".join(f"{code}: {detail}" for code, detail in refusals),
+            code=refusals[0][0],
+            generation=generation,
         )
         return ESCALATED_TO_HUMAN, (
             "привратник применения возражает — " + refusals[0][0]
@@ -1018,6 +1031,9 @@ async def _hand_to_the_human_named(
     task_id: int,
     reason: str,
     who: str = "Привратник применения возражает",
+    *,
+    generation: int,
+    code: str = "apply_gate_refused",
 ) -> None:
     """Отказ привратника — в карточку своими словами, а не словами правила.
 
@@ -1033,5 +1049,15 @@ async def _hand_to_the_human_named(
         "status",
         f"Самостоятельного одобрения не будет — решает человек. {who}: " + reason + ".",
         author_kind="hub",
+    )
+    # #2052: отказ назван в ленте, и владелец записан в той же транзакции.
+    prefix = f"{code}: "
+    await verdict_owner.hand_to_human(
+        db,
+        task_id,
+        verdict_owner.reason_of(
+            code, reason[len(prefix) :] if reason.startswith(prefix) else reason
+        ),
+        generation=generation,
     )
     await db.commit()
