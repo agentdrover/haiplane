@@ -67,11 +67,9 @@ _LOCK = threading.Lock()
 
 
 def _renew_lock_in_child() -> None:
-    """Замок, занятый в момент fork потоком родителя, в потомке не освободит никто.
-
-    RLock не годится: поток-форкер в потомке сохраняет свой ident и вошёл бы в
-    реестры, оставленные другим потоком на середине правки.
-    """
+    """Замок, занятый в момент fork другим потоком родителя, в потомке не освободит
+    никто; а реестры, оставленные тем потоком на середине правки, потомок отбросит
+    переходом PID. Поэтому замок заводится заново."""
     global _LOCK
     _LOCK = threading.Lock()
 
@@ -115,7 +113,7 @@ def _forget_inherited() -> None:
     pid = os.getpid()
     if _STATE["pid"] == pid:
         return
-    for owner in list(_OWNERS.values()):
+    for owner in _OWNERS.values():
         if not owner.handle.closed:
             owner.handle.close()
     _OWNERS.clear()

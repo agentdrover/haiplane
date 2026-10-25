@@ -527,13 +527,14 @@ def _race_in_child(rework_launch, first_call, second_call, *, after_first):
     rework_launch._OWNERS = _PausingOwners(
         rework_launch._OWNERS, entered, resume, after_first=after_first
     )
-    out: dict[str, Any] = {}
+    out: dict[str, Any] = {"order": []}
 
     def run(name, call):
         try:
             out[name] = call()
         except BaseException as exc:  # noqa: BLE001 - ошибку потока отдаём тесту
             out[name] = f"{type(exc).__name__}: {exc}"
+        out["order"].append(name)
         if name == "second":
             resume.set()
 
@@ -647,3 +648,77 @@ async def test_a_lock_held_at_fork_time_does_not_hang_the_child(lock_path):
         assert chan.report()["entered"] is True, "потомок унаследовал занятый замок"
     finally:
         assert _reap(pid, chan) == 0
+
+
+@pytest.mark.parametrize("second", ["owns_db", "release_all"])
+async def test_every_entry_waits_for_the_pid_transition(lock_path, second):
+    from hub.services import rework_launch
+
+    assert rework_launch.claim_process(lock_path, "A") is True
+    rework_launch.release_process(lock_path, "A")
+    assert rework_launch.claim_process(lock_path, "A") is True
+
+    def child(chan: _Chan) -> None:
+        chan.hear()
+        out = _race_in_child(
+            rework_launch,
+            lambda: rework_launch.release_process(lock_path, "A"),
+            getattr(rework_launch, second),
+            after_first=False,
+        )
+        chan.say(json.dumps({**_state(rework_launch, []), "out": out}))
+        chan.hear()
+
+    pid, chan = _run_forked(child)
+    try:
+        rework_launch.release_process(lock_path, "A")
+        chan.say("go")
+        done = chan.report()
+        assert done["out"]["order"] == ["first", "second"], "вход обогнал переход PID"
+        assert done["out"]["second"] in (False, None)
+        assert done["apps"] == {} and done["owners"] == []
+    finally:
+        assert _reap(pid, chan) == 0
+
+
+async def test_a_failed_cleanup_is_retried_not_published_as_done(lock_path):
+    from hub.services import rework_launch
+
+    key = rework_launch._key(lock_path)
+    assert rework_launch.claim_process(lock_path, "A") is True
+
+    class _Flaky:
+        closed = False
+
+        def __init__(self, real):
+            self.real, self.failed = real, False
+
+        def close(self):
+            if not self.failed:
+                self.failed = True
+                raise OSError("close failed")
+            self.real.close()
+            self.closed = True
+
+    def child(chan: _Chan) -> None:
+        chan.hear()
+        owner = rework_launch._OWNERS[key]
+        owner.handle = _Flaky(owner.handle)
+        try:
+            rework_launch.claim_process(lock_path, "B")
+        except OSError:
+            pass
+        rework_launch.claim_process(lock_path, "C")
+        chan.say(
+            json.dumps({"apps": {k: list(v) for k, v in rework_launch._APPS.items()}})
+        )
+        chan.hear()
+
+    pid, chan = _run_forked(child)
+    try:
+        chan.say("go")
+        apps = chan.report()["apps"]
+        assert apps.get(key) == ["C"], "родительские заявки пережили сбой очистки"
+    finally:
+        assert _reap(pid, chan) == 0
+        rework_launch.release_process(lock_path, "A")
