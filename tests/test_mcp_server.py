@@ -2248,7 +2248,9 @@ async def test_hub_submit_for_review(
     assert payload["actor_hint"] == "agent"
     assert payload["transition"] == {"from": "running", "to": "review"}
     mock_api_post.assert_awaited_once_with(
-        "/api/tasks/42/submit-review", {"agent": "dev", "summary": "pass 2"}
+        "/api/tasks/42/submit-review",
+        {"agent": "dev", "summary": "pass 2"},
+        timeout=120.0,
     )
 
 
@@ -2388,55 +2390,31 @@ async def test_a_submit_timeout_says_a_same_sha_retry_is_safe(
     assert "submission #3" in again["message"]
     assert "no new generation opened" in again["message"]
 
-    # Сервер: медленный заказ ревью не держит ответ сдачи и не множится на
-    # повторе того же поколения.
-    import asyncio
+    # Срок: сдача ждёт _TIMEOUT_SUBMIT, остальные записи - прежний _TIMEOUT_SLOW.
+    mock_api_post.assert_awaited_with(
+        "/api/tasks/42/submit-review",
+        {"expected_sha": sha},
+        timeout=srv._TIMEOUT_SUBMIT,
+    )
+    assert srv._TIMEOUT_SUBMIT == 120.0 and srv._TIMEOUT_SLOW == 30.0
 
-    from hub import repository as repo
-    from hub.services import review_order
 
-    release = asyncio.Event()
-    ordered: list[int] = []
+async def test_only_submit_gets_the_long_client_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2057: настоящий _api_post называет в отказе срок, который просрочил."""
+    from hub import mcp_server as srv
 
-    async def slow_process(_db: Any, task_id: int, _generation: int) -> None:
-        ordered.append(task_id)
-        await release.wait()
-
-    async def fake_task(_db: Any, _task_id: int) -> dict[str, Any]:
-        return {"submission_generation": 3}
-
-    class _Conn:
-        async def commit(self) -> None:
-            return None
-
-        async def close(self) -> None:
-            return None
-
-    async def fake_connect(_dsn: str) -> _Conn:
-        return _Conn()
-
-    async def no_intent(*_a: Any) -> None:
-        return None
-
-    with (
-        patch.object(review_order, "DETACH_ENABLED", True),
-        patch.object(review_order, "process_intent", slow_process),
-        patch.object(review_order, "record_intent", no_intent),
-        patch.object(repo, "get_task", fake_task),
-        patch.object(review_order, "connect", fake_connect),
-    ):
-        token = review_order.detach_dsn.set("unused-dsn")
-        try:
-            for _ in range(2):
-                await asyncio.wait_for(review_order.kick(_Conn(), 42), 2)  # type: ignore[arg-type]
-        finally:
-            review_order.detach_dsn.reset(token)
-        for _ in range(20):
-            await asyncio.sleep(0)
-        assert ordered == [42], "заказ ушёл фоном, один на поколение"
-        assert review_order.inflight_count() == 1
-        release.set()
-        await review_order.drain()
+    async with _silent_hub(monkeypatch):
+        monkeypatch.setattr(srv, "_TIMEOUT_SUBMIT", 0.8)
+        with pytest.raises(HubApiError) as other:
+            await srv._api_post("/api/tasks/1/updates", {})
+        with pytest.raises(HubApiError) as submit:
+            await srv._api_post(
+                "/api/tasks/1/submit-review", {}, timeout=srv._TIMEOUT_SUBMIT
+            )
+    assert other.value.payload["timeout_seconds"] == 0.4
+    assert submit.value.payload["timeout_seconds"] == 0.8
 
 
 async def test_submit_answer_reads_as_new_when_the_generation_moves(

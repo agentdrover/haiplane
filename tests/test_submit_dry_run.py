@@ -19,7 +19,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import AsyncClient
 
-from hub.services import review_order
 from hub import cli, config
 from hub import repository as repo
 from hub.services import chat_pair as cp
@@ -133,7 +132,6 @@ async def test_real_submit_after_dry_run_unchanged(client: AsyncClient, db):
         assert dry.json()["would_submit"] is True
         real_a = await sup.submit(client, a, sup.body(), dry=False)
         real_b = await sup.submit(client, b, sup.body(), dry=False)
-        await review_order.drain()  # заказ ревью идёт фоном (#2057)
     assert real_a.status_code == real_b.status_code == 200, real_a.text
     assert real_a.json()["submission_generation"] == 1
     shape_a, shape_b = await _shape(db, a), await _shape(db, b)

@@ -85,7 +85,7 @@ from hub.services import (
     rework_launch,
     verdict_guard,
 )
-from hub.services import ci_contract, ci_integrity, ci_trust, review_order
+from hub.services import ci_contract, ci_integrity, ci_trust
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
@@ -3594,7 +3594,6 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await critic_orders.accept_in_transaction(
             db, state.task, observed=state.submission_sha, always=True
         )  # #1953
-        await review_order.record_intent(db, task_id, generation)  # #2057
         # #919: вывод прод-дефекта, присланный с повтором, не тонет молча.
         await _store_submitted_prevention(state)
         # AC-5: то же место в транзакции, что и в _apply_submission — до
@@ -3919,7 +3918,9 @@ async def _dispatch_cross_model_review(db: aiosqlite.Connection, task_id: int) -
     только в комментарии посреди перехода.
     """
     try:
-        await review_order.kick(db, task_id)
+        from hub.services.review_dispatch import maybe_dispatch_review
+
+        await maybe_dispatch_review(db, task_id)
     except Exception:  # noqa: BLE001 - dispatch must never break a submit
         log.exception("cross-model review dispatch failed for task #%s", task_id)
 
@@ -4042,7 +4043,6 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         )
         await _store_submitted_prevention(state)
         generation = await repo.bump_submission_generation(db, task_id)
-        await review_order.record_intent(db, task_id, generation)  # #2057
         # #758: the declared implementing model rides the submission the
         # same way the branch does — a report, not an observation, kept
         # auditable next to the pinned sha.

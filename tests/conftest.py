@@ -280,10 +280,6 @@ async def db(db_dsn, tmp_path_factory):
     await conn.close()
 
 
-#: Клиент ждёт фоновые заказы ревью после каждого ответа (#2057).
-DRAIN_AFTER_RESPONSE = True
-
-
 @pytest.fixture
 async def client(db, db_dsn):
     """httpx AsyncClient к приложению — с СОЕДИНЕНИЕМ НА ЗАПРОС (#1065).
@@ -319,24 +315,11 @@ async def client(db, db_dsn):
             """
             await db.commit()
 
-        async def _settle_background_orders(_response):
-            """Заказ ревью после сдачи идёт фоном (#2057): тест видит его итог.
-
-            Прод не ждёт; тесты, которым нужен именно фон, гасят флаг.
-            """
-            if DRAIN_AFTER_RESPONSE:
-                from hub.services import review_order
-
-                await review_order.drain()
-
         try:
             async with AsyncClient(
                 transport=transport,
                 base_url="http://test",
-                event_hooks={
-                    "request": [_flush_fixture_writes],
-                    "response": [_settle_background_orders],
-                },
+                event_hooks={"request": [_flush_fixture_writes]},
             ) as c:
                 yield c
         finally:

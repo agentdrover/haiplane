@@ -27,7 +27,6 @@ import aiosqlite
 import pytest
 from httpx import AsyncClient
 
-from hub.services import review_order
 from hub import cli
 from hub import repository as repo
 from hub import services
@@ -203,7 +202,6 @@ async def _submit(client: AsyncClient, task_id: int, **extra: Any):
         "hub.services.review_dispatch.maybe_dispatch_review", new=AsyncMock()
     ) as dispatch:
         resp = await client.post(f"/api/tasks/{task_id}/submit-review", json=body)
-        await review_order.drain()  # заказ ревью идёт фоном (#2057)
     return resp, dispatch
 
 

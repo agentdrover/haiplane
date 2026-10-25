@@ -24,7 +24,6 @@ import pytest
 from fastapi import HTTPException
 from httpx import AsyncClient
 
-from hub.services import review_order
 from hub import db as db_module
 from hub import repository as repo
 from hub import services
@@ -418,7 +417,6 @@ async def test_another_agent_resubmits_a_returned_task(
         json={"agent": "agent-b", "model": "claude-opus-5.5"},
         headers=_AGENT_B,
     )
-    await review_order.drain()  # заказ ревью идёт фоном (#2057)
     assert resp.status_code == 200, resp.text
     card = resp.json()
     assert card["status"] == "review"

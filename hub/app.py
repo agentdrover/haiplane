@@ -160,7 +160,7 @@ from hub.mcp_catalog import (
 )
 from hub.services import accepted_delivery_retry
 from hub.services import admin as admin_svc
-from hub.services import chat_pair, rework_launch, review_order
+from hub.services import chat_pair, rework_launch
 from hub.services import owner_minutes, policy_change, project_policy, triage_inbox
 from hub.services.brief_failure import scrub_strings
 from hub.services.refusal_publish import update_views
@@ -2697,14 +2697,9 @@ async def api_submit_for_review(
     """
     if dry_run:
         return await dry_run_submit(_db(request), task_id, body)
-    # #2057: заказ ревью уходит из запроса на своё соединение по этому DSN.
-    token = review_order.detach_dsn.set(getattr(request.app.state, "dsn", None))
-    try:
-        return await services.submit_for_review(
-            _db(request), task_id, body, principal_id=identity.principal_id
-        )
-    finally:
-        review_order.detach_dsn.reset(token)
+    return await services.submit_for_review(
+        _db(request), task_id, body, principal_id=identity.principal_id
+    )
 
 
 @app.post("/api/tasks/{task_id}/machine-review", response_model=MachineReviewView)

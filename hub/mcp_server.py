@@ -351,6 +351,8 @@ def _parse_api_error(resp: Any, status_code: int) -> dict[str, Any]:
 # местам.
 _TIMEOUT_DEFAULT = 15.0
 _TIMEOUT_SLOW = 30.0
+#: Сдача на ревью ходит в git/GitHub внутри запроса (#2057): ей нужен срок длиннее.
+_TIMEOUT_SUBMIT = 120.0
 
 _TRANSPORT_READ_RETRY = "Повтор безопасен: чтение ничего не меняло."
 _TRANSPORT_WRITE_RETRY = (
@@ -652,6 +654,7 @@ async def _api_post(
     body: dict[str, Any] | None = None,
     *,
     extra_headers: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> Any:
     import httpx
 
@@ -667,7 +670,7 @@ async def _api_post(
         or headers.get("X-Client-Request-Id")
         or ""
     ).strip()
-    deadline = _TIMEOUT_SLOW
+    deadline = _TIMEOUT_SLOW if timeout is None else timeout
     try:
         async with httpx.AsyncClient(timeout=deadline) as client:
             resp = await client.post(
@@ -2758,7 +2761,9 @@ async def hub_submit_for_review(
     if evidence is not None:
         body["evidence"] = evidence
     try:
-        task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
+        task = await _api_post(
+            f"/api/tasks/{task_id}/submit-review", body or None, timeout=_TIMEOUT_SUBMIT
+        )
     except HubApiError as exc:
         return _format_hub_api_error(_with_same_sha_retry_note(exc), prior_task)
     generation = task.get("submission_generation", 0)
