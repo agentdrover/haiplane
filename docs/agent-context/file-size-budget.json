@@ -65,7 +65,7 @@
     },
     {
       "path": "hub/repository.py",
-      "measured": 6586,
+      "measured": 6639,
       "max": 6916,
       "removed_by": "unclaimed"
     },

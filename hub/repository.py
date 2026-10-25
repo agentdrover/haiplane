@@ -35,10 +35,8 @@ from hub.models import (
 )
 
 # One spelling of "this row is finished", derived from the model instead of
-# retyped in SQL (#571). list_live_epics had the three values written out by
-# hand, and #569 shipped that list WRONG — it omitted `failed` until spec review
-# caught it. A second hand-typed copy for orphan tasks would make three places
-# to keep in step, which is the same defect as the permission list in #614.
+# retyped in SQL (#571): a hand-typed list once omitted `failed` (#569), and a
+# second copy would be one more place to keep in step (#614).
 FINAL_STATUS_VALUES = tuple(sorted(s.value for s in FINAL_STATUSES))
 _FINAL_PLACEHOLDERS = ",".join("?" * len(FINAL_STATUS_VALUES))
 
@@ -61,20 +59,14 @@ class UnknownTaskStateError(ValueError):
     """
 
 
-# The named status-set modes (#617). A counter and the list behind its link have
-# to agree, and "live" is the NEGATION of a set — impossible to express through
-# the single-valued ``status`` filter, which is exactly why "Без эпика: 19 живых"
-# opened a list of 51.
+# The named status-set modes (#617). A counter and the list behind its link must
+# agree, and "live" is the NEGATION of a set — inexpressible through the
+# single-valued ``status`` filter. Named values only, from the model's own sets:
+# arbitrary status lists in a query string would be an unvalidated query language.
 #
-# Named values only, taken from the model's own sets. Accepting arbitrary status
-# lists in a query string would turn this into a small query language nobody
-# validates; a fourth NAMED mode is the way to grow, per the task's revisit
-# condition.
-#
-# ``awaiting`` excludes a headless review — a review with ``review_job_id`` set
-# belongs to the poller conveyor, not to a person. Same rule as
-# ``list_stale_by_status(require_null_review_job=True)`` and the card counter in
-# #567; disagreeing with it here would recreate the very mismatch this fixes.
+# ``awaiting`` excludes a headless review (``review_job_id`` set): it belongs to
+# the poller conveyor, not a person. Same rule as
+# ``list_stale_by_status(require_null_review_job=True)`` and the card counter (#567).
 TASK_STATE_FILTERS: dict[str, tuple[str, tuple[str, ...]]] = {
     "live": (f"status NOT IN ({_FINAL_PLACEHOLDERS})", FINAL_STATUS_VALUES),
     "awaiting": (
@@ -83,16 +75,10 @@ TASK_STATE_FILTERS: dict[str, tuple[str, tuple[str, ...]]] = {
         AWAITING_HUMAN_STATUS_VALUES,
     ),
     "inflight": (f"status IN ({_IN_FLIGHT_PLACEHOLDERS})", IN_FLIGHT_STATUS_VALUES),
-    # A fourth NAMED mode, added exactly the way #617's revisit condition said to
-    # grow this: approved and untouched is a queue, and it deserves its own link
-    # rather than an arbitrary status list in the query string (#619).
-    #
-    # Epics are excluded, and the reason is the one ``project_work_summary``
-    # already gives for the same exclusion: an epic sits in ``open`` for its
-    # entire life as a container, so it is not "approved and nobody started it".
-    # #619 put that rule in the counter and forgot it here, which is how
-    # notesforllm came to promise 4 and open 5 (#621). The membership rule now
-    # lives on BOTH sides of the same door.
+    # A fourth NAMED mode (#619): approved and untouched is a queue with its own
+    # link. Epics are excluded, as in ``project_work_summary``: an epic sits in
+    # ``open`` for its whole life as a container. The rule lives on BOTH sides,
+    # counter and list (#621).
     "queued": (
         f"status IN ({_QUEUED_PLACEHOLDERS}) AND task_type != 'epic'",
         QUEUED_STATUS_VALUES,
@@ -109,15 +95,12 @@ def task_state_condition(state: str) -> tuple[str, tuple[str, ...]]:
         raise UnknownTaskStateError(f"unknown state {state!r}; known: {known}") from exc
 
 
-# Membership in a project, written ONCE (#627).
-#
-# The project sits on the epic and descendants inherit it, so membership is a
-# subtree walk. Every list that narrows by project must apply this INSIDE its
-# query, before its LIMIT: applied afterwards in Python it discards rows the
-# query already spent, and the caller gets an empty list that is
-# indistinguishable from "this project has no work". That defect has now been
-# fixed three times — #370 in the API, #621 on the tasks page, #627 across the
-# dashboard and inbox — which is why the rule is a constant instead of a habit.
+# Membership in a project, written ONCE (#627). The project sits on the epic and
+# descendants inherit it, so membership is a subtree walk. Every list narrowing by
+# project applies this INSIDE its query, before its LIMIT: applied afterwards in
+# Python it discards spent rows and returns an empty list indistinguishable from
+# "this project has no work". Fixed three times (#370, #621, #627): hence a
+# constant, not a habit.
 PROJECT_SUBTREE_CONDITION = """id IN (
     WITH RECURSIVE subtree(id) AS (
         SELECT id FROM tasks WHERE project_id = ?
@@ -134,10 +117,8 @@ PROJECT_SUBTREE_CONDITION = """id IN (
 # NOT part of this: callers control that through include_archived.
 ORPHAN_CONDITION = "parent_id IS NULL AND task_type != 'epic'"
 
-# Whether an epic is alive. Written once and used by BOTH the live list and the
-# done list, so the two are exact complements: spell the condition twice and an
-# epic can fall out of both at once, which is the silent loss #569 refused when
-# it dropped its LIMIT.
+# Whether an epic is alive. Written once for BOTH the live and the done list so
+# they are exact complements: spelled twice, an epic can fall out of both (#569).
 _EPIC_IS_LIVE = """
         EXISTS (
             SELECT 1 FROM sub JOIN tasks c ON c.id = sub.id
@@ -159,20 +140,11 @@ _SUBTREE_CTE = """
     )"""
 
 # When work last HAPPENED in this epic's subtree — from the feed, not from
-# ``updated_at`` (#570).
-#
-# ``updated_at`` is bumped by any write at all (#616 spelled that out), so it
-# answers "when was this row last touched". Checked against production: ordering
-# by it floated #182, #192, #209, #371 and #394 to the top — the five epics whose
-# PROJECT had just been reassigned. An administrative touch would have looked
-# exactly like work.
-#
-# Falling back to ``updated_at`` was the first design and a TEST KILLED IT: with
-# a per-row COALESCE the epic's own touch entered the maximum, so a rename
-# outranked a week of real work — the exact noise this key exists to avoid. An
-# epic with no feed entry anywhere in its subtree has no activity, full stop; it
-# sorts last (SQLite ranks NULL below every value, so DESC puts it at the end)
-# and stays in the list, which is the honest answer rather than a borrowed date.
+# ``updated_at`` (#570): any write bumps ``updated_at``, so an administrative
+# touch (a project reassignment: #182, #192, #209, #371, #394) would look like
+# work, and a per-row COALESCE fallback would let the epic's own touch outrank
+# real work. No feed entry means no activity: NULL sorts last under DESC and the
+# epic stays in the list.
 _EPIC_ACTIVITY = """
         SELECT MAX(u.created_at)
         FROM sub JOIN task_updates u ON u.task_id = sub.id
@@ -249,10 +221,9 @@ async def count_tasks_by_state(
 
     Built by folding TASK_STATE_FILTERS into a single SELECT of SUM(CASE ...),
     so a counter cannot drift from the list its link opens: both read the same
-    condition string. Spelling the counts out with "similar" WHERE clauses is
-    exactly how #571, #619 and #621 each shipped a number that disagreed with
-    the page behind it — three times is enough to make the shared definition
-    structural rather than a habit (#630).
+    condition string. Spelling the counts out with "similar" WHERE clauses shipped
+    a number that disagreed with its page three times (#571, #619, #621), so the
+    shared definition is structural rather than a habit (#630).
     """
     parts: list[str] = []
     params: list[Any] = []
@@ -326,9 +297,7 @@ def inbox_query_string(
     return f"?{urlencode(params)}"
 
 
-# ---------------------------------------------------------------------------
-# Tasks — Read
-# ---------------------------------------------------------------------------
+# --- Tasks — Read ------------------------------------------------------------
 
 
 async def get_task(
@@ -393,9 +362,8 @@ async def list_tasks_filtered(
         # would silently change every existing link that passes an empty box.
         conditions.append(ORPHAN_CONDITION)
     if state:
-        # #617: a third independent parameter. It composes with status and
-        # no_epic rather than replacing either — the counter needs "live", the
-        # hierarchy flag needs "no parent", and they are different questions.
+        # #617: independent of status and no_epic — the counter needs "live", the
+        # hierarchy flag "no parent"; different questions.
         sql, values = task_state_condition(state)
         conditions.append(sql)
         params.extend(values)
@@ -439,8 +407,7 @@ async def list_tasks_by_statuses(
 ) -> list[aiosqlite.Row]:
     placeholders = ",".join("?" for _ in statuses)
     archived_sql = "" if include_archived else " AND archived=0"
-    # #627: optional, and INSIDE the query — see PROJECT_SUBTREE_CONDITION for
-    # why narrowing a limited list afterwards is the defect, not the fix.
+    # #627: optional, and INSIDE the query (see PROJECT_SUBTREE_CONDITION).
     project_sql = f" AND {PROJECT_SUBTREE_CONDITION}" if project_id is not None else ""
     project_params = () if project_id is None else (project_id,)
     return await fetchall(
@@ -470,8 +437,7 @@ async def list_tasks_by_status(
     if not include_archived:
         conditions.append("archived=0")
     if project_id is not None:
-        # #627: inside the query, before the LIMIT — see
-        # PROJECT_SUBTREE_CONDITION.
+        # #627: inside the query, before the LIMIT.
         conditions.append(PROJECT_SUBTREE_CONDITION)
         params.append(project_id)
     _append_person_filters(
@@ -497,18 +463,10 @@ async def list_unmerged_branch_tasks(
 ) -> list[aiosqlite.Row]:
     """Active tasks (other than ``exclude_task_id``) that own a branch (#438).
 
-    ``submission_generation`` travels with the row (#1283): it counts the
-    submissions the task actually made, so zero is the hub's own record that
-    this task has never handed work in — and therefore owns nothing on origin
-    to compare against.
-
-    ``submission_sha`` travels with it too, and it used to carry that meaning
-    alone — wrongly, which is why the count is here: an empty sha does not say
-    "never published". ``resolve_branch_tip`` documents the empty value as
-    "could not look" (no workspace, a failed fetch, an exception), the
-    submission is accepted anyway, and a verdict on a moved tip wipes the pin.
-    The stacking walk reads both; callers that do not care simply ignore the
-    columns.
+    ``submission_generation`` (#1283) counts the submissions the task made: zero
+    means it never handed work in and owns nothing on origin. ``submission_sha``
+    alone cannot say that — empty means "could not look" (``resolve_branch_tip``),
+    and a verdict on a moved tip wipes the pin. The stacking walk reads both.
     """
     placeholders = ",".join("?" for _ in statuses)
     return await fetchall(
@@ -548,29 +506,17 @@ async def list_undelivered_completed_branch_tasks(
       could not get, and the existing reader keeps it apart for the same
       reason (#725).
 
-    ``pr_closed`` reads the same as ``pr_open`` here, and that is deliberate
-    (found by machine review of submission #8, verified against the code
-    rather than taken on the reviewer's word): ``delivery_state.task_delivery``
-    calls a PR closed without merging "work dropped on purpose", but "on
-    purpose" describes the OWNER's decision, not the git history. The base
-    task's commits stay ancestors of any branch drawn from it whether its PR
-    is still open or was closed, and a squash merge of that branch still
-    carries them into the base branch under the dependent's number — the
-    #1183-over-#1175 shape this whole condition exists to prevent. A prior
-    revision of this query and its test asserted the opposite (``pr_closed``
-    excluded, reasoning only about whether it is worth ASKING a human "when
-    will this arrive" — a question that genuinely has no answer for abandoned
-    work). That reasoning answers a different question than the one this
-    function feeds: the stacking gate is not asking when the base will
-    deliver, it is asking whether merging now would carry undelivered commits
-    forward. Reproduced before this fix: a completed base with a
-    ``delivery_discrepancies`` row of ``pr_closed`` let a stacked dependent
-    merge straight through, with ``merge_pr`` awaited and no human ever
-    named the base
+    ``pr_closed`` reads the same as ``pr_open`` here, deliberately:
+    ``delivery_state.task_delivery`` calls a PR closed without merging "work
+    dropped on purpose", but that is the OWNER's decision, not git history. The
+    base task's commits stay ancestors of any branch drawn from it, and a squash
+    merge of that branch still carries them into the base branch under the
+    dependent's number — the #1183-over-#1175 shape this condition exists to
+    prevent. The stacking gate asks whether merging now would carry undelivered
+    commits forward, not when the base will deliver
     (``tests/test_delivery_gate.py::test_a_closed_unmerged_base_also_calls_a_human``).
 
-    TWO NAMED BLIND SPOTS, because a partial answer read as a complete one is
-    how this class of bug returns:
+    Two named blind spots:
     1. ``unknown`` rows are NOT candidates. They cannot be: such a task's
        branch is usually long deleted, the probe would answer ``unavailable``,
        and under #1186's rule that outranks ``clear`` — every delivery would
@@ -644,10 +590,8 @@ async def list_pair_tasks_awaiting_delivery(
     Every condition here is something the hub can see for itself: the verdict
     belongs to the current submission, a PR exists to deliver, and no dispatch
     job owns the task. None of them asks whether some process is still alive —
-    which is the whole point. On 26.08.2026 a session submitted #954 and died
-    six minutes later; the APPROVED verdict arrived an hour after that, with a
-    green PR ready to merge, and nothing happened, because the only merge
-    trigger a pair task had was the agent's own done report.
+    which is the whole point (a session that died after submitting left an APPROVED
+    verdict with a green PR and no merge trigger, #954).
 
     Whether the approval is CURRENT is decided by the one predicate that owns
     that question — ``review_approved_for_current_submission`` (#306) — not by
@@ -671,12 +615,9 @@ async def list_pair_tasks_awaiting_delivery(
 async def completed_by_poller_delivery(db: aiosqlite.Connection, task_id: int) -> bool:
     """Did the hub finish this task itself, with no done report (#971)?
 
-    Asked when a done report arrives for a task that is already complete. The
-    answer decides between two very different things: an agent reporting on
-    work the hub carried home while it was away, and a report on a task that
-    finished some other way. Read from the completion event rather than from
-    the feed text, because the event is what the poller writes and a message
-    is what anyone can.
+    Asked when a done report arrives for an already complete task: it separates
+    a report on work the hub carried home from one on a task finished another way.
+    Read from the completion event (the poller writes it), not from the feed text.
     """
     rows = await fetchall(
         db,
@@ -737,9 +678,7 @@ async def list_stale_running(
     )
 
 
-# ---------------------------------------------------------------------------
-# Projects (#335)
-# ---------------------------------------------------------------------------
+# --- Projects (#335) ---------------------------------------------------------
 
 
 async def create_project(
@@ -976,11 +915,9 @@ async def pipeline_merge_recorded(
 ) -> bool:
     """Was this task's PR already delivered by the pipeline (#605)?
 
-    The completion gate must not merge twice: the headless conveyor merges
-    inside the poller and then walks the same shared transition, and a second
-    merge_pr on an already-merged PR reads as a refusal — which would flip a
-    delivered task into needs_decision. Caught by #363's merges-exactly-once
-    guard the first time the gate ran.
+    The completion gate must not merge twice: the headless conveyor merges in the
+    poller, and a second merge_pr on a merged PR reads as a refusal that would flip
+    a delivered task into needs_decision (the #363 guard).
     """
     rows = await fetchall(
         db,
@@ -1170,9 +1107,7 @@ async def update_project(
     )
 
 
-# ---------------------------------------------------------------------------
-# Отложенные правки политики проекта (#1593)
-# ---------------------------------------------------------------------------
+# --- Отложенные правки политики проекта (#1593) ------------------------------
 
 
 async def insert_scheduled_policy_change(
@@ -1504,17 +1439,12 @@ async def record_skill_publication(
 ) -> None:
     """Записать доказательства публикации ТУДА, ГДЕ У НИХ НЕТ СРОКА (#1253).
 
-    Парная к ``insert_event`` запись: событие уведомляет, эта — хранит.
-    Вызывающий обязан передать сюда ТОТ ЖЕ словарь, что ушёл в событие, — не
-    второй такой же, собранный рядом. Разойтись двум сборкам полезной
-    нагрузки ничто не мешает, а расхождение путей публикации и есть исходный
-    дефект #1169; сериализация здесь та же, что у ``insert_event``, поэтому
-    из одного словаря выходит и одна строка.
+    Парная к ``insert_event``: событие уведомляет, эта запись хранит. Вызывающий
+    передаёт ТОТ ЖЕ словарь, что ушёл в событие: две сборки нагрузки разойдутся
+    (дефект #1169); сериализация та же, что у ``insert_event``.
 
-    Коммита здесь нет намеренно, как и у ``insert_event``: вызывающий пишет
-    запись в той же транзакции, что и саму активацию, и откат обязан унести
-    обе. Записи о публикации версии, которой нет в реестре, не бывает —
-    ``UPDATE`` по несуществующей паре просто не тронет ни одной строки.
+    Коммита нет намеренно: запись идёт в транзакции самой активации, откат уносит
+    обе. Записи о версии вне реестра не бывает: ``UPDATE`` не тронет ни одной строки.
     """
     await db.execute(
         "UPDATE skills SET publication_record=? WHERE name=? AND version=?",
@@ -1525,14 +1455,7 @@ async def record_skill_publication(
 async def latest_skill_activation(
     db: aiosqlite.Connection, name: str, version: int
 ) -> dict[str, Any] | None:
-    """Записанные доказательства публикации ИМЕННО ЭТОЙ версии.
-
-    This is what makes paths 1 and 3 visible AFTER the fact (#1169). On path 1
-    the person is the author of the text, so a preview adds nothing — what was
-    missing is the record of what got published; on path 3 there is no person
-    at all. The page reads that record back rather than recomputing it, so what
-    a human sees is the thing that was actually written down, not a second
-    opinion computed later from rows that may since have moved.
+    """Записанные (не пересчитанные) доказательства публикации ИМЕННО ЭТОЙ версии.
 
     Читается колонка строки версии, а НЕ лента событий (#1253). Лента —
     канал уведомлений: поллер чистит её раз в две недели
@@ -1845,11 +1768,9 @@ async def list_machine_reviews(
 ) -> list[aiosqlite.Row]:
     """Every review RUN this task has cost, oldest first (#893).
 
-    The unit that tracks spend is the run, not the token: measured across
-    eleven billed runs, none came in under 777k tokens and the size of the
-    diff explained none of the variance. A task reviewed five times cost five
-    times the entry price, and that is only visible when the runs are counted
-    rather than summed.
+    The unit that tracks spend is the run, not the token: across eleven billed runs
+    none came in under 777k tokens and the diff size explained none of the
+    variance. A task reviewed five times cost five times the entry price.
     """
     return list(
         await fetchall(
@@ -1883,16 +1804,10 @@ async def upsert_finding_disposition(
 ) -> None:
     """Record what one confirmed finding turned out to be.
 
-    Upsert stays on (review_id, finding_index), and that is correct rather than
-    legacy: a stored report is IMMUTABLE. ``findings_confirmed`` is written once
-    by ``insert_machine_review`` and never rewritten, and a resubmission files a
-    NEW report with its own id and its own judgements — so inside one report a
-    slot names one finding for good. A gate revisiting its own call corrects
-    that row instead of stacking a contradictory one beside it.
-
-    What the slot cannot do is carry identity ACROSS reports, which is why
-    ``finding_uid`` is stored beside it (#1007): the same defect in the next
-    generation has a different position and the same id.
+    Upsert stays on (review_id, finding_index): a stored report is IMMUTABLE
+    (``findings_confirmed`` is written once; a resubmission files a NEW report), so
+    a slot names one finding for good and a gate revisiting its call corrects that
+    row; across reports only ``finding_uid`` (#1007) links one defect.
 
     ``finding_uid`` is required and has no default: an empty one used to be
     accepted and then written over an id already computed — the silent
@@ -2034,21 +1949,16 @@ async def list_unjudged_findings(
 ) -> list[aiosqlite.Row]:
     """Confirmed findings of CURRENT reports that nobody has answered yet.
 
-    Deliberately keyed on nothing about the task's status. Every other inbox
-    section is built from ``list_tasks_by_status``, and that is exactly why
-    these findings were unreachable: a report is written while the task is in
-    review, and by the time anyone would judge it the task is ``completed`` and
-    appears in no section at all. The findings outlive the status, so the query
-    that finds them must not depend on it (#1038).
+    Deliberately keyed on nothing about the task's status (#1038): other inbox
+    sections are built from ``list_tasks_by_status``, but a report is written in
+    review and by the time anyone judges it the task is ``completed`` and in no
+    section. The findings outlive the status, so the query must not depend on it.
 
-    ``since`` takes the same relative form as the metrics window
-    ('-90 days'); omitted, the whole history answers.
+    ``since`` takes the metrics window form ('-90 days'); omitted, all history.
     """
     where, params = _unjudged_where(since, project_id, category)
-    # Свежие сверху, когда об этом просят (#1171). Разбор идёт категориями, а
-    # внутри категории свежая находка судится точнее старой: код ещё похож на
-    # тот, о котором писал ревьюер. Порядок по умолчанию не тронут — его читает
-    # страница, написанная до этого параметра.
+    # Свежие сверху, когда просят (#1171): свежая находка судится точнее (код ещё
+    # похож на тот, что видел ревьюер). Порядок по умолчанию не тронут.
     order = "DESC" if newest_first else "ASC"
     sql = (
         "SELECT t.id AS task_id, t.title AS task_title, "  # nosec B608
@@ -2073,13 +1983,11 @@ async def unjudged_findings_by_category(
 ) -> list[dict[str, Any]]:
     """Сколько находок ждёт в каждой категории, самые частые первыми (#1171).
 
-    Порядок разбора — предмет постановки, а не украшение: correctness даёт
-    больше находок, чем все прочие категории вместе, и его precision — первое
-    число, под которое имеет смысл писать детерминированную проверку. Один
-    длинный список вперемешку такого ответа не даёт.
+    Порядок разбора — предмет постановки: correctness даёт больше находок, чем все
+    прочие вместе, и его precision — первое число, под которое пишут
+    детерминированную проверку.
 
-    Тот же ``FROM``, что у списка и счётчика, — по построению, а не по
-    аккуратности копирования.
+    Тот же ``FROM``, что у списка и счётчика, — по построению, а не по копированию.
     """
     where, params = _unjudged_where(since, project_id)
     rows = await fetchall(
@@ -2104,10 +2012,8 @@ async def count_unjudged_findings(
 ) -> dict[str, int]:
     """How many findings wait, and across how many reports.
 
-    Same FROM as :func:`list_unjudged_findings` by construction. The count a
-    person sees on the metrics page and the length of the queue they open from
-    it are the same question, and answering it twice is how the two start
-    disagreeing.
+    Same FROM as :func:`list_unjudged_findings` by construction: the count on the
+    metrics page and the length of the queue it opens are one question.
     """
     where, params = _unjudged_where(since, project_id, extra=extra)
     rows = await fetchall(
@@ -2197,16 +2103,12 @@ async def finding_outcome_for_uid(
 ) -> aiosqlite.Row | None:
     """The author's account of one defect, across every report of this task.
 
-    By ``task_id`` and not by ``review_id`` on purpose (#1170). Outcomes are
-    written at the NEXT submission, against the report that sent the work back
-    (lifecycle._step_finding_outcomes), so a row never exists for the report
-    being judged right now. What does carry across is the uid: it is derived
-    from the finding's content (#1007), so one defect raised again by the next
-    report is the same id. Asking per review would therefore always answer
-    "nothing", which is the difference between a check and an off switch.
-
-    The latest account wins: a resubmission may correct what the author said
-    last time, and the correction is the answer.
+    By ``task_id``, not ``review_id`` (#1170): outcomes are written at the NEXT
+    submission against the report that sent the work back
+    (lifecycle._step_finding_outcomes), so no row exists for the report being
+    judged now. What carries across is the uid, derived from the finding's content
+    (#1007); asking per review would always answer "nothing", an off switch and not
+    a check. The latest account wins: a resubmission may correct the author.
     """
     sql = "SELECT * FROM finding_outcomes WHERE task_id=? AND finding_uid=?"
     params: list[object] = [task_id, finding_uid]
@@ -2335,14 +2237,9 @@ async def upsert_ci_run_report(
     Since #1687 the row is the projection of the CURRENT attempt of the commit
     (see hub.services.ci_trust); ``trust`` says whether GitHub confirmed it.
 
-    Re-running CI on the same commit updates the row rather than adding a
-    second opinion — the same rule the merge ledger follows (#605).
-
     ``mutations`` / ``baseline`` of ``None`` mean "the report carried no such
     key" (#1606): the step did not run, so a block stored earlier IN THIS ROW
-    stays. Since #1687 the row is the projection of the current attempt and the
-    hub writes it with the attempt's own text, so a block is inherited only
-    inside one attempt, never from another one (the latest attempt must carry
+    stays, never one inherited from another attempt (the latest attempt must carry
     its own baseline). The decision is made inside ON CONFLICT, in the same
     statement that writes. Text (including ``"{}"``) replaces: a step that ran
     and found nothing, or ended in error, is a fact, not an absence.
@@ -2749,16 +2646,11 @@ async def list_stale_tasks(
 async def list_outcome_debt(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     """Completed tasks that stated an outcome nobody has come back to.
 
-    DoR refuses a task without ``outcome_metric``, and nothing has ever read it
-    since. This is the read that makes the debt visible.
-
-    Deliberately not filtered by ``outcome_deadline``: that column is free text
-    (models.py, max_length 64) and real values are event descriptions - "within
-    the first 30 captures", "on the next reviewed submission" - not dates.
-    Filtering on it would hide tasks behind a value that cannot be parsed.
-
-    Oldest first: the ones that have waited longest are the ones whose answer is
-    most likely already knowable.
+    DoR refuses a task without ``outcome_metric`` and nothing has read it since;
+    this read makes the debt visible. Deliberately not filtered by ``outcome_deadline``:
+    that column is free text (models.py, max_length 64) holding event descriptions
+    ("on the next reviewed submission"), not dates. Oldest first: the tasks that
+    waited longest are the likeliest to be answerable already.
     """
     return await fetchall(
         db,
@@ -2833,10 +2725,7 @@ async def list_live_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     all stays live until itself final — a freshly approved epic must not
     vanish before its first task exists.
 
-    "Final" is the model's own set — completed, failed, rejected — not the
-    completed/rejected pair the task prose named: failed is terminal
-    everywhere else in the lifecycle, and a criterion that disagrees with
-    FINAL_STATUSES would fork the model (spec review, finding 1).
+    "Final" is the model's own FINAL_STATUSES (completed, failed, rejected).
 
     No LIMIT: silently dropping a live epic is exactly the failure this
     replaces (#569 AC-4). The list is bounded by reality — an epic leaves it
@@ -2852,15 +2741,11 @@ async def list_live_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
 async def list_done_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     """Epics whose work is finished — the exact complement of the live list (#570).
 
-    Not merely "not shown": before this they were unreachable from the epic
-    views, because #569 filtered them out and nothing counted them. A collapsed
-    block with a number gives the access back without putting 14 finished epics
-    back into the working list.
-
-    Complement by construction, sharing ``_EPIC_IS_LIVE`` with
-    ``list_live_epics``: two hand-written conditions would eventually disagree,
-    and an epic matching neither would vanish from both lists — the silent loss
-    #569 refused when it dropped its LIMIT.
+    Before this they were unreachable (#569 filtered them out and nothing counted
+    them); a collapsed block with a number gives access back without putting
+    finished epics into the working list. Complement by construction, sharing
+    ``_EPIC_IS_LIVE`` with ``list_live_epics``: two hand-written conditions would
+    disagree and an epic matching neither would vanish from both lists.
     """
     return await fetchall(db, _DONE_EPICS_SQL, FINAL_STATUS_VALUES * 2)
 
@@ -2868,10 +2753,7 @@ async def list_done_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
 async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, Any]]:
     """Per project: what waits for a human, what is in flight, when work last happened.
 
-    ONE aggregate query for every project rather than a loop of per-project
-    queries — the N+1 risk named in #567's own statement.
-
-    Two rules are honoured here rather than restated:
+    ONE aggregate query for all projects (the N+1 risk, #567). Two rules hold here:
 
     * the project sits on the EPIC and descendants inherit it (the same subtree
       walk as ``list_task_ids_for_project``), so a task outside every epic
@@ -2885,12 +2767,9 @@ async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, 
     counting query would multiply every row by its number of feed entries and
     silently inflate all three numbers.
 
-    Epics count as awaiting a human but NOT as work in flight, and the asymmetry
-    is deliberate: a draft epic really is waiting for the same approval gate as a
-    draft task, while an epic sits in ``open`` for its entire life as a
-    container — counting it would add a permanent "+1 in flight" to every
-    project, including projects where nothing at all is happening. Caught by a
-    test that expected 2 and got 3.
+    Epics count as awaiting a human but NOT as work in flight: a draft epic waits
+    for the same approval gate as a draft task, while an epic sits in ``open`` for
+    its whole life as a container and would add a permanent "+1 in flight".
     """
     counts_sql = f"""
         WITH RECURSIVE tree(project_id, id) AS (
@@ -2937,8 +2816,7 @@ async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, 
             "awaiting_human": int(d["awaiting"] or 0),
             "drafts": int(d["drafts"] or 0),
             "in_flight": int(d["in_flight"] or 0),
-            # Kept beside "in flight" rather than folded into it: the queue is
-            # worth seeing, it is just a different question (#619).
+            # Kept beside "in flight", not folded into it: a different question (#619).
             "queued": int(d["queued"] or 0),
             "last_activity_at": None,
         }
@@ -2953,15 +2831,11 @@ async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, 
 async def count_live_orphan_tasks(db: aiosqlite.Connection) -> int:
     """How many live tasks belong to no epic (#571).
 
-    The epic-shaped views — the dashboard and the epic list — are built on
-    ``list_live_epics``, so a task with no parent appears in none of them. It is
-    findable in the flat ``/tasks`` list, which is why the claim "invisible
-    everywhere" was wrong; what was missing is anything that SAYS how many there
-    are. On 10.08.2026 that was 51 rows, 13 of them live.
-
-    Counted here, next to the epic criterion, because two consumers ask
-    (the epic list and the projects page) and two copies of the condition
-    would drift — the class of defect fixed in #609, #614 and #616.
+    The epic-shaped views are built on ``list_live_epics``, so a parentless task
+    appears in none of them (it is findable in the flat ``/tasks`` list, but
+    nothing SAID how many). Counted next to the epic criterion because two
+    consumers ask (epic list, projects page) and two copies of the condition would
+    drift (#609, #614, #616).
     """
     rows = await fetchall(db, _LIVE_ORPHANS_COUNT_SQL, FINAL_STATUS_VALUES)
     return int(dict(rows[0])["n"]) if rows else 0
@@ -3020,9 +2894,7 @@ async def find_task_id_by_description_marker(
     return int(row[0]) if row else None
 
 
-# ---------------------------------------------------------------------------
-# Tasks — Write
-# ---------------------------------------------------------------------------
+# --- Tasks — Write -----------------------------------------------------------
 
 
 async def create_task(
@@ -3188,27 +3060,19 @@ async def close_review_verdict_window(
 ) -> int | None:
     """Close the CURRENT submission's APPROVAL, revoked by a decision (#1286).
 
-    Returns the generation whose window was closed, or ``None`` when there was
-    nothing to close. The caller uses that answer to decide whether the feed
-    has anything to say, so "nothing was closed" is an answer and not a
-    silence.
+    Returns the generation whose window was closed, or ``None`` when nothing was
+    closed, so the caller can tell "nothing to close" from silence. Nothing to
+    close is: no verdict; a verdict of an earlier submission; or a verdict that
+    never authorised a delivery. CHANGES_REQUESTED is the live case of the third
+    (reachable on the current generation without a bump, e.g. a failed fix dispatch
+    dropping the task into needs_decision). A window exists only where the verdict
+    grants the right to deliver, APPROVED alone: closing one anyway made the feed
+    announce a revoked approval over a task nobody had approved.
 
-    Nothing to close means one of three things, and the third one was this
-    function's own defect: no verdict at all; a verdict belonging to an
-    earlier submission; or a verdict that never authorised a delivery.
-    CHANGES_REQUESTED is the live case of the third — reachable on the current
-    generation without any bump, e.g. when the fix dispatch fails and drops
-    the task into needs_decision, or when the arbiter finishes on that same
-    submission. A window exists only where the verdict grants the right to
-    deliver, which is APPROVED and nothing else: rework does not revoke a
-    rejection, it agrees with it. Closing one anyway made the feed announce a
-    revoked approval over a task nobody had approved.
-
-    Written in SQL against ``submission_generation`` for the same reason
-    ``record_review_verdict`` binds the verdict there: nothing read before the
-    statement can be stale by the time it runs. The verdict itself, its
-    generation, its findings and its self-approved flag are left ALONE — the
-    window closes, the history stays (#1286 constraint).
+    Written in SQL against ``submission_generation``, as ``record_review_verdict``
+    binds the verdict: nothing read before the statement can be stale when it runs.
+    The verdict, its generation, findings and self-approved flag are left ALONE;
+    the window closes, the history stays.
     """
     rows = await fetchall(
         db,
@@ -3231,8 +3095,7 @@ async def close_review_verdict_window(
         (task_id, ReviewVerdict.approved.value),
     )
     if not cur.rowcount:
-        # A concurrent verdict landed between the read and the write: it owns
-        # its own window, and this decision closed nothing.
+        # A concurrent verdict landed between read and write: it owns its window.
         return None
     return generation
 
@@ -3308,17 +3171,12 @@ async def claim_ci_run_request(
 ) -> bool:
     """Занять единственную попытку запроса прогона по ``sha`` (#1197).
 
-    Возвращает True, только если попытка по этому коммиту ещё не занята.
-    Заявка ставится ОДНИМ атомарным UPDATE и ДО платного вызова наружу — как
-    у claim_arbiter_dispatch (#421), и по той же причине. Проверить снимок
-    задачи, а потом сходить в сеть — это check-then-act через await: два
-    вызывающих (тик поллера и отчёт о готовности) работают на разных
-    соединениях, оба увидели бы пустую колонку и оба заказали бы прогон.
-    Заявка вместо проверки убирает саму возможность, а не сужает окно.
-
-    Вызывающий обязан закоммитить перед внешним вызовом, иначе заявки не
-    видит никто, кроме него. Как и остальная бухгалтерия конвейера, не
-    трогает ``updated_at``.
+    Возвращает True, только если попытка по этому коммиту ещё не занята. Заявка —
+    ОДИН атомарный UPDATE ДО платного вызова наружу, как claim_arbiter_dispatch
+    (#421): проверка снимка и поход в сеть — check-then-act через await, и тик
+    поллера с отчётом о готовности на разных соединениях оба заказали бы прогон.
+    Вызывающий обязан закоммитить перед внешним вызовом. Как и прочая бухгалтерия
+    конвейера, не трогает ``updated_at``.
     """
     cur = await db.execute(
         "UPDATE tasks SET ci_run_requested_sha=? WHERE id=? AND "
@@ -3384,9 +3242,7 @@ async def clear_job_missing(
     )
 
 
-# ---------------------------------------------------------------------------
-# Cross-model review dispatches (#757)
-# ---------------------------------------------------------------------------
+# --- Cross-model review dispatches (#757) ------------------------------------
 
 
 async def create_review_dispatch(
@@ -3407,19 +3263,15 @@ async def create_review_dispatch(
 ) -> int:
     """Insert a review-dispatch row (#757, #1180, #1252, #1266).
 
-    ``only_tests`` (#1254) — the symbols this order named to the reviewer;
-    None when the call-site walk did not run for it.
+    ``only_tests`` (#1254): the symbols this order named to the reviewer; None when
+    the call-site walk did not run. ``profile_assignment`` (#1403): who chose the
+    profile, ``rule`` or the ``random`` lot over rule-assigned lite.
 
-    ``profile_assignment`` (#1403) — who chose the profile: ``rule`` or the
-    ``random`` lot over rule-assigned lite.
-
-    ``replaces_dispatch_id`` is set ONLY when this row is the second door's
-    local replacement of an earlier failed order of the SAME rung — it marks
-    the row as continuing that order's ladder step rather than spending a new
-    one (#1266, ``count_review_dispatches``). ``second_door_reason`` is the
-    observed cause the local channel was used instead of cloud — the same
-    text the task feed already gets, kept here too because the review brief
-    reads the ROW (``get_settled_review_dispatch``), not the feed.
+    ``replaces_dispatch_id`` is set ONLY for the second door's local replacement of
+    an earlier failed order of the SAME rung: it continues that ladder step rather
+    than spending a new one (#1266, ``count_review_dispatches``).
+    ``second_door_reason`` is the observed cause the local channel was used, kept
+    on the ROW because the brief reads it (``get_settled_review_dispatch``).
     """
     cur = await db.execute(
         "INSERT INTO review_dispatches "
@@ -3450,12 +3302,10 @@ async def list_active_review_dispatches(
 ) -> list[aiosqlite.Row]:
     """Заказы, по которым свипу ещё есть что доделать (#757, #1252).
 
-    ``second_door`` здесь не украшение: это ДОЛГ, а не состояние прогона.
-    Прогон уже кончился без отчёта, но обещанная сдаче вторая дверь ещё не
-    открыта, и строка обязана оставаться видимой свипу — иначе сбой между
-    закрытием облачного заказа и созданием локального уносил бы второй
-    способ добыть отчёт безвозвратно (поллер глотает исключение и идёт
-    дальше).
+    ``second_door`` — ДОЛГ, а не состояние прогона: прогон кончился без отчёта, но
+    обещанная вторая дверь не открыта, и строка обязана оставаться видимой свипу;
+    иначе сбой между закрытием облачного заказа и созданием локального уносил бы
+    второй способ добыть отчёт (поллер глотает исключение).
     """
     return list(
         await fetchall(
@@ -3491,16 +3341,12 @@ async def get_review_dispatch_for_generation(
 ) -> aiosqlite.Row | None:
     """The latest dispatch of this generation, whatever its status (#807).
 
-    Deliberately status-agnostic, unlike get_settled_review_dispatch: the
-    profile is decided when the run is launched, and the report normally
-    arrives while the dispatch is still 'active'.
-
-    One exception (#1242): a SETTLED sync-refusal stub (empty ``agent_id``,
-    no longer active or owed) is skipped. It now outlives the call as the
-    ask-again trace, and it never ran — its model and profile are what
-    would have been launched, not a fact about any reviewer, so the
-    auto-verdict's "which model reviewed" and the intake's profile must not
-    read it.
+    Status-agnostic, unlike get_settled_review_dispatch: the profile is decided at
+    launch and the report normally arrives while the dispatch is still 'active'.
+    Exception (#1242): a SETTLED sync-refusal stub (empty ``agent_id``, no longer
+    active or owed) is skipped. It never ran: its model and profile are what would
+    have been launched, not a fact about any reviewer, so neither the auto-verdict's
+    "which model reviewed" nor the intake's profile may read it.
     """
     rows = list(
         await fetchall(
@@ -3644,14 +3490,10 @@ async def record_state_decision(
     """Вердикт state-задачи и переход статуса — ОДНА условная запись (#1647).
 
     Условие целиком в SQL: задача — state, в review, живое поколение равно
-    названному, и вердикта на него ещё нет. Любое расхождение даёт 0 строк и
-    False — вызывающий откатывает транзакцию (409 без записей). Так запись
-    вердикта, переход и завершение не расходятся между собой: нет момента, где
-    вердикт записан, а статус нет.
-
-    ``new_status='completed'`` ставит ещё и метку завершения, снимает бронь и
-    прод-дефекту проставляет время восстановления — тем же правилом, что
-    ``update_task`` (#517, #916), только условным.
+    названному, вердикта на него ещё нет. Расхождение даёт 0 строк и False —
+    вызывающий откатывает транзакцию (409 без записей), так что вердикт и статус
+    не расходятся. ``new_status='completed'`` ставит метку завершения, снимает
+    бронь и проставляет прод-дефекту время восстановления (как ``update_task``, #517).
     """
     sets = [
         "review_verdict=?",
@@ -3771,23 +3613,17 @@ async def count_review_dispatches(
       continues the rung it replaces rather than opening a new one, and that
       rung already counted where it was paid for.
 
-    Two genuine cloud runs (LITE then a DEEP top-up) both have empty
-    ``replaces_dispatch_id`` and non-empty ``agent_id`` — they still count as
-    two and still hit ``REVIEW_LADDER_MAX_STEPS``.
-
     #1242 sharpens the second rule: a replacement is free only when the row
     it replaces was a PAID run. The ask-again pass replaces a sync-refusal
     stub too, and that stub never counted — so the first real run of the
     rung is the replacement itself, and skipping it would hand the ladder a
     step it never paid for.
 
-    The paid row is looked for along the WHOLE ``replaces_dispatch_id``
-    chain, not only at the direct parent (finding b9943fc18e24a30c): paid run
-    failed → ask-again hit a 429 and left a free stub → the next ask-again
-    succeeded. The success's parent is the free stub, yet the rung was paid
-    two links up — counting it made one rung two, and the ladder refused its
-    DEEP top-up claiming the ceiling was hit. ``replaces_dispatch_id`` always
-    points to an earlier row, so the walk ends.
+    The paid row is looked for along the WHOLE ``replaces_dispatch_id`` chain, not
+    only at the direct parent: paid run failed, ask-again hit a 429 and left a free
+    stub, the next ask-again succeeded. Its parent is the free stub, yet the rung
+    was paid two links up, and counting it as a second rung refused the DEEP
+    top-up. The walk ends: ``replaces_dispatch_id`` always points to an earlier row.
     """
     rows = await fetchall(
         db,
@@ -3929,14 +3765,11 @@ async def claim_deep_seat(
 ) -> bool:
     """Место под суточным потолком deep проекта — атомарно (#1414).
 
-    Счёт и бронь одной транзакцией BEGIN IMMEDIATE, как у брони заказа
-    (#1399): строка заказа пишется ПОСЛЕ оплаченного вызова провайдера, и
-    два параллельных заказа, считающие только строки, оба увидели бы
-    свободное место. Бронь живёт срок брони заказа и в счёте склеивается со
-    строкой своей сдачи; снимать её не нужно.
-
-    Сдача, уже занявшая место сегодня, получает его снова: переспрос и
-    повторный триггер той же сдачи — не новый deep.
+    Счёт и бронь одной транзакцией BEGIN IMMEDIATE, как у брони заказа (#1399):
+    строка пишется ПОСЛЕ оплаченного вызова, и два параллельных заказа, считающие
+    строки, оба увидели бы свободное место. Бронь живёт срок брони заказа, в счёте
+    склеивается со строкой своей сдачи; снимать её не нужно. Сдача, уже занявшая
+    место сегодня, получает его снова: переспрос не новый deep.
     """
     await db.commit()
     ttl = f"-{REVIEW_ORDER_CLAIM_TTL_MINUTES} minutes"
@@ -4032,15 +3865,11 @@ async def delete_review_dispatch(db: aiosqlite.Connection, dispatch_id: int) -> 
     """Remove a debt-tracking stub once it settled without a crash (#1266).
 
     The sync cloud-create-refusal path writes a placeholder row (empty
-    ``agent_id``) purely as crash insurance BEFORE the risky call that might
-    open the second door — the row is how a resumed sweep finds the debt if
-    the process dies in between. When nothing crashed, the caller already
-    knows the outcome from the direct call and no longer needs the row: an
-    unconfigured local path must stay byte-identical to before the second
-    door existed (#1252 AC-3), and a successful local order must be the ONLY
-    row a clean run leaves. Called only on the row this same call just wrote
-    and immediately settled — never on a row a crash may have left for a
-    later sweep to find.
+    ``agent_id``) as crash insurance BEFORE the call that may open the second door,
+    so a resumed sweep finds the debt. When nothing crashed the row is unneeded: an
+    unconfigured local path must stay byte-identical to before the second door
+    (#1252 AC-3), and a successful local order the ONLY row a clean run leaves.
+    Called only on the row this same call just wrote and settled.
     """
     await db.execute("DELETE FROM review_dispatches WHERE id=?", (dispatch_id,))
 
@@ -4109,18 +3938,14 @@ async def list_review_dispatches_owing_usage(
     )
 
 
-# ---------------------------------------------------------------------------
-# Task dependencies (#483, epic #478)
-# ---------------------------------------------------------------------------
+# --- Task dependencies (#483, epic #478) -------------------------------------
 
 
 class DependencyCycleError(ValueError):
     """Raised when an edge would close a cycle in the dependency graph (#483).
 
-    The message names the path that would close it. "Cycle detected" tells the
-    caller that something is wrong; naming A → B → C → A tells them which edge
-    to reconsider, and that is the difference between an error somebody acts
-    on and one they work around.
+    The message names the path that would close it: "Cycle detected" says something
+    is wrong, A → B → C → A says which edge to reconsider.
     """
 
 
@@ -4137,13 +3962,10 @@ async def add_task_dependency(
 ) -> bool:
     """Record that ``task_id`` waits for ``depends_on_task_id`` (#483).
 
-    Returns True when an edge was created, False when it already existed —
-    adding the same edge twice is not an error, it is a no-op, because the
-    caller's intent ("this must wait for that") is already satisfied.
-
-    Deliberately does NOT commit: the cycle walk and the insert belong to the
-    same transaction as the caller's other writes, so two concurrent callers
-    cannot each pass the check separately and close a cycle between them.
+    Returns True when an edge was created, False when it already existed (a no-op:
+    the caller's intent is satisfied). Deliberately does NOT commit: the cycle walk
+    and the insert share the caller's transaction, so two concurrent callers cannot
+    each pass the check and close a cycle between them.
     """
     if task_id == depends_on_task_id:
         raise SelfDependencyError(f"задача #{task_id} не может зависеть от самой себя")
@@ -4178,16 +4000,13 @@ async def list_task_dependencies(
 ) -> dict[str, list[dict[str, Any]]]:
     """Both sides of the task's edges, with the other end's status (#483).
 
-    ``blocked_by`` is what this task waits for, ``unblocks`` is what waits for
-    it. Both are needed and neither is derivable from the other cheaply: the
-    first is read when work is about to start, the second when it finishes.
-    Statuses travel along because every consumer would otherwise ask for them
-    immediately — "blocked by #818" means nothing without knowing where #818
-    stands.
+    ``blocked_by`` is what this task waits for (read when work is about to start),
+    ``unblocks`` what waits for it (read when it finishes); neither is cheaply
+    derivable from the other. Statuses travel along: "blocked by #818" means
+    nothing without knowing where #818 stands.
     """
-    # #485: delivery travels beside the status. A closed task whose PR is not
-    # merged blocks exactly as much as an open one — that is what #830 learned
-    # the expensive way, and a reader given only the status would repeat it.
+    # #485: delivery travels beside the status. A closed task whose PR is not merged
+    # blocks as much as an open one (#830); a reader given only the status repeats it.
     blocked_by = await fetchall(
         db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
@@ -4264,13 +4083,11 @@ async def undelivered_blockers(
 ) -> list[dict[str, Any]]:
     """Blockers of ``task_id`` whose CODE has not been delivered (#484).
 
-    Readiness is judged by delivery, not by status — the owner's decision of
-    21.08.2026, taken after five cases in which the blocker was undelivered
-    code rather than an unfinished task. #830 stopped after pair-start
-    because the module it needed sat in an unmerged PR while its task was in
-    review; and even ``completed`` would not have saved it, since the window
-    between a done report and the gate's merge is real and a PR can still go
-    back for rework.
+    Readiness is judged by delivery, not by status (the owner's decision): the
+    blocker was often undelivered code, not an unfinished task. #830 stopped after
+    pair-start because its module sat in an unmerged PR while its task was in
+    review; even ``completed`` would not save it (a PR can still go back for
+    rework). Each entry names WHY: "PR not declared" differs from "PR not merged".
 
     Delivery is read from ``pipeline_merges`` (#534) — merges the hub
     performed itself, keyed by task and carrying the merge SHA. A merge made
@@ -4278,10 +4095,6 @@ async def undelivered_blockers(
     for the hub's own project that is a property (manual merges into the base
     branch are forbidden and the drift guard catches them), and the gate this
     feeds is advisory anyway.
-
-    Each entry names WHY it is not delivered — "PR not declared" and "PR not
-    merged" are different situations, and collapsing them would leave the
-    reader unable to act on either.
     """
     rows = await fetchall(
         db,
@@ -4340,9 +4153,7 @@ async def _dependency_path(
     return None
 
 
-# ---------------------------------------------------------------------------
-# Autopilot digests (#739)
-# ---------------------------------------------------------------------------
+# --- Autopilot digests (#739) ------------------------------------------------
 
 
 async def create_digest(
@@ -4416,16 +4227,13 @@ async def claim_arbiter_dispatch(
 ) -> bool:
     """Conditionally claim an arbiter dispatch for a submission generation (#421).
 
-    Returns ``True`` only if no active marker already exists for this
-    generation — the claim is a single atomic UPDATE that sets state
-    ``dispatching`` and the dispatch clock BEFORE any external submit, so a
-    repeat poll or a restart finds the marker and does not dispatch again.
-    A newer submission generation does not match the old marker, so it opens a
-    fresh window. The caller must commit before the external side effect.
+    Returns ``True`` only if no active marker exists for this generation: ONE atomic
+    UPDATE sets state ``dispatching`` and the dispatch clock BEFORE any external
+    submit, so a repeat poll or restart does not dispatch again. A newer generation
+    does not match the old marker. The caller must commit before the side effect.
     """
-    # Positive form so SQL three-valued logic on NULL columns still matches on
-    # the first claim: succeed when there is no ACTIVE marker for this exact
-    # generation (different generation, or a non-active/NULL state).
+    # Positive form so SQL three-valued logic on NULL columns still matches on the
+    # first claim: no ACTIVE marker for this exact generation.
     cur = await db.execute(
         "UPDATE tasks SET arbiter_state='dispatching', arbiter_generation=?, "
         "arbiter_job_id=NULL, arbiter_dispatch_at=datetime('now') "
@@ -4771,9 +4579,7 @@ async def append_task_risk(
     return (cur.rowcount or 0) > 0
 
 
-# ---------------------------------------------------------------------------
-# Acceptance criteria — CRUD
-# ---------------------------------------------------------------------------
+# --- Acceptance criteria — CRUD ----------------------------------------------
 
 
 async def list_acceptance_criteria(
@@ -5004,9 +4810,7 @@ async def delete_task_subtree(db: aiosqlite.Connection, root_id: int) -> int:
     return len(ids)
 
 
-# ---------------------------------------------------------------------------
-# Task Updates — Read
-# ---------------------------------------------------------------------------
+# --- Task Updates — Read -----------------------------------------------------
 
 
 # #948: сдача на ревью не пишет собственного события, и её единственный след —
@@ -5247,9 +5051,7 @@ async def has_stale_alert(
     return bool(rows)
 
 
-# ---------------------------------------------------------------------------
-# Task Updates — Write
-# ---------------------------------------------------------------------------
+# --- Task Updates — Write ----------------------------------------------------
 
 
 async def add_task_update(
@@ -5310,9 +5112,7 @@ async def list_activity(
     )
 
 
-# ---------------------------------------------------------------------------
-# Task create idempotency
-# ---------------------------------------------------------------------------
+# --- Task create idempotency -------------------------------------------------
 
 
 async def get_task_idempotency_key(
@@ -5344,9 +5144,7 @@ async def insert_task_idempotency_key(
     )
 
 
-# ---------------------------------------------------------------------------
-# Agent session registry (#771)
-# ---------------------------------------------------------------------------
+# --- Agent session registry (#771) -------------------------------------------
 
 
 async def upsert_agent_session(
@@ -5504,14 +5302,10 @@ async def tasks_with_retired_worktrees(
 ) -> list[aiosqlite.Row]:
     """Finished tasks whose pair worktree has outlived ``keep_days`` (#1033).
 
-    Age comes from ``completed_at`` and from nothing else: the directory's
-    mtime moves whenever anything reads the tree, so a forgotten worktree
-    somebody grepped last night would look brand new.
-
-    Only terminal statuses are listed, and a task still in review or running
-    can never appear here whatever its age — the caller must not be the place
-    where that rule is remembered. Oldest first, so a backlog drains in a
-    predictable order rather than by whatever the database returns.
+    Age comes from ``completed_at`` only: the directory's mtime moves whenever
+    anything reads the tree. Only terminal statuses are listed; a task in review or
+    running never appears whatever its age, and the caller is not where that rule
+    is remembered. Oldest first, so a backlog drains predictably.
     """
     return list(
         await fetchall(
@@ -5535,9 +5329,7 @@ async def prune_agent_sessions(db: aiosqlite.Connection, *, keep_days: int = 14)
     return cur.rowcount or 0
 
 
-# ---------------------------------------------------------------------------
-# Agent messages (#773)
-# ---------------------------------------------------------------------------
+# --- Agent messages (#773) ---------------------------------------------------
 
 
 async def insert_agent_message(
@@ -5858,9 +5650,7 @@ async def list_recent_threads(
     )
 
 
-# ---------------------------------------------------------------------------
-# MCP usage telemetry (#780)
-# ---------------------------------------------------------------------------
+# --- MCP usage telemetry (#780) ----------------------------------------------
 
 # The full write surface of the telemetry table. Both the INSERT below and the
 # redaction test read this tuple, so a column added to the schema without a
@@ -6044,9 +5834,7 @@ async def prune_mcp_call_events(
     return cur.rowcount or 0
 
 
-# ---------------------------------------------------------------------------
-# Live-check evidence (#813)
-# ---------------------------------------------------------------------------
+# --- Live-check evidence (#813) ----------------------------------------------
 
 
 async def insert_live_check(
@@ -6148,22 +5936,18 @@ async def completed_tasks_awaiting_delivery(
 ) -> list[Any]:
     """Completed tasks whose pinned PR the hub has no merge for — candidates only.
 
-    Cheap by construction, the way #885 made ``merged_into_base`` cheap: a task
-    the gate merged is delivered by definition and never reaches here, and a
-    task already answered ``delivered`` or ``pr_closed`` is never asked twice —
-    both are terminal (code in the base branch stays there, and a closed PR is
-    a decision, not a transient). What is left is the small set that can still
-    be a discrepancy, so a sweep normally costs zero network calls.
+    Cheap by construction (#885): a task the gate merged is delivered by
+    definition, and ``delivered`` or ``pr_closed`` answers are terminal (code in the
+    base branch stays, a closed PR is a decision), so they are never asked twice
+    and a sweep normally costs zero network calls.
 
     ``pr_number IS NOT NULL`` is a deliberate boundary: a completed task with
     no PR at all is work that never started delivery, which is #498's warning,
     not this list. Mixing them would make "the discrepancy list" mean two
     different things and stop being trustworthy as either.
 
-    THE LOOKBACK BOUNDS THE FIRST QUESTION, NOT EVERY LATER ONE (#1204, machine
-    review of submission #6). It used to bound both, and while every reader of
-    this table was advisory that was only a stale dashboard cell. Since #1204
-    a live ``pr_open`` row feeds an IRREVERSIBLE gate, and there the same
+    THE LOOKBACK BOUNDS THE FIRST QUESTION, NOT EVERY LATER ONE (#1204). A live
+    ``pr_open`` row feeds an IRREVERSIBLE gate, and for it
     staleness is a different animal: past day thirty the sweep stopped asking,
     so the row froze at whatever the provider last said. Deliver that base by
     hand — merge the PR, delete the branch — and nothing ever corrects the row.
@@ -6175,24 +5959,11 @@ async def completed_tasks_awaiting_delivery(
 
     So a row that already says ``pr_open`` keeps being re-asked whatever its
     age, and it is asked FIRST — ``ORDER BY`` puts it ahead of the window.
-    The cost is bounded by how many such rows exist, which is the set
-    ``hub_undelivered_completed`` prints, and is paid by the sweep rather than
-    in the delivery path.
 
-    AHEAD OF THE WINDOW IS NOT YET "CANNOT STARVE" (#1204, machine review of
-    submission #7). Submission #6 claimed this ``ORDER BY`` put the ``LIMIT``
-    beyond starving these rows. That was false whenever live ``pr_open`` rows
-    outnumber the limit (default 100; the sweep passes none of its own), and
-    false in the worst possible direction: ordering them ``completed_at DESC``
-    is a FIXED priority, so the rows past the cut are always the SAME rows —
-    the oldest. Those are exactly the fossils most likely to have been merged
-    and had their branch deleted by hand, which is the dead ref
-    ``_stranded_with_a_dead_ref`` bricks the whole project on. A fixed order
-    does not delay such a row, it excludes it permanently — the same "a frozen
-    row locks the project" class this function was changed to close, with a
-    counter for a threshold instead of thirty days.
-
-    Live ``pr_open`` rows are therefore ordered by ``checked_at`` ASC: the
+    "Ahead of the window" must not starve either (#1204): a FIXED order
+    (``completed_at DESC``) cuts the SAME oldest rows past the ``LIMIT`` when live
+    ``pr_open`` rows outnumber it (default 100), and those are the likeliest
+    fossils. Live ``pr_open`` rows are therefore ordered by ``checked_at`` ASC: the
     least recently asked goes first, and asking it writes ``checked_at`` and
     moves it to the back. That is rotation rather than priority — with R live
     rows and limit L every one of them is reached within ``ceil(R / L)``
@@ -6202,26 +5973,12 @@ async def completed_tasks_awaiting_delivery(
     with no ceiling of its own: the gate stands on rows only this sweep
     refreshes, so a row it can never reach is a row the gate believes forever.
 
-    ``checked_at`` alone would not be enough, and the reason is a property of
-    the column rather than of the design: it is written ``datetime('now')``,
-    which is whole seconds. Rows refreshed inside the same second tie, and a
-    tie falls to the next key — under the old ``completed_at DESC`` that handed
-    the cut straight back to the oldest rows. So live rows break their tie
-    ``completed_at`` ASC: oldest first, the same direction the rotation runs,
-    never against it. The window's own rows keep their ``DESC`` ordering — the
-    tiebreak is scoped to live rows by the ``CASE``, because for a row nobody
-    has ever asked about there is no rotation to preserve.
+    ``checked_at`` is whole seconds, so rows refreshed in the same second tie; live
+    rows break the tie by ``completed_at`` ASC, the direction the rotation runs. The
+    window's own rows keep ``DESC``: the ``CASE`` scopes the tiebreak to live rows.
 
-    ``unknown`` is deliberately NOT given the same reprieve. It is not a
-    candidate of that gate (see ``list_undelivered_completed_branch_tasks``),
-    so its staleness costs nothing, while re-asking every ancient unanswerable
-    row forever would spend a network call per sweep on exactly the rows the
-    provider has already refused to answer.
-
-    THE BLIND SPOT THAT REMAINS, named because half of it used to be named and
-    the dangerous half was not: absence of a row still means "never asked", not
-    "delivered" — a task completed before the window and never scanned has no
-    row to revive here.
+    ``unknown`` gets no such reprieve (not a candidate of that gate; re-asking costs
+    a call per sweep). Blind spot: no row means "never asked", not "delivered".
     """
     return list(
         await fetchall(
@@ -6283,14 +6040,11 @@ async def record_delivery_discrepancy(
 ) -> None:
     """Store the latest answer about one task's delivery.
 
-    ``first_seen_at`` survives updates on purpose — it is the age of the
-    discrepancy, and re-checking a row every quarter of an hour must not keep
-    resetting the clock that tells the owner how long this has been true.
-
-    ``disposition``/``accepted_via``/``alerted_state`` are ``None`` for "leave
-    what is there": the sweep refreshes the facts without erasing what the
-    owner declared at acceptance, and the acceptance path records a
-    declaration without pretending to have re-run the alert.
+    ``first_seen_at`` survives updates on purpose: it is the age of the
+    discrepancy, and re-checking every quarter of an hour must not reset it.
+    ``disposition``/``accepted_via``/``alerted_state`` are ``None`` for "leave what
+    is there": the sweep refreshes facts without erasing what the owner declared at
+    acceptance, and acceptance records a declaration without re-running the alert.
     """
     await db.execute(
         """
@@ -6345,7 +6099,6 @@ async def acknowledge_delivery_discrepancy(
     Возвращает False, если строки нет или причина пуста. Пустую причину
     отвергает СХЕМА вызова, а не совесть вызывающего: признание без причины —
     это выключатель, а он превращает механизм в способ глушить неудобное.
-    Ровно тот риск назван в постановке, и держать его комментарием мало.
 
     Запись не удаляется и состояние не подменяется: реестр по-прежнему
     показывает расхождение, к нему лишь приписано, кто и почему считает его
@@ -6357,11 +6110,9 @@ async def acknowledge_delivery_discrepancy(
     им следующий, никем не одобренный факт («доставку подтвердить не удалось»)
     нельзя.
 
-    ЧЕГО ЭТО НЕ ДАЁТ, чтобы обещание не было шире кода: между отрисовкой
-    страницы и нажатием кнопки успевает пройти свип, и записан будет тот факт,
-    который в строке СЕЙЧАС, а не тот, что человек видел. Отдельной защиты нет
-    намеренно: промах самолечится — расхождение вернётся на доску уже как
-    непризнанное, с формой, и признать его можно заново.
+    ЧЕГО ЭТО НЕ ДАЁТ: между отрисовкой страницы и нажатием успевает пройти свип, и
+    запишется факт строки СЕЙЧАС, не виденный человеком. Отдельной защиты нет
+    намеренно: промах самолечится, расхождение вернётся непризнанным.
     """
     if not (reason or "").strip():
         return False
@@ -6409,42 +6160,26 @@ async def record_delivery_observation(
 
     ЧЕГО ЭТА ФУНКЦИЯ НЕ ДЕЛАЕТ, и каждое «не» — требование постановки:
 
-    * не трогает ``state``, ``reason`` и ``delivery_path``. Прежнее unknown и
-      причина, по которой оно возникло, остаются читаемыми навсегда: строка
-      не закрывается, а ДОПИСЫВАЕТСЯ. Свип, если он ещё берёт эту задачу в
-      кандидаты, продолжит обновлять факты поверх — и это правильно, потому
-      что наблюдение не отменяет вопроса, а отвечает на него от своего имени;
-    * не трогает задачу: ни статус, ни ``archived``. Реестр — зеркало, а не
-      гейт, и архивация не является и не становится способом убрать строку:
-      она унесла бы вместе со строкой outcome-долг, который читается тем же
-      фильтром ``archived = 0``;
-    * не проверяет доказательство на правдивость. Обязательность полей — это
-      всё, что схема может, и она честно ловит только форму штампа. Оценивает
-      запись читатель, которому она приписана поимённо.
+    * не трогает ``state``, ``reason`` и ``delivery_path``: прежнее unknown и его
+      причина остаются читаемыми, строка не закрывается, а ДОПИСЫВАЕТСЯ; свип,
+      если ещё берёт задачу в кандидаты, обновляет факты поверх, наблюдение не отменяет вопроса;
+    * не трогает задачу (статус, ``archived``): реестр — зеркало, а не гейт, а
+      архивация унесла бы вместе со строкой outcome-долг (фильтр ``archived = 0``);
+    * не проверяет доказательство на правдивость: схема ловит только форму штампа,
+      оценивает запись читатель, которому она приписана поимённо.
 
-    ``observed_state`` пишется ИЗ ``expect_state`` — из того факта, который
-    вызывающий читал и о котором наблюдение сделано, — и тем же значением
-    сторожится строка: ``WHERE ... AND state = ?``. Не ``observed_state =
-    state``, и разница здесь не косметическая (находка 493a0ee9). SELECT
-    транзакции не открывает, а #1065 даёт запросу и опросчику РАЗНЫЕ
-    соединения: между чтением состояния и этой записью свип успевает
-    зафиксировать ``pr_open``. Без предиката запись села бы поверх нового
-    факта, ``observed_state`` совпал бы с ним — и строка, источник которой
-    ОТВЕЧАЕТ, молча вычлась бы из списка как «закрытая наблюдением», хотя
-    pr_open не наблюдал никто. Предикат превращает это в честный промах:
-    ``None`` вместо тихой лжи, и вызывающий говорит словами, что случилось.
+    ``observed_state`` пишется ИЗ ``expect_state`` — факта, который вызывающий
+    читал, — и тем же значением сторожится строка: ``WHERE ... AND state = ?``,
+    не ``observed_state = state``. SELECT транзакции не открывает, а #1065 даёт
+    запросу и опросчику РАЗНЫЕ соединения: между чтением и записью свип успевает
+    зафиксировать ``pr_open``, и строка, источник которой ОТВЕЧАЕТ, молча вычлась
+    бы как «закрытая наблюдением». Предикат делает это честным промахом: ``None``.
 
-    ``AND observed_at = ''`` сторожит второй, независимый промах (находка
-    ревью Codex, коммит 86150e7): наблюдение никогда не меняет ``state``, а
-    значит строка остаётся ``unknown`` и ПОСЛЕ того, как её уже закрыли.
-    (Столбец объявлен ``NOT NULL DEFAULT ''`` — как и засыпка в миграции
-    ``backfill_delivery_observed_from_live_checks`` проверяет, пусто ли поле,
-    сравнением со строкой, а не ``IS NULL``.) Без этого предиката retry после
-    потерянного ответа — или второй наблюдатель той же строки — проходил бы
-    тот же WHERE заново и молча переписывал бы чужие
-    ``observed_by``/``observed_evidence``/``observed_sha`` поверх первой, уже
-    приписанной записи. Акт закрытия происходит один раз; второй заход — не
-    обновление, а отдельное событие, которого предикат не пускает.
+    ``AND observed_at = ''`` сторожит второй промах: наблюдение не меняет
+    ``state``, строка остаётся ``unknown`` и ПОСЛЕ закрытия. (Столбец объявлен
+    ``NOT NULL DEFAULT ''``, пустоту проверяют сравнением со строкой, а не
+    ``IS NULL``.) Без предиката retry или второй наблюдатель переписали бы чужие
+    ``observed_by``/``observed_evidence``/``observed_sha``: акт закрытия один раз.
 
     Возврат ``None`` значит РОВНО «запись не легла»: строки нет, факт под ней
     успел смениться, или строка уже закрыта чьим-то наблюдением. Различает
@@ -6478,18 +6213,12 @@ async def record_delivery_observation(
     )
     if (cur.rowcount or 0) == 0:
         return None
-    # Намеренно БЕЗ коммита здесь (находка ревью #1215, задача Codex): эта
-    # запись — только первая часть акта закрытия строки. Вызывающий
-    # (``services.delivery_state.record_delivery_observation``) дописывает
-    # тем же соединением журнал и событие и коммитит ОДИН раз для всех трёх.
-    # Прежде запись коммитилась сама: падение insert_event ПОСЛЕ этой строки
-    # оставляло ``observed_at``/``observed_state`` уже зафиксированными —
-    # список расхождений уже не видел строку как «неотвеченную», хотя вызов
-    # вернул ошибку и ни истории, ни события не осталось. Повтор того же
-    # запроса при этом переписывал бы наблюдение заново, не будучи
-    # идемпотентным. Один коммит на весь акт устраняет оба исхода: либо
-    # строка закрыта, история дописана и событие есть, либо не произошло
-    # ничего.
+    # Намеренно БЕЗ коммита: запись — первая часть акта закрытия. Вызывающий
+    # (``services.delivery_state.record_delivery_observation``) дописывает тем же
+    # соединением журнал и событие и коммитит ОДИН раз для всех трёх. Иначе падение
+    # insert_event после этой строки оставило бы ``observed_at``/``observed_state``
+    # зафиксированными без истории и события, а повтор переписал бы наблюдение
+    # (#1215): либо закрыто всё, либо ничего.
     return prior
 
 
@@ -6527,14 +6256,8 @@ async def list_delivery_discrepancies(
     уроком, что и у «признано» выше. ``closed_by_observation=False`` (умолчание)
     ВЫЧИТАЕТ такие строки, ``True`` возвращает только их. Оба режима считают
     закрытие одним и тем же выражением, поэтому список, доска и счёт не могут
-    разъехаться в том, что считать расхождением. Вычитание по умолчанию — то,
-    ради чего задача заведена: список ценен, только пока пустой список значит
-    «расхождений нет», а строка, у которой закрыты все три источника, иначе не
-    может уйти из него никогда.
-
-    Закрытие привязано к ФАКТУ: ``observed_state = d.state``. Наблюдали
-    unknown — закрыт unknown; заговорит провайдер и скажет pr_open, и строка
-    вернётся в список, потому что ЭТОГО никто не наблюдал.
+    разъехаться в том, что считать расхождением. Закрытие привязано к ФАКТУ:
+    ``observed_state = d.state``; провайдер скажет pr_open — строка вернётся в список.
     """
     if not states:
         return []
