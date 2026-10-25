@@ -111,20 +111,29 @@ async def test_a_raced_submit_refuses_conflicting_outcomes_but_not_identical(
         return [{"id": 7}]
 
     async def rows(_db, _rid):
-        return [{"finding_uid": "f1", "outcome": "fixed"}]
+        return [
+            {
+                "finding_uid": "f1",
+                "outcome": "deferred",
+                "note": "later",
+                "linked_task_id": None,
+            }
+        ]
 
     monkeypatch.setattr(finding_outcome, "reports_owed_an_answer", reports)
     monkeypatch.setattr(repo, "list_finding_outcomes", rows)
 
-    def item(outcome):
+    def item(outcome="deferred", note="later", linked=None):
         return models.FindingOutcomeItem(
-            finding_uid="f1", outcome=outcome, note="n", linked_task_id=None
+            finding_uid="f1", outcome=outcome, note=note, linked_task_id=linked
         )
 
-    await finding_outcome.refuse_conflicting(db, 1, 2, [item("fixed")])
-    with pytest.raises(HTTPException) as err:
-        await finding_outcome.refuse_conflicting(db, 1, 2, [item("deferred")])
-    assert err.value.status_code == 409
+    await finding_outcome.refuse_conflicting(db, 1, 2, [item()])  # тот же кортеж
+    await finding_outcome.refuse_conflicting(db, 1, 2, [item(note=" later ")])
+    for other in (item("wont_fix"), item(linked=9), item(note="otherwise")):
+        with pytest.raises(HTTPException) as err:
+            await finding_outcome.refuse_conflicting(db, 1, 2, [other])
+        assert err.value.status_code == 409
 
 
 async def test_a_stale_snapshot_is_caught_inside_the_write_transaction(db, monkeypatch):

@@ -208,16 +208,29 @@ async def refuse_conflicting(
     follow-up (deferred) никто бы не завёл. Обычный повтор того же sha вне
     гонки ведёт себя как прежде.
     """
-    stored: dict[str, str] = {}
+
+    def answer(outcome: Any, note: Any, linked: Any) -> tuple[str, str, int | None]:
+        return (
+            str(getattr(outcome, "value", outcome)),
+            str(note or "").strip(),
+            int(linked) if linked else None,
+        )
+
+    stored: dict[str, tuple[str, str, int | None]] = {}
     for report in await reports_owed_an_answer(db, task_id, generation):
         for row in await repo.list_finding_outcomes(db, int(dict(report)["id"])):
-            stored[str(dict(row)["finding_uid"])] = str(dict(row)["outcome"])
+            found = dict(row)
+            stored[str(found["finding_uid"])] = answer(
+                found["outcome"], found.get("note"), found.get("linked_task_id")
+            )
     clashes = [
         f"{item.finding_uid}: записано {stored[item.finding_uid]}, прислано "
-        f"{getattr(item.outcome, 'value', item.outcome)}"
+        f"{answer(item.outcome, item.note, item.linked_task_id)} "
+        "(исход, заметка, связанная задача)"
         for item in items
         if item.finding_uid in stored
-        and stored[item.finding_uid] != getattr(item.outcome, "value", item.outcome)
+        and stored[item.finding_uid]
+        != answer(item.outcome, item.note, item.linked_task_id)
     ]
     if clashes:
         raise HTTPException(
