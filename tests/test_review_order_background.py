@@ -145,12 +145,12 @@ async def test_a_failed_order_backs_off_then_is_named_once_and_rearmed(db, monke
         await _due(db, task.id)
         await review_order.sweep_review_orders(db)
         assert len(attempts) == expected
-    assert (await _intent(db, task.id))["state"] == "lost"
+    assert (await _intent(db, task.id))["state"] == "failed"
     assert len(await _alerts(db, task.id)) == 1
 
     await _due(db, task.id)
     await review_order.sweep_review_orders(db)
-    assert len(attempts) == review_order.MAX_ATTEMPTS, "lost не переспрашивается"
+    assert len(attempts) == review_order.MAX_ATTEMPTS, "failed не переспрашивается"
 
     # Повтор того же sha из review возвращает заказ в работу.
     await lifecycle.submit_for_review(db, task.id, body)
@@ -336,39 +336,29 @@ async def test_a_fresh_claim_blocks_and_a_stale_one_is_retaken(db, monkeypatch):
     assert calls == [task.id]
 
 
-# --- платный POST не повторяется вслепую (#2057) ---------------------------
-
-
-def _provider(monkeypatch, recorder, *, asked: bool = True):
-    """Список агентов провайдера: то, что создали вызовы recorder по имени."""
-    from hub.integrations import cursor_cloud
-
-    lookups: list[str] = []
-
-    async def find(name, pages=3):
-        lookups.append(name)
-        if not asked:
-            return cursor_cloud.Reconciliation("", "", False)
-        for call in recorder.calls:
-            if call["name"] == name:
-                return cursor_cloud.Reconciliation("bc-1", "run-1", True)
-        return cursor_cloud.Reconciliation("", "", True)
-
-    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", find)
-    return lookups
+# --- не больше одного автоматического платного POST (#2057) -----------------
 
 
 async def _lost_kick_submit(client, db, monkeypatch, slug):
     recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
     _wire(monkeypatch, recorder)
     await _pinned_setup(db, monkeypatch)
+    from hub.integrations import cursor_cloud
+
+    lookups: list[str] = []
+
+    async def find(name, pages=3):
+        lookups.append(name)
+        return cursor_cloud.Reconciliation("", "", True)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", find)
 
     async def dead(*_a, **_k):
         return None
 
     monkeypatch.setattr(review_order, "kick", dead)
     task_id = await _submitted(client, db, slug, policy={"review": "dispatch"})
-    return recorder, task_id
+    return recorder, task_id, lookups
 
 
 async def _expire_order_claim(db, task_id):
@@ -376,126 +366,153 @@ async def _expire_order_claim(db, task_id):
     await db.commit()
 
 
-async def test_a_failed_dispatch_insert_never_buys_a_second_agent(
+async def _unknown_alerts(db, task_id):
+    return [a for a in await _alerts(db, task_id) if "исход неизвестен" in a]
+
+
+async def test_a_failed_dispatch_insert_is_unknown_and_never_reordered(
     client, db, monkeypatch
 ):
-    recorder, task_id = await _lost_kick_submit(client, db, monkeypatch, "dup-insert")
-    lookups = _provider(monkeypatch, recorder)
+    recorder, task_id, lookups = await _lost_kick_submit(
+        client, db, monkeypatch, "dup-insert"
+    )
     real = repo.create_review_dispatch
-    boom = {"left": 1}
 
-    async def flaky(*a, **k):
-        if boom["left"]:
-            boom["left"] -= 1
-            raise RuntimeError("insert failed")
-        return await real(*a, **k)
+    async def broken(*a, **k):
+        raise RuntimeError("insert failed")
 
-    monkeypatch.setattr(repo, "create_review_dispatch", flaky)
+    monkeypatch.setattr(repo, "create_review_dispatch", broken)
     await review_dispatch.sweep_review_dispatches(db)
-    assert len(recorder.calls) == 1 and lookups == [], "первый заказ без сверки"
-    assert (await _intent(db, task_id))["ordering_marker"] == recorder.calls[0]["name"]
+    row = await _intent(db, task_id)
+    assert (row["state"], row["ordering_marker"]) == (
+        "unknown",
+        recorder.calls[0]["name"],
+    )
+    assert len(await _unknown_alerts(db, task_id)) == 1
 
+    monkeypatch.setattr(repo, "create_review_dispatch", real)
     await _expire_order_claim(db, task_id)
     await _due(db, task_id)
     await review_dispatch.sweep_review_dispatches(db)
-    assert len(recorder.calls) == 1, "повтор подобрал агента, а не купил второго"
-    assert lookups == [recorder.calls[0]["name"]]
-    assert (await _any_dispatch_row(db, task_id))["agent_id"] == "bc-1"
+    await review_dispatch.sweep_review_dispatches(db)
+    assert len(recorder.calls) == 1, "второго автоматического POST нет"
+    assert len(await _unknown_alerts(db, task_id)) == 1, "алерт один"
+
+    # Осознанная пересдача того же sha - явный запрос нового заказа.
+    await lifecycle.submit_for_review(db, task_id, models.TaskSubmitReview())
+    assert (await _intent(db, task_id))["state"] == "pending"
+    await review_dispatch.sweep_review_dispatches(db)
+    assert len(recorder.calls) == 2
+
+
+async def test_a_post_that_raises_after_sending_is_unknown_not_retried(
+    client, db, monkeypatch
+):
+    recorder, task_id, lookups = await _lost_kick_submit(
+        client, db, monkeypatch, "raise"
+    )
+    from hub.integrations import cursor_cloud
+
+    async def raising(**kwargs):
+        recorder.calls.append(kwargs)
+        raise RuntimeError("socket died after send")
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", raising)
+    await review_dispatch.sweep_review_dispatches(db)
+    await _expire_order_claim(db, task_id)
+    await _due(db, task_id)
+    await review_dispatch.sweep_review_dispatches(db)
+    assert len(recorder.calls) == 1
+    assert (await _intent(db, task_id))["state"] == "unknown"
+    assert len(await _unknown_alerts(db, task_id)) == 1
+
+
+async def test_generation_drift_aborts_without_a_post(client, db, monkeypatch):
+    """Намерение поколения 1, а диспетчер прочитал поколение 2: POST нет."""
+    recorder, task_id, _ = await _lost_kick_submit(client, db, monkeypatch, "drift")
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2 WHERE id=?", (task_id,)
+    )
+    await db.commit()
+
+    async def not_settled(*_a, **_k):
+        return False  # устаревание поймано бы раньше; нужен именно шов
+
+    monkeypatch.setattr(review_order, "_settled", not_settled)
+    await review_order.process_intent(db, task_id, 1)
+    assert recorder.calls == [], "метка поколения 2 не ложится на намерение 1"
+    row = await _intent(db, task_id)
+    assert (row["state"], row["ordering_marker"]) == ("done", "")
+
+
+async def test_a_call_that_crossed_the_seam_without_a_row_is_unknown(
+    client, db, monkeypatch
+):
+    recorder, task_id, _ = await _lost_kick_submit(client, db, monkeypatch, "norow")
+
+    async def crossed_then_quiet(conn, tid, **_kw):
+        await review_order.begin_ordering(conn, tid, f"haiplane:review:t{tid}:g1:a1")
+        return False  # POST мог уйти, строки заказа нет
+
+    monkeypatch.setattr(review_dispatch, "maybe_dispatch_review", crossed_then_quiet)
+    await review_order.sweep_review_orders(db)
+    assert (await _intent(db, task_id))["state"] == "unknown"
+    assert len(await _unknown_alerts(db, task_id)) == 1
+
+
+async def test_lost_ownership_never_posts(client, db, monkeypatch):
+    recorder, task_id, _ = await _lost_kick_submit(client, db, monkeypatch, "owner")
+    real = review_order.begin_ordering
+
+    async def stolen(conn, tid, marker):
+        await conn.execute(
+            "UPDATE review_order_intents SET claimed_by='thief' WHERE task_id=?",
+            (tid,),
+        )
+        await conn.commit()
+        await real(conn, tid, marker)
+
+    monkeypatch.setattr(review_order, "begin_ordering", stolen)
+    await review_order.sweep_review_orders(db)
+    assert recorder.calls == []
+    assert (await _intent(db, task_id))["state"] == "pending"
+
+
+async def test_restart_with_pending_orders_once_and_with_ordering_is_unknown(
+    client, db, monkeypatch
+):
+    recorder, task_id, lookups = await _lost_kick_submit(
+        client, db, monkeypatch, "restart"
+    )
+    # перезапуск при pending: ровно один заказ (путь поллера)
+    await review_dispatch.sweep_review_dispatches(db)
+    await review_dispatch.sweep_review_dispatches(db)
+    assert len(recorder.calls) == 1
     assert (await _intent(db, task_id))["state"] == "done"
 
 
-async def test_a_blocked_first_call_is_not_taken_over_by_a_stale_claim(
+async def test_restart_with_ordering_is_unknown_with_no_post_and_no_lookup(
     client, db, monkeypatch
 ):
-    recorder, task_id = await _lost_kick_submit(client, db, monkeypatch, "blocked")
-    _provider(monkeypatch, recorder)
-    from hub.integrations import cursor_cloud
-
-    async def not_listed_yet(name, pages=3):  # POST ещё не вернулся: списка нет
-        return cursor_cloud.Reconciliation("", "", True)
-
-    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", not_listed_yet)
-    release = asyncio.Event()
-
-    async def blocked(**kwargs):
-        recorder.calls.append(kwargs)
-        await release.wait()
-        return recorder.result, None
-
-    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", blocked)
-    first = asyncio.ensure_future(review_order.sweep_review_orders(db))
-    for _ in range(50):
-        await asyncio.sleep(0.01)
-        if recorder.calls:
-            break
-    assert len(recorder.calls) == 1
-
-    # Бронь «протухла» по часам и бронь заказа тоже: чужой процесс не доказан.
-    await db.execute(
-        "UPDATE review_order_intents SET claimed_at=datetime('now', '-30 minutes')"
+    recorder, task_id, lookups = await _lost_kick_submit(
+        client, db, monkeypatch, "restart-ord"
     )
-    await _expire_order_claim(db, task_id)
-    await review_order.sweep_review_orders(db)
-    assert len(recorder.calls) == 1, "второй POST при живом первом не уходит"
-    release.set()
-    await first
-    assert (await _any_dispatch_row(db, task_id))["agent_id"] == "bc-1"
-    assert len(recorder.calls) == 1
-
-
-async def test_a_restart_during_ordering_adopts_instead_of_creating(
-    client, db, monkeypatch
-):
-    recorder, task_id = await _lost_kick_submit(client, db, monkeypatch, "restart-ord")
-    lookups = _provider(monkeypatch, recorder)
-    from hub.integrations import cursor_cloud
-
-    marker = cursor_cloud.agent_marker("review", task_id, 1, 1)
-    # агент у провайдера есть: прежний процесс успел купить и умер
-    recorder.calls.append({"name": marker})
     await db.execute(
-        "UPDATE review_order_intents SET ordering_marker=?, claimed_by='dead-boot', "
-        "claimed_at=datetime('now', '-10 minutes')",
-        (marker,),
+        "UPDATE review_order_intents SET state='ordering', claimed_by='dead', "
+        "ordering_marker='m', ordering_at=datetime('now', '-20 minutes')"
     )
     await db.commit()
     await review_dispatch.sweep_review_dispatches(db)
-    assert len(recorder.calls) == 1, "новый агент не создан"
-    assert lookups == [marker]
-    assert (await _any_dispatch_row(db, task_id))["agent_id"] == "bc-1"
-
-
-async def test_a_dead_process_claim_is_not_taken_before_the_grace(
-    client, db, monkeypatch
-):
-    recorder, task_id = await _lost_kick_submit(client, db, monkeypatch, "grace")
-    _provider(monkeypatch, recorder)
-    await db.execute(
-        "UPDATE review_order_intents SET claimed_by='dead-boot', "
-        "claimed_at=datetime('now', '-30 seconds')"
-    )
-    await db.commit()
     await review_dispatch.sweep_review_dispatches(db)
-    assert recorder.calls == []
+    assert recorder.calls == [], "ordering автоматически не заказывается"
+    assert lookups == [], "сверки провайдера нет"
+    assert (await _intent(db, task_id))["state"] == "unknown"
+    assert len(await _unknown_alerts(db, task_id)) == 1
 
 
-async def test_an_unavailable_lookup_blocks_the_create_and_counts_an_attempt(
-    client, db, monkeypatch
+async def test_a_resubmit_rearms_closed_intents_but_not_an_order_in_flight(
+    db, monkeypatch
 ):
-    recorder, task_id = await _lost_kick_submit(client, db, monkeypatch, "blind")
-    _provider(monkeypatch, recorder, asked=False)
-    from hub.integrations import cursor_cloud
-
-    marker = cursor_cloud.agent_marker("review", task_id, 1, 1)
-    await db.execute("UPDATE review_order_intents SET ordering_marker=?", (marker,))
-    await db.commit()
-    await review_dispatch.sweep_review_dispatches(db)
-    assert recorder.calls == [], "спросить не удалось - не создаём"
-    row = await _intent(db, task_id)
-    assert (row["state"], row["attempts"]) == ("pending", 1)
-
-
-async def test_a_same_sha_resubmit_rearms_inside_its_own_transaction(db, monkeypatch):
     _install_git(monkeypatch, X)
 
     async def dead(*_a, **_k):
@@ -505,11 +522,23 @@ async def test_a_same_sha_resubmit_rearms_inside_its_own_transaction(db, monkeyp
     task = await _running_task(db, "Перевзвод")
     body = models.TaskSubmitReview(agent="dev")
     await lifecycle.submit_for_review(db, task.id, body)
-    await db.execute("UPDATE review_order_intents SET state='lost', attempts=4")
+    for closed in ("unknown", "failed"):
+        await db.execute(
+            "UPDATE review_order_intents SET state=?, attempts=3, ordering_marker='m'",
+            (closed,),
+        )
+        await db.commit()
+        await lifecycle.submit_for_review(db, task.id, body)
+        row = await _intent(db, task.id)
+        assert (row["state"], row["attempts"], row["ordering_marker"]) == (
+            "pending",
+            0,
+            "",
+        ), "внутри транзакции сдачи, без kick"
+    await db.execute("UPDATE review_order_intents SET state='ordering'")
     await db.commit()
     await lifecycle.submit_for_review(db, task.id, body)
-    row = await _intent(db, task.id)
-    assert (row["state"], row["attempts"]) == ("pending", 0), "без участия kick"
+    assert (await _intent(db, task.id))["state"] == "ordering"
 
 
 async def test_a_raced_submit_refuses_conflicting_outcomes_but_not_identical(

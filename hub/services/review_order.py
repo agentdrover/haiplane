@@ -1,24 +1,29 @@
 """Заказ машинного ревью после сдачи: durable намерение + свип (#2057).
 
 Заказ ходит в сеть (Cursor, git); HTTP-ответ сдачи его не ждёт. Прод
-перезапускается на каждом мерже, поэтому фоновая задача в памяти не может быть
-носителем заказа. Носитель - строка ``review_order_intents``, записанная В ТОЙ
-ЖЕ транзакции, что и сдача (``record_intent``).
+перезапускается на каждом мерже, поэтому носитель заказа - строка
+``review_order_intents``, записанная В ТОЙ ЖЕ транзакции, что и сдача
+(``record_intent``).
 
-Инварианты:
-* Единственный исполнитель заказа - ``process_intent``. Его зовут свип
-  (``sweep_review_orders``, из ``review_dispatch.sweep_review_dispatches``) и
-  подталкивание маршрутом (``kick``); корректность от подталкивания не зависит.
-  Рестарт = свип находит ``pending`` и заказывает.
-* Обработка берётся условным UPDATE ``claimed_at`` (одна на строку); бронь
-  старше ``CLAIM_STALE_MINUTES`` считается брошенной.
-* Успех - только то, что видно в базе: строка заказа есть, либо сдача уже не та
-  (статус/поколение/review_job_id), либо заказ отказан политикой БЕЗ удержанной
-  брони. Удержанная бронь заказа без строки - не успех: попытка считается,
-  откат растёт, после ``MAX_ATTEMPTS`` - один алерт и ``lost``. Повторная сдача
-  того же sha из review (#1265) возвращает ``lost``/``done`` в ``pending``.
-* Без DSN (прямой вызов сервиса, тесты на общем соединении) подталкивание
-  обрабатывает намерение на месте.
+Главное правило: НЕ БОЛЬШЕ ОДНОГО автоматического платного POST на
+(задачу, поколение). Каждая схема «повтор + сверка» рождала новый путь ко
+второму платному заказу, поэтому после любой попытки, которая могла дойти до
+провайдера, автоматического пути назад нет.
+
+* ``pending`` -> ``ordering``: условный UPDATE, огражённый токеном владельца и
+  выполняемый ПЕРЕД POST (``begin_ordering``, шов в ``_create_or_adopt``) с
+  commit; метка заказа привязывается к намерению. Не вышло (владение потеряно,
+  поколение другое) - POST не отправляется.
+* ``ordering`` -> ``done``, если строка заказа записана; иначе ``unknown`` и
+  ОДИН алерт (исключение после отправки, провалившийся INSERT строки,
+  зависание дольше ``ORDERING_TIMEOUT_MINUTES``). Свип такие строки не заказывает.
+* До шва (подготовка заказа, сеть git) попытки безопасны: откат и не более
+  ``MAX_ATTEMPTS``, затем ``failed`` и один алерт.
+* Свип (из ``review_dispatch.sweep_review_dispatches``) и ``kick`` заказывают
+  только ``pending``; рестарт = свип находит ``pending``. Повтор сдачи того же
+  sha из review (#1265) - осознанный запрос: он возвращает ``done``/``unknown``/
+  ``failed`` в ``pending`` в своей транзакции; ``ordering`` не трогает.
+* Без DSN (прямой вызов сервиса, тесты) подталкивание обрабатывает на месте.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ import asyncio
 import contextvars
 import logging
 import uuid
-from typing import Any, Final
+from typing import Final
 
 import aiosqlite
 
@@ -44,19 +49,25 @@ detach_dsn: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 #: Выключатель фонового подталкивания (тесты, которым нужна обработка на месте).
 DETACH_ENABLED: bool = True
 
-MAX_ATTEMPTS: Final = 4
-#: Откат (секунды) после n-й неудачи; последний шаг длиннее брони заказа (10 мин).
-BACKOFF_SECONDS: Final = (120, 360, 720)
-#: Чужую бронь берут только у другого процесса и не раньше этого срока
-#: (прежний процесс мёртв, его POST оборван; провайдер мог не успеть показать
-#: агента в списке). Внутри живого процесса бронь по таймеру не отбирается.
-FOREIGN_CLAIM_GRACE_MINUTES: Final = 2
+MAX_ATTEMPTS: Final = 3
+#: Откат (секунды) после n-й неудачи ДО шва; POST тут ещё не было.
+BACKOFF_SECONDS: Final = (60, 300)
+#: Бронь обработки ``pending`` без шва старше срока считается брошенной.
+CLAIM_STALE_MINUTES: Final = 5
+#: ``ordering`` дольше срока - исход неизвестен (создание длится до ~6 минут).
+ORDERING_TIMEOUT_MINUTES: Final = 15
 
-#: Процесс хаба: владелец брони.
-BOOT_ID: Final = uuid.uuid4().hex
 
-#: (задача, поколение) намерения, которое обрабатывает эта корутина.
-_current: contextvars.ContextVar[tuple[int, int] | None] = contextvars.ContextVar(
+class OrderingRefused(Exception):
+    """Шов отказал: POST не отправляется. ``superseded`` - сдача уже другая."""
+
+    def __init__(self, why: str, *, superseded: bool = False) -> None:
+        super().__init__(why)
+        self.superseded = superseded
+
+
+#: (задача, поколение, токен владельца) обработки, идущей в этой корутине.
+_current: contextvars.ContextVar[tuple[int, int, str] | None] = contextvars.ContextVar(
     "review_order_current", default=None
 )
 
@@ -78,93 +89,152 @@ async def record_intent(
 ) -> None:
     """Записать намерение; коммит - за вызывающим (транзакция сдачи).
 
-    Повтор той же сдачи возвращает ``lost``/``done`` в ``pending``: решение о
-    заказе пересматривается (#1150), а уже лёгший заказ ``_settled`` узнаёт сам.
+    Повтор той же сдачи возвращает закрытое намерение в ``pending`` (решение о
+    заказе пересматривается, #1150); ``pending`` и ``ordering`` не трогает.
     """
     await db.execute(
         "INSERT INTO review_order_intents (task_id, generation) VALUES (?, ?) "
         "ON CONFLICT(task_id, generation) DO UPDATE SET state='pending', "
         "attempts=0, next_attempt_at=datetime('now'), claimed_at=NULL, "
-        "claimed_by='' "
-        "WHERE state IN ('lost', 'done')",
+        "claimed_by='', ordering_marker='', ordering_at=NULL, last_error='' "
+        "WHERE state IN ('done', 'unknown', 'failed')",
         (task_id, generation),
     )
 
 
-async def _claim(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
+async def _claim(
+    db: aiosqlite.Connection, task_id: int, generation: int, token: str
+) -> bool:
     cur = await db.execute(
         "UPDATE review_order_intents SET claimed_at=datetime('now'), claimed_by=? "
         "WHERE task_id=? AND generation=? AND state='pending' "
         "AND next_attempt_at <= datetime('now') "
-        "AND (claimed_at IS NULL OR (claimed_by <> ? "
-        "AND claimed_at < datetime('now', ?)))",
-        (
-            BOOT_ID,
-            task_id,
-            generation,
-            BOOT_ID,
-            f"-{FOREIGN_CLAIM_GRACE_MINUTES} minutes",
-        ),
+        "AND (claimed_at IS NULL OR claimed_at < datetime('now', ?))",
+        (token, task_id, generation, f"-{CLAIM_STALE_MINUTES} minutes"),
     )
     await db.commit()
     return cur.rowcount == 1
 
 
-async def _finish(db: aiosqlite.Connection, task_id: int, generation: int) -> None:
-    await db.execute(
-        "UPDATE review_order_intents SET state='done', claimed_at=NULL, "
-        "claimed_by='' WHERE task_id=? AND generation=? AND claimed_by=?",
-        (task_id, generation, BOOT_ID),
+async def begin_ordering(db: aiosqlite.Connection, task_id: int, marker: str) -> None:
+    """Шов перед платным POST: ``pending`` -> ``ordering`` или отказ без POST.
+
+    Вне обработки намерения (переспрос, лестница) шов молчит: у них своя сверка.
+    """
+    scope = _current.get()
+    if scope is None or scope[0] != task_id:
+        return
+    _, generation, token = scope
+    row = await repo.get_task(db, task_id)
+    live = int((dict(row).get("submission_generation") or 0) if row else 0)
+    if live != generation or f":g{generation}:" not in marker:
+        raise OrderingRefused("поколение сдачи сменилось", superseded=True)
+    cur = await db.execute(
+        "SELECT 1 FROM review_order_intents WHERE task_id=? AND generation=? "
+        "AND claimed_by=? AND state IN ('ordering', 'done')",
+        (task_id, generation, token),
     )
+    if await cur.fetchone() is not None:
+        return  # следующая ступень лестницы той же обработки: шов уже пройден
+    cur = await db.execute(
+        "UPDATE review_order_intents SET state='ordering', ordering_marker=?, "
+        "ordering_at=datetime('now') WHERE task_id=? AND generation=? "
+        "AND state='pending' AND claimed_by=?",
+        (marker, task_id, generation, token),
+    )
+    await db.commit()
+    if cur.rowcount != 1:
+        raise OrderingRefused("владение обработкой потеряно")
+
+
+async def _state(db: aiosqlite.Connection, task_id: int, generation: int) -> str:
+    cur = await db.execute(
+        "SELECT state FROM review_order_intents WHERE task_id=? AND generation=?",
+        (task_id, generation),
+    )
+    row = await cur.fetchone()
+    return str(row[0]) if row else ""
+
+
+async def _set_closed(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    token: str,
+    from_state: str,
+    to_state: str,
+) -> bool:
+    cur = await db.execute(
+        "UPDATE review_order_intents SET state=?, claimed_at=NULL "
+        "WHERE task_id=? AND generation=? AND state=? AND claimed_by=?",
+        (to_state, task_id, generation, from_state, token),
+    )
+    await db.commit()
+    return cur.rowcount == 1
+
+
+async def _alert(db: aiosqlite.Connection, task_id: int, text: str) -> None:
+    await repo.add_task_update(db, task_id, "hub", "alert", text)
     await db.commit()
 
 
-async def _fail(
-    db: aiosqlite.Connection, task_id: int, generation: int, why: str
+async def _unknown(
+    db: aiosqlite.Connection, task_id: int, generation: int, token: str, why: str
+) -> None:
+    if await _set_closed(db, task_id, generation, token, "ordering", "unknown"):
+        await _alert(
+            db,
+            task_id,
+            f"Заказ ревью поколения {generation} мог уйти в Cursor, исход "
+            f"неизвестен ({why[:120]}) - строки заказа нет. Проверьте агента "
+            "по маркеру или пересдайте.",
+        )
+
+
+async def _fail_before_post(
+    db: aiosqlite.Connection, task_id: int, generation: int, token: str, why: str
 ) -> None:
     cur = await db.execute(
         "UPDATE review_order_intents SET attempts=attempts+1, claimed_at=NULL, "
-        "claimed_by='', last_error=? WHERE task_id=? AND generation=? "
+        "last_error=? WHERE task_id=? AND generation=? AND state='pending' "
         "AND claimed_by=? RETURNING attempts",
-        (why[:300], task_id, generation, BOOT_ID),
+        (why[:300], task_id, generation, token),
     )
     row = await cur.fetchone()
-    if row is None:  # бронь уже не наша: исход пишет её владелец
+    if row is None:
         await db.commit()
         return
     attempts = int(row[0])
     if attempts >= MAX_ATTEMPTS:
         await db.execute(
-            "UPDATE review_order_intents SET state='lost' "
+            "UPDATE review_order_intents SET state='failed' "
             "WHERE task_id=? AND generation=?",
             (task_id, generation),
         )
-        await repo.add_task_update(
+        await _alert(
             db,
             task_id,
-            "hub",
-            "alert",
-            f"Заказ ревью поколения {generation} не ушёл после {attempts} "
-            f"попыток ({why[:120]}). Повторная сдача того же sha из review "
-            "ничего не меняет в сдаче и закажет ревью заново.",
+            f"Заказ ревью поколения {generation} не начат после {attempts} "
+            f"попыток ({why[:120]}); провайдеру ничего не отправлено. "
+            "Повторная сдача того же sha закажет ревью заново.",
         )
-    else:
-        pause = BACKOFF_SECONDS[min(attempts - 1, len(BACKOFF_SECONDS) - 1)]
-        await db.execute(
-            "UPDATE review_order_intents SET next_attempt_at=datetime('now', ?) "
-            "WHERE task_id=? AND generation=?",
-            (f"+{pause} seconds", task_id, generation),
-        )
+        return
+    pause = BACKOFF_SECONDS[min(attempts - 1, len(BACKOFF_SECONDS) - 1)]
+    await db.execute(
+        "UPDATE review_order_intents SET next_attempt_at=datetime('now', ?) "
+        "WHERE task_id=? AND generation=?",
+        (f"+{pause} seconds", task_id, generation),
+    )
     await db.commit()
 
 
 async def _settled(
     db: aiosqlite.Connection, task_id: int, generation: int, *, rows: bool = True
 ) -> bool:
-    """Заказ закрыт по данным базы: сдача уже не та или (rows) строка заказа есть.
+    """Сдача уже не та или (rows) строка заказа есть.
 
     До вызова диспетчера строки не смотрим: он сам отказывает по ним, и его
-    отказ (#1152) — наблюдаемое поведение повтора того же sha.
+    отказ (#1152) - наблюдаемое поведение повтора того же sha.
     """
     row = await repo.get_task(db, task_id)
     task = dict(row) if row else None
@@ -199,91 +269,90 @@ async def _claim_is_held(
 async def process_intent(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> None:
-    """Обработать одно намерение: единственный путь, которым хаб заказывает ревью."""
-    if not await _claim(db, task_id, generation):
+    """Обработать одно ``pending`` намерение: единственный путь заказа ревью."""
+    token = uuid.uuid4().hex
+    if not await _claim(db, task_id, generation, token):
         return
-    marker_scope = _current.set((task_id, generation))
+    scope = _current.set((task_id, generation, token))
     try:
         if await _settled(db, task_id, generation, rows=False):
-            await _finish(db, task_id, generation)
+            await _set_closed(db, task_id, generation, token, "pending", "done")
             return
         from hub.services.review_dispatch import maybe_dispatch_review
 
         placed = await maybe_dispatch_review(db, task_id)
+    except OrderingRefused as refused:
+        await db.rollback()
+        if refused.superseded:
+            await _set_closed(db, task_id, generation, token, "pending", "done")
+        return  # потерянное владение: исход пишет владелец
     except asyncio.CancelledError:
-        # Исход заказа неизвестен: бронь снимается, метка остаётся - следующая
-        # попытка сначала спросит провайдера.
-        await asyncio.shield(_release(db, task_id, generation))
+        await asyncio.shield(_after_cancel(db, task_id, generation, token))
         raise
     except Exception as exc:  # noqa: BLE001 - заказ не должен ронять хаб
         log.exception("review order failed for task #%s gen %s", task_id, generation)
         await db.rollback()
-        await _fail(db, task_id, generation, f"{type(exc).__name__}: {exc}")
+        why = f"{type(exc).__name__}: {exc}"
+        if await _state(db, task_id, generation) == "ordering":
+            await _unknown(db, task_id, generation, token, why)
+        else:
+            await _fail_before_post(db, task_id, generation, token, why)
         return
     finally:
-        _current.reset(marker_scope)
-    if placed or await _settled(db, task_id, generation):
-        await _finish(db, task_id, generation)
+        _current.reset(scope)
+    await _finish_after_call(db, task_id, generation, token, placed)
+
+
+async def _after_cancel(
+    db: aiosqlite.Connection, task_id: int, generation: int, token: str
+) -> None:
+    """Отмена: до шва бронь снимается; после шва остаётся ``ordering`` (свип)."""
+    await db.execute(
+        "UPDATE review_order_intents SET claimed_at=NULL WHERE task_id=? "
+        "AND generation=? AND state='pending' AND claimed_by=?",
+        (task_id, generation, token),
+    )
+    await db.commit()
+
+
+async def _finish_after_call(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    token: str,
+    placed: bool,
+) -> None:
+    settled = placed or await _settled(db, task_id, generation)
+    if await _state(db, task_id, generation) == "ordering":
+        if settled:
+            await _set_closed(db, task_id, generation, token, "ordering", "done")
+        else:
+            await _unknown(db, task_id, generation, token, "строки заказа нет")
+    elif settled:
+        await _set_closed(db, task_id, generation, token, "pending", "done")
     elif await _claim_is_held(db, task_id, generation):
-        await _fail(db, task_id, generation, "бронь заказа удержана, строки заказа нет")
+        await _fail_before_post(db, task_id, generation, token, "бронь заказа удержана")
     else:
-        await _finish(db, task_id, generation)  # отказ политики/конфигурации
+        await _set_closed(db, task_id, generation, token, "pending", "done")
 
 
-async def _release(db: aiosqlite.Connection, task_id: int, generation: int) -> None:
-    await db.execute(
-        "UPDATE review_order_intents SET claimed_at=NULL, claimed_by='' "
-        "WHERE task_id=? AND generation=? AND claimed_by=?",
-        (task_id, generation, BOOT_ID),
-    )
-    await db.commit()
-
-
-async def reconcile_before_create(
-    db: aiosqlite.Connection | None, task_id: int, marker: str
-) -> Any:
-    """Шов перед платным POST провайдеру: метка в базу, повтор - сначала сверка.
-
-    Первый заказ по метке: пишет ``ordering_marker`` (commit) и отпускает
-    создание (None). Повтор по той же метке (прежняя попытка могла купить
-    агента и не записать строку) спрашивает провайдера: агент найден - его и
-    подбирают; спросить не удалось - создание запрещено (``blind``); «нет» при
-    удавшемся вопросе - создание разрешено. Вне обработки намерения (переспрос,
-    лестница) шов молчит: у них своя сверка.
-    """
-    scope = _current.get()
-    if db is None or scope is None or scope[0] != task_id:
-        return None
-    generation = scope[1]
+async def _expire_stuck_orders(db: aiosqlite.Connection) -> None:
+    """``ordering`` дольше срока: строка заказа есть - ``done``, иначе ``unknown``."""
     cur = await db.execute(
-        "SELECT ordering_marker FROM review_order_intents "
-        "WHERE task_id=? AND generation=? AND claimed_by=?",
-        (task_id, generation, BOOT_ID),
+        "SELECT task_id, generation, claimed_by FROM review_order_intents "
+        "WHERE state='ordering' AND ordering_at < datetime('now', ?)",
+        (f"-{ORDERING_TIMEOUT_MINUTES} minutes",),
     )
-    row = await cur.fetchone()
-    if row is None:
-        return None
-    if row[0] == marker:
-        from hub.integrations import cursor_cloud
-        from hub.services.review_dispatch import _Started
-
-        seen = await cursor_cloud.find_agent_by_name(marker)
-        if seen.agent_id or not seen.asked:
-            return _Started(
-                seen.agent_id, seen.run_id, bool(seen.agent_id), not seen.asked, 0, None
-            )
-        return None
-    await db.execute(
-        "UPDATE review_order_intents SET ordering_marker=?, ordering_at=datetime('now') "
-        "WHERE task_id=? AND generation=? AND claimed_by=?",
-        (marker, task_id, generation, BOOT_ID),
-    )
-    await db.commit()
-    return None
+    for task_id, generation, token in [tuple(r) for r in await cur.fetchall()]:
+        if await _settled(db, int(task_id), int(generation)):
+            await _set_closed(db, task_id, generation, token, "ordering", "done")
+        else:
+            await _unknown(db, task_id, generation, token, "зависание заказа")
 
 
 async def sweep_review_orders(db: aiosqlite.Connection) -> None:
-    """Проход поллера: заказать то, что записано и не заказано."""
+    """Проход поллера: закрыть зависшие ``ordering``, заказать ``pending``."""
+    await _expire_stuck_orders(db)
     cur = await db.execute(
         "SELECT task_id, generation FROM review_order_intents WHERE state='pending' "
         "AND next_attempt_at <= datetime('now') ORDER BY created_at LIMIT 20"

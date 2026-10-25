@@ -1,15 +1,19 @@
 """#2057: намерение заказать машинное ревью - durable, в одной транзакции со сдачей.
 
-Одна строка на (задача, поколение сдачи). ``pending`` -> ``done`` (заказ лёг,
-отказ политики, сдача устарела) | ``lost`` (попытки исчерпаны, один алерт в
-ленте). ``claimed_at``/``claimed_by`` - бронь обработчика: условный UPDATE, одна
-обработка на строку; ``claimed_by`` - идентификатор процесса хаба, и чужую бронь
-можно взять только у ДРУГОГО процесса (прежний мёртв), а не по таймеру.
-``ordering_marker`` - метка заказа провайдера, записанная (commit) ДО первого
-POST: повтор по такой метке сначала спрашивает провайдера и подбирает агента,
-создавая нового только при подтверждённом «нет».
-``next_attempt_at`` - откат между попытками. Единственный исполнитель заказа -
-свип ``review_order.sweep_review_orders``; HTTP-маршрут лишь подталкивает его.
+Одна строка на (задача, поколение сдачи). Состояния:
+
+* ``pending`` - платного вызова провайдеру не было; заказать может свип/подталкивание;
+* ``ordering`` - перед POST записаны метка и владелец (условный UPDATE, commit);
+  автоматически НЕ повторяется никогда: исход неизвестен, пока не записана
+  строка заказа;
+* ``done`` - строка заказа есть, либо сдача устарела, либо отказ политики;
+* ``unknown`` - заказ мог уйти к провайдеру, а строки нет; один алерт, дальше
+  решает человек или осознанная пересдача;
+* ``failed`` - до POST не дошли за ``MAX_ATTEMPTS`` попыток; один алерт.
+
+``claimed_by`` - токен владельца обработки (uuid на обработку): переход в
+``ordering`` и запись исхода ограждены им, потерянное владение = никакого POST.
+``ordering_marker`` - метка заказа провайдера, привязанная к ЭТОМУ намерению.
 """
 
 MIGRATIONS = [
@@ -19,7 +23,8 @@ MIGRATIONS = [
             task_id         INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
             generation      INTEGER NOT NULL,
             state           TEXT    NOT NULL DEFAULT 'pending'
-                            CHECK (state IN ('pending', 'done', 'lost')),
+                            CHECK (state IN ('pending', 'ordering', 'done',
+                                             'unknown', 'failed')),
             attempts        INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT    NOT NULL DEFAULT (datetime('now')),
             claimed_at      TEXT,
@@ -32,8 +37,9 @@ MIGRATIONS = [
         )""",
     ),
     (
-        "index_review_order_intents_pending",
-        "CREATE INDEX IF NOT EXISTS idx_review_order_intents_pending "
-        "ON review_order_intents(next_attempt_at) WHERE state = 'pending'",
+        "index_review_order_intents_open",
+        "CREATE INDEX IF NOT EXISTS idx_review_order_intents_open "
+        "ON review_order_intents(next_attempt_at) "
+        "WHERE state IN ('pending', 'ordering')",
     ),
 ]
