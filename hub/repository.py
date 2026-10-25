@@ -2239,8 +2239,8 @@ async def upsert_ci_run_report(
 
     ``mutations`` / ``baseline`` of ``None`` mean "the report carried no such
     key" (#1606): the step did not run, so a block stored earlier IN THIS ROW
-    stays, never one inherited from another attempt (the latest attempt must carry
-    its own baseline). The decision is made inside ON CONFLICT, in the same
+    stays; the caller passes the attempt's own text, so nothing is inherited from
+    another attempt (the latest must carry its own baseline). The decision is made inside ON CONFLICT, in the same
     statement that writes. Text (including ``"{}"``) replaces: a step that ran
     and found nothing, or ended in error, is a fact, not an absence.
     """
@@ -2753,7 +2753,7 @@ async def list_done_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
 async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, Any]]:
     """Per project: what waits for a human, what is in flight, when work last happened.
 
-    ONE aggregate query for all projects (the N+1 risk, #567). Two rules hold here:
+    ONE aggregate query for all projects, not a per-project loop (N+1, #567). Two rules:
 
     * the project sits on the EPIC and descendants inherit it (the same subtree
       walk as ``list_task_ids_for_project``), so a task outside every epic
@@ -3066,8 +3066,8 @@ async def close_review_verdict_window(
     never authorised a delivery. CHANGES_REQUESTED is the live case of the third
     (reachable on the current generation without a bump, e.g. a failed fix dispatch
     dropping the task into needs_decision). A window exists only where the verdict
-    grants the right to deliver, APPROVED alone: closing one anyway made the feed
-    announce a revoked approval over a task nobody had approved.
+    grants the right to deliver, APPROVED alone: closing a window on any other verdict
+    made the feed announce a revoked approval over a task nobody had approved.
 
     Written in SQL against ``submission_generation``, as ``record_review_verdict``
     binds the verdict: nothing read before the statement can be stale when it runs.
@@ -6172,8 +6172,8 @@ async def record_delivery_observation(
     читал, — и тем же значением сторожится строка: ``WHERE ... AND state = ?``,
     не ``observed_state = state``. SELECT транзакции не открывает, а #1065 даёт
     запросу и опросчику РАЗНЫЕ соединения: между чтением и записью свип успевает
-    зафиксировать ``pr_open``, и строка, источник которой ОТВЕЧАЕТ, молча вычлась
-    бы как «закрытая наблюдением». Предикат делает это честным промахом: ``None``.
+    зафиксировать ``pr_open``. БЕЗ предиката строка, источник которой ОТВЕЧАЕТ,
+    молча вычлась бы как «закрытая наблюдением»; с ним — честный промах: ``None``.
 
     ``AND observed_at = ''`` сторожит второй промах: наблюдение не меняет
     ``state``, строка остаётся ``unknown`` и ПОСЛЕ закрытия. (Столбец объявлен
@@ -6217,8 +6217,8 @@ async def record_delivery_observation(
     # (``services.delivery_state.record_delivery_observation``) дописывает тем же
     # соединением журнал и событие и коммитит ОДИН раз для всех трёх. Иначе падение
     # insert_event после этой строки оставило бы ``observed_at``/``observed_state``
-    # зафиксированными без истории и события, а повтор переписал бы наблюдение
-    # (#1215): либо закрыто всё, либо ничего.
+    # зафиксированными без истории и события (#1215): либо закрыто всё, либо ничего.
+    # Перезапись закрытой строки запрещает предикат ``observed_at = ''``, не коммит.
     return prior
 
 
