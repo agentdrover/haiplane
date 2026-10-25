@@ -2291,6 +2291,10 @@ class TaskDecide(BaseModel):
         False, description="Устарел: решение всегда пишется в ленту задачи."
     )
     pr_disposition: str = Field("", pattern=PR_DISPOSITION_PATTERN)
+    confirm_no_job: bool = Field(
+        False,
+        description="rework после оборванного заказа: подтверждаю, что задания в очереди диспетчера нет.",
+    )
 
 
 class TaskReturnToWork(BaseModel):

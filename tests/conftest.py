@@ -94,6 +94,24 @@ def _fresh_mcp_session_manager():
 
 
 @pytest.fixture(autouse=True)
+def _own_database_lock(tmp_path_factory):
+    """Блокировка владельца базы (#1991) - на каталог теста, не на общий HOME.
+
+    Иначе воркеры xdist спорили бы за один файл блокировки, а дескриптор
+    держался бы до конца процесса.
+    """
+    from hub.services import rework_launch
+
+    path = tmp_path_factory.mktemp("hubdb") / "hub.db"
+    # Свой контекст подмены: monkeypatch.undo() в теле теста путь не возвращает.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(config, "HUB_DB_PATH", path)
+        rework_launch.claim_process(path, "pytest")
+        yield
+        rework_launch.release_all()
+
+
+@pytest.fixture(autouse=True)
 def _no_random_deep_lot(monkeypatch):
     """Жребий deep (#1403) выключен: тесты профилей не должны зависеть от хеша.
 

@@ -160,7 +160,7 @@ from hub.mcp_catalog import (
 )
 from hub.services import accepted_delivery_retry
 from hub.services import admin as admin_svc
-from hub.services import chat_pair
+from hub.services import chat_pair, rework_launch
 from hub.services import owner_minutes, policy_change, project_policy, triage_inbox
 from hub.services.brief_failure import scrub_strings
 from hub.services.refusal_publish import update_views
@@ -461,11 +461,20 @@ async def lifespan(app: FastAPI):
     # Drive the MCP session manager lifespan inside ours so /mcp/* requests
     # have a live transport. Keeps everything in a single uvicorn process.
     mcp_lifespan = _mcp_streamable_app.router.lifespan_context(_mcp_streamable_app)
+    # Заявка - непосредственно перед защищённым блоком: любой выход из него
+    # снимает её в finally, ошибка запуска раньше её не оставляет.
+    if not rework_launch.claim_process(config.HUB_DB_PATH, app):
+        log.warning(
+            "На базе %s работает другой экземпляр хаба: сверку броней и заказ "
+            "доработки он ведёт сам, этот экземпляр их не выполняет",
+            config.HUB_DB_PATH,
+        )
     try:
         async with mcp_lifespan:
             await _startup_checks(app.state.db)
             yield
     finally:
+        rework_launch.release_process(config.HUB_DB_PATH, app)
         # #1180: локальные прогоны ревью — чужие процессы, порождённые этим
         # хабом. Уйти, не сняв их, значит оставить агентский CLI сиротой:
         # он доработает, попробует сдать отчёт по прогону, за которым больше

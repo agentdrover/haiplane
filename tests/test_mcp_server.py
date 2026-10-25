@@ -1500,6 +1500,7 @@ async def test_hub_decide_task_sends_all_params(
             "record_decision": True,
             # #897: the owner's choice about the PR travels with the decision.
             "pr_disposition": "",
+            "confirm_no_job": False,
         },
     )
 
@@ -1525,6 +1526,7 @@ async def test_hub_decide_task_rework_without_summary(
             "decision_summary": "",
             "record_decision": False,
             "pr_disposition": "",
+            "confirm_no_job": False,
         },
     )
 

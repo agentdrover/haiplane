@@ -585,3 +585,10 @@ async def shadow_pass(db: aiosqlite.Connection) -> int:
         if await announce_once(db, answer):
             written += 1
     return written
+
+
+async def run_sweep(db: aiosqlite.Connection) -> None:
+    # Очередь исполнения в тени (#1274): для каждого проекта с
+    # orchestrator_queue=shadow — событие «следующей взял бы #N» с причинами
+    # пропуска, только при смене ответа. Ни статуса, ни claim, ни воркспейса.
+    await shadow_pass(db)

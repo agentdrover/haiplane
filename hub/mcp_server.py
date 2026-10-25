@@ -3634,6 +3634,7 @@ async def hub_decide_task(
     decision_summary: str = "",
     record_decision: bool = False,
     pr_disposition: str = "",
+    confirm_no_job: bool = False,
 ) -> str:
     """Human decision after arbiter review — the Decision Gate.
 
@@ -3651,9 +3652,11 @@ async def hub_decide_task(
         pr_disposition: On accept — 'deliver'|'abandon'|''. 'deliver' merges
             under the gate's own conditions or refuses naming the unmet one:
             a decision cannot stand in for a gate (#1037).
+        confirm_no_job: rework after a cut-off order: no job in the queue
     """
     body: dict[str, Any] = {
         "action": action,
+        "confirm_no_job": confirm_no_job,
         "instructions": instructions,
         "decision_summary": decision_summary,
         "record_decision": record_decision,
