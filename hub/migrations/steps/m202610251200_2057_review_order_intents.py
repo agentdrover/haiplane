@@ -2,8 +2,12 @@
 
 Одна строка на (задача, поколение сдачи). ``pending`` -> ``done`` (заказ лёг,
 отказ политики, сдача устарела) | ``lost`` (попытки исчерпаны, один алерт в
-ленте). ``claimed_at`` - бронь обработчика: условный UPDATE, одна обработка
-на строку; протухшая бронь (рестарт хаба посреди заказа) берётся заново.
+ленте). ``claimed_at``/``claimed_by`` - бронь обработчика: условный UPDATE, одна
+обработка на строку; ``claimed_by`` - идентификатор процесса хаба, и чужую бронь
+можно взять только у ДРУГОГО процесса (прежний мёртв), а не по таймеру.
+``ordering_marker`` - метка заказа провайдера, записанная (commit) ДО первого
+POST: повтор по такой метке сначала спрашивает провайдера и подбирает агента,
+создавая нового только при подтверждённом «нет».
 ``next_attempt_at`` - откат между попытками. Единственный исполнитель заказа -
 свип ``review_order.sweep_review_orders``; HTTP-маршрут лишь подталкивает его.
 """
@@ -19,6 +23,9 @@ MIGRATIONS = [
             attempts        INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT    NOT NULL DEFAULT (datetime('now')),
             claimed_at      TEXT,
+            claimed_by      TEXT    NOT NULL DEFAULT '',
+            ordering_marker TEXT    NOT NULL DEFAULT '',
+            ordering_at     TEXT,
             last_error      TEXT    NOT NULL DEFAULT '',
             created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (task_id, generation)

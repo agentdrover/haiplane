@@ -4338,6 +4338,9 @@ async def _create_or_adopt(
     Отвергнутый заказ агента не создаёт, так что второго ревьюера этот
     повтор не покупает; дальше (сверка, повтор по обрыву) — без параметров.
     """
+    early = await review_order.reconcile_before_create(db, task_id, marker)  # #2057
+    if early is not None:
+        return early
     adopted = False
     blind = False
     attempts = 1

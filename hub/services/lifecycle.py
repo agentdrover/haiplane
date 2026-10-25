@@ -3529,6 +3529,12 @@ async def submit_for_review(
     except _SameShaRaced as raced:
         # #2057: параллельная сдача этого же sha легла между снимком и локом.
         state.task = raced.live
+        await finding_outcome.refuse_conflicting(
+            db,
+            task_id,
+            int(raced.live.get("submission_generation") or 0),
+            state.body.finding_outcomes or [],
+        )
         return await _same_sha_noop_response(state)
 
 
@@ -3588,6 +3594,7 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await critic_orders.accept_in_transaction(
             db, state.task, observed=state.submission_sha, always=True
         )  # #1953
+        await review_order.record_intent(db, task_id, generation)  # #2057
         # #919: вывод прод-дефекта, присланный с повтором, не тонет молча.
         await _store_submitted_prevention(state)
         # AC-5: то же место в транзакции, что и в _apply_submission — до

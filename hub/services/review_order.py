@@ -26,7 +26,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
-from typing import Final
+import uuid
+from typing import Any, Final
 
 import aiosqlite
 
@@ -46,7 +47,18 @@ DETACH_ENABLED: bool = True
 MAX_ATTEMPTS: Final = 4
 #: Откат (секунды) после n-й неудачи; последний шаг длиннее брони заказа (10 мин).
 BACKOFF_SECONDS: Final = (120, 360, 720)
-CLAIM_STALE_MINUTES: Final = 5
+#: Чужую бронь берут только у другого процесса и не раньше этого срока
+#: (прежний процесс мёртв, его POST оборван; провайдер мог не успеть показать
+#: агента в списке). Внутри живого процесса бронь по таймеру не отбирается.
+FOREIGN_CLAIM_GRACE_MINUTES: Final = 2
+
+#: Процесс хаба: владелец брони.
+BOOT_ID: Final = uuid.uuid4().hex
+
+#: (задача, поколение) намерения, которое обрабатывает эта корутина.
+_current: contextvars.ContextVar[tuple[int, int] | None] = contextvars.ContextVar(
+    "review_order_current", default=None
+)
 
 _inflight: dict[tuple[int, int], asyncio.Task[None]] = {}
 
@@ -72,7 +84,8 @@ async def record_intent(
     await db.execute(
         "INSERT INTO review_order_intents (task_id, generation) VALUES (?, ?) "
         "ON CONFLICT(task_id, generation) DO UPDATE SET state='pending', "
-        "attempts=0, next_attempt_at=datetime('now'), claimed_at=NULL "
+        "attempts=0, next_attempt_at=datetime('now'), claimed_at=NULL, "
+        "claimed_by='' "
         "WHERE state IN ('lost', 'done')",
         (task_id, generation),
     )
@@ -80,11 +93,18 @@ async def record_intent(
 
 async def _claim(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
     cur = await db.execute(
-        "UPDATE review_order_intents SET claimed_at=datetime('now') "
+        "UPDATE review_order_intents SET claimed_at=datetime('now'), claimed_by=? "
         "WHERE task_id=? AND generation=? AND state='pending' "
         "AND next_attempt_at <= datetime('now') "
-        "AND (claimed_at IS NULL OR claimed_at < datetime('now', ?))",
-        (task_id, generation, f"-{CLAIM_STALE_MINUTES} minutes"),
+        "AND (claimed_at IS NULL OR (claimed_by <> ? "
+        "AND claimed_at < datetime('now', ?)))",
+        (
+            BOOT_ID,
+            task_id,
+            generation,
+            BOOT_ID,
+            f"-{FOREIGN_CLAIM_GRACE_MINUTES} minutes",
+        ),
     )
     await db.commit()
     return cur.rowcount == 1
@@ -92,9 +112,9 @@ async def _claim(db: aiosqlite.Connection, task_id: int, generation: int) -> boo
 
 async def _finish(db: aiosqlite.Connection, task_id: int, generation: int) -> None:
     await db.execute(
-        "UPDATE review_order_intents SET state='done', claimed_at=NULL "
-        "WHERE task_id=? AND generation=?",
-        (task_id, generation),
+        "UPDATE review_order_intents SET state='done', claimed_at=NULL, "
+        "claimed_by='' WHERE task_id=? AND generation=? AND claimed_by=?",
+        (task_id, generation, BOOT_ID),
     )
     await db.commit()
 
@@ -104,11 +124,15 @@ async def _fail(
 ) -> None:
     cur = await db.execute(
         "UPDATE review_order_intents SET attempts=attempts+1, claimed_at=NULL, "
-        "last_error=? WHERE task_id=? AND generation=? RETURNING attempts",
-        (why[:300], task_id, generation),
+        "claimed_by='', last_error=? WHERE task_id=? AND generation=? "
+        "AND claimed_by=? RETURNING attempts",
+        (why[:300], task_id, generation, BOOT_ID),
     )
     row = await cur.fetchone()
-    attempts = int(row[0]) if row else MAX_ATTEMPTS
+    if row is None:  # бронь уже не наша: исход пишет её владелец
+        await db.commit()
+        return
+    attempts = int(row[0])
     if attempts >= MAX_ATTEMPTS:
         await db.execute(
             "UPDATE review_order_intents SET state='lost' "
@@ -178,6 +202,7 @@ async def process_intent(
     """Обработать одно намерение: единственный путь, которым хаб заказывает ревью."""
     if not await _claim(db, task_id, generation):
         return
+    marker_scope = _current.set((task_id, generation))
     try:
         if await _settled(db, task_id, generation, rows=False):
             await _finish(db, task_id, generation)
@@ -186,18 +211,75 @@ async def process_intent(
 
         placed = await maybe_dispatch_review(db, task_id)
     except asyncio.CancelledError:
+        # Исход заказа неизвестен: бронь снимается, метка остаётся - следующая
+        # попытка сначала спросит провайдера.
+        await asyncio.shield(_release(db, task_id, generation))
         raise
     except Exception as exc:  # noqa: BLE001 - заказ не должен ронять хаб
         log.exception("review order failed for task #%s gen %s", task_id, generation)
         await db.rollback()
         await _fail(db, task_id, generation, f"{type(exc).__name__}: {exc}")
         return
+    finally:
+        _current.reset(marker_scope)
     if placed or await _settled(db, task_id, generation):
         await _finish(db, task_id, generation)
     elif await _claim_is_held(db, task_id, generation):
         await _fail(db, task_id, generation, "бронь заказа удержана, строки заказа нет")
     else:
         await _finish(db, task_id, generation)  # отказ политики/конфигурации
+
+
+async def _release(db: aiosqlite.Connection, task_id: int, generation: int) -> None:
+    await db.execute(
+        "UPDATE review_order_intents SET claimed_at=NULL, claimed_by='' "
+        "WHERE task_id=? AND generation=? AND claimed_by=?",
+        (task_id, generation, BOOT_ID),
+    )
+    await db.commit()
+
+
+async def reconcile_before_create(
+    db: aiosqlite.Connection | None, task_id: int, marker: str
+) -> Any:
+    """Шов перед платным POST провайдеру: метка в базу, повтор - сначала сверка.
+
+    Первый заказ по метке: пишет ``ordering_marker`` (commit) и отпускает
+    создание (None). Повтор по той же метке (прежняя попытка могла купить
+    агента и не записать строку) спрашивает провайдера: агент найден - его и
+    подбирают; спросить не удалось - создание запрещено (``blind``); «нет» при
+    удавшемся вопросе - создание разрешено. Вне обработки намерения (переспрос,
+    лестница) шов молчит: у них своя сверка.
+    """
+    scope = _current.get()
+    if db is None or scope is None or scope[0] != task_id:
+        return None
+    generation = scope[1]
+    cur = await db.execute(
+        "SELECT ordering_marker FROM review_order_intents "
+        "WHERE task_id=? AND generation=? AND claimed_by=?",
+        (task_id, generation, BOOT_ID),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    if row[0] == marker:
+        from hub.integrations import cursor_cloud
+        from hub.services.review_dispatch import _Started
+
+        seen = await cursor_cloud.find_agent_by_name(marker)
+        if seen.agent_id or not seen.asked:
+            return _Started(
+                seen.agent_id, seen.run_id, bool(seen.agent_id), not seen.asked, 0, None
+            )
+        return None
+    await db.execute(
+        "UPDATE review_order_intents SET ordering_marker=?, ordering_at=datetime('now') "
+        "WHERE task_id=? AND generation=? AND claimed_by=?",
+        (marker, task_id, generation, BOOT_ID),
+    )
+    await db.commit()
+    return None
 
 
 async def sweep_review_orders(db: aiosqlite.Connection) -> None:
@@ -230,14 +312,13 @@ async def _background(dsn: str, task_id: int, generation: int) -> None:
 async def kick(db: aiosqlite.Connection, task_id: int) -> None:
     """Подтолкнуть заказ текущего поколения после коммита сдачи.
 
-    Для повтора того же sha сначала возвращает ``lost`` в ``pending``.
+    Намерение (и его возврат в ``pending`` на повторе того же sha) пишет сама
+    сдача в своей транзакции; подталкивание его не создаёт и не взводит.
     """
     row = await repo.get_task(db, task_id)
     generation = int((dict(row).get("submission_generation") or 0) if row else 0)
     if not generation:
         return
-    await record_intent(db, task_id, generation)
-    await db.commit()
     dsn = detach_dsn.get()
     if not DETACH_ENABLED or not dsn:
         await process_intent(db, task_id, generation)
