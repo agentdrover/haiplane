@@ -39,6 +39,7 @@ at-most-once — вердикт привязан к генерации, — и �
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -49,8 +50,9 @@ from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.services import verdict_owner, watch_notices
+from hub.services.finding_identity import finding_uids
 from hub.services.refusal_reason import CodedRefusal
-from hub.models import ReviewVerdict, TaskReviewVerdict
+from hub.models import ReviewFinding, ReviewSeverity, ReviewVerdict, TaskReviewVerdict
 from hub.services.result_kind import (
     AUTOMATION_REFUSAL,
     automation_not_applicable,
@@ -224,8 +226,65 @@ async def apply_judgement(
             f"бюджет циклов исчерпан ({cycles}) — решение за человеком"
         )
 
-    await _record(db, task_id, ReviewVerdict.changes_requested, generation)
+    await _record(
+        db,
+        task_id,
+        ReviewVerdict.changes_requested,
+        generation,
+        claim=claim,
+        findings=judge_findings(dict(judgement)),
+    )
     return RETURNED, f"работа возвращена автору, цикл {cycles + 1}"
+
+
+_SEVERITY_OF = {
+    "high": ReviewSeverity.high,
+    "p1": ReviewSeverity.high,
+    "critical": ReviewSeverity.high,
+    "low": ReviewSeverity.low,
+    "p3": ReviewSeverity.low,
+}
+
+
+def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
+    """Находки судьи в виде находок вердикта: автор получает их списком, а не текстом.
+
+    Судья пишет находки свободными словарями; вердикт хранит ``ReviewFinding``.
+    ``finding_uid`` (свой или выведенный из содержимого тем же правилом, что у
+    машинного отчёта) стоит в начале сообщения: по нему автор отвечает
+    ``finding_outcomes``. Невнятная находка не теряется - её сообщением
+    становится сам словарь.
+    """
+    try:
+        raw = json.loads(judgement.get("findings") or "[]")
+    except ValueError:
+        raw = []
+    entries = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    out: list[ReviewFinding] = []
+    for number, (entry, uid) in enumerate(zip(entries, finding_uids(entries)), 1):
+        text = next(
+            (
+                str(entry[key]).strip()
+                for key in ("message", "title", "summary", "detail")
+                if str(entry.get(key) or "").strip()
+            ),
+            json.dumps(entry, ensure_ascii=False),
+        )
+        line = entry.get("line")
+        out.append(
+            ReviewFinding(
+                id=number,
+                severity=_SEVERITY_OF.get(
+                    str(entry.get("severity") or "").strip().lower(),
+                    ReviewSeverity.medium,
+                ),
+                message=f"[uid {entry.get('finding_uid') or uid}] {text}"[:2000],
+                file=str(entry.get("file") or "")[:500],
+                line=line if isinstance(line, int) and line >= 1 else None,
+                recommendation=str(entry.get("recommendation") or "")[:2000],
+            )
+        )
+    return out
 
 
 def _refuse_if_the_submission_moved(task: dict[str, Any], generation: int) -> None:
@@ -285,6 +344,7 @@ async def _record(
     generation: int,
     *,
     claim: tuple[int, str] | None = None,
+    findings: list[ReviewFinding] | None = None,
 ) -> None:
     """Записать вердикт ТЕМ ЖЕ путём, которым его пишет человек.
 
@@ -302,6 +362,7 @@ async def _record(
             agent=_STEWARD_ACTOR,
             verdict=verdict,
             comments=f"Применено стюардом по суждению генерации {generation}.",
+            findings=findings or [],
         ),
         # #1601: вердикт пишется ТОЛЬКО на то поколение, о котором судили, и
         # только пока на него нет вердикта — условие стоит в самой записи.

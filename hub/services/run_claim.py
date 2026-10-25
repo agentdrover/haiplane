@@ -381,6 +381,69 @@ async def release_for_rework(db: aiosqlite.Connection, task_id: int) -> bool:
     )
 
 
+async def reopen_if_executor_gone(db: aiosqlite.Connection, task_id: int) -> bool:
+    """changes_requested вернул задачу в running, а исполнителя на связи нет: в open.
+
+    Один вопрос «на связи ли исполнитель» для вердикта человека и для судьи -
+    тот же ``pair_executor_online``, что у конвейера доставки. На связи - задача
+    остаётся у него в running (как и было); иначе она никому не нужна в running,
+    и честное состояние - open с снятым захватом: её возьмёт следующий. Без
+    коммита; одно событие. Личность исполнителя (``implementer_principal_id``)
+    остаётся: запрет самоодобрения не должен исчезать оттого, что работа ушла.
+    """
+    from hub.services.sessions import pair_executor_online
+
+    found = await repo.get_task(db, int(task_id))
+    if found is None:
+        return False
+    task = dict(found)
+    if not (task.get("claim_session_id") or "").strip():
+        # Присутствие знает только реестр сессий: захват без адреса (ручной,
+        # токен окружения) - «неизвестно», а не «ушёл»; такая задача не меняется.
+        return False
+    if await pair_executor_online(db, task):
+        return False
+    if not await repo.transition_status_if(
+        db, int(task_id), expected_from="running", new_status="open"
+    ):
+        return False
+    run_id = task.get("executor_run_id")
+    await db.execute(
+        "UPDATE tasks SET claimed_by = NULL, claim_session_id = NULL, "
+        "claimed_at = NULL, executor_run_id = NULL WHERE id = ?",
+        (int(task_id),),
+    )
+    if run_id is not None:
+        await drop_run_holdings(db, int(task_id), int(run_id))
+    session = (task.get("claim_session_id") or "").strip()
+    if session:
+        await db.execute(
+            "UPDATE agent_sessions SET current_task_id = NULL "
+            "WHERE session_id = ? AND current_task_id = ?",
+            (session, int(task_id)),
+        )
+    await repo.add_task_update(
+        db,
+        int(task_id),
+        "hub",
+        "status",
+        "Вердикт «на доработку» пришёл, а исполнителя на связи нет: захват снят, "
+        "задача открыта для следующего.",
+    )
+    await repo.insert_event(
+        db,
+        kind=EVENT_CLAIM_RELEASED,
+        task_id=int(task_id),
+        actor="hub",
+        payload={
+            "executor_run_id": run_id,
+            "from_status": "running",
+            "reason": "changes_requested_executor_offline",
+        },
+    )
+    return True
+
+
 async def stuck_candidates(db: aiosqlite.Connection) -> list[int]:
     """Задачи в running/claimed, чей захват ссылается на ЗАКОНЧЕННЫЙ прогон хаба."""
     rows = await fetchall(
