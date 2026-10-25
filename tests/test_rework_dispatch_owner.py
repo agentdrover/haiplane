@@ -375,9 +375,10 @@ async def test_a_forked_child_drops_parent_registrations(lock_path):
         chan.say(json.dumps(_state(rework_launch, inherited)))
         chan.hear()  # go: родитель отпустил A
         assert rework_launch.claim_process(lock_path, "B") is True
+        taken = [o.handle for o in rework_launch._OWNERS.values()]
         chan.say(json.dumps(_state(rework_launch, inherited)))
         rework_launch.release_process(lock_path, "B")
-        chan.say(json.dumps(_state(rework_launch, inherited)))
+        chan.say(json.dumps(_state(rework_launch, inherited + taken)))
         chan.hear()  # exit
 
     pid, chan = _run_forked(child)
@@ -465,5 +466,30 @@ async def test_a_forked_child_lazy_owner_releases_with_its_last_app(lock_path):
         assert gone["apps"] == {} and gone["owners"] == []
         assert all(gone["closed"]), "уход B не закрыл дескриптор"
         assert _can_take_lock(lock_path) is True, "претендент не допущен"
+    finally:
+        assert _reap(pid, chan) == 0
+
+
+async def test_a_forked_child_release_all_keeps_the_parent_lock(lock_path):
+    """Первый вход потомка - release_all(): дескриптор закрыт, lock родителя цел."""
+    from hub.services import rework_launch
+
+    assert rework_launch.claim_process(lock_path, "A") is True
+    inherited = [o.handle for o in rework_launch._OWNERS.values()]
+
+    def child(chan: _Chan) -> None:
+        chan.hear()
+        rework_launch.release_all()
+        chan.say(json.dumps(_state(rework_launch, inherited)))
+        chan.hear()
+
+    pid, chan = _run_forked(child)
+    try:
+        chan.say("go")
+        done = chan.report()
+        assert done["apps"] == {} and done["owners"] == [] and all(done["closed"])
+        assert _can_take_lock(lock_path) is False, "release_all потомка снял lock"
+        rework_launch.release_process(lock_path, "A")
+        assert _can_take_lock(lock_path) is True
     finally:
         assert _reap(pid, chan) == 0
