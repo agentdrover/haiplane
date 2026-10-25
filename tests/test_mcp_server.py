@@ -2380,6 +2380,27 @@ async def test_a_submit_timeout_says_a_same_sha_retry_is_safe(
     assert "безопасен" not in blind["message"].split("Сдача:")[1]
     assert "hub_task_status" in blind["message"]
 
+    # Исход, оставляющий след (deferred -> черновик), повтор не обещан.
+    for outcomes in (
+        [{"finding_uid": "f1", "outcome": "deferred", "note": "n"}],
+        [{"finding_uid": "f1", "outcome": "fixed", "linked_task_id": 9}],
+    ):
+        mock_api_post.side_effect = HubApiError(timeout)
+        traced = json.loads(
+            await hub_submit_for_review(42, expected_sha=sha, finding_outcomes=outcomes)
+        )
+        assert traced["same_sha_retry_safe"] is False
+        assert "hub_task_status" in traced["message"]
+    mock_api_post.side_effect = HubApiError(timeout)
+    plain = json.loads(
+        await hub_submit_for_review(
+            42,
+            expected_sha=sha,
+            finding_outcomes=[{"finding_uid": "f1", "outcome": "fixed"}],
+        )
+    )
+    assert plain["same_sha_retry_safe"] is True
+
     # Не транспорт — совет не дописывается.
     mock_api_post.side_effect = HubApiError({"reason": "head_moved", "message": "x"})
     refused = json.loads(await hub_submit_for_review(42, expected_sha=sha))

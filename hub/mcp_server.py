@@ -1750,12 +1750,28 @@ _SUBMIT_SAME_SHA_RETRY = (
     "менялись, сначала hub_task_status."
 )
 _SUBMIT_CHECK_FIRST = (
-    "Сдача: вызов был без expected_sha, поэтому безопасность повтора не "
-    "доказана — сначала hub_task_status (updates=-1)."
+    "Сдача: безопасность повтора не доказана (нет expected_sha или в вызове "
+    "исходы находок, оставляющие след) — сначала hub_task_status (updates=-1)."
 )
 
 
-def _with_same_sha_retry_note(err: HubApiError, expected_sha: str) -> HubApiError:
+_PLAIN_FIX_OUTCOMES = frozenset({"fixed", "real_fixed"})
+
+
+def _outcomes_are_plain_fixes(items: list[dict[str, Any]] | None) -> bool:
+    """Исход «починено» без связанной задачи не оставляет следа при повторе."""
+    return all(
+        str(item.get("outcome") or "") in _PLAIN_FIX_OUTCOMES
+        and not item.get("linked_task_id")
+        for item in items or []
+    )
+
+
+def _with_same_sha_retry_note(
+    err: HubApiError,
+    expected_sha: str,
+    finding_outcomes: list[dict[str, Any]] | None = None,
+) -> HubApiError:
     """Транспортный отказ сдачи: сказать, когда повтор безопасен (#2057).
 
     retry_safe остаётся False: безопасность держится на неизменном sha, а не
@@ -1766,7 +1782,9 @@ def _with_same_sha_retry_note(err: HubApiError, expected_sha: str) -> HubApiErro
     payload = err.payload
     if payload.get("reason") not in ("transport_timeout", "transport_error"):
         return err
-    safe = bool(expected_sha.strip())
+    # Исход, оставляющий черновик или заметку (deferred, wont_fix, …), при
+    # повторе мог бы записаться вторым: обещания нет.
+    safe = bool(expected_sha.strip()) and _outcomes_are_plain_fixes(finding_outcomes)
     note = _SUBMIT_SAME_SHA_RETRY if safe else _SUBMIT_CHECK_FIRST
     noted = dict(payload)
     noted["same_sha_retry_safe"] = safe
@@ -2774,7 +2792,7 @@ async def hub_submit_for_review(
         )
     except HubApiError as exc:
         return _format_hub_api_error(
-            _with_same_sha_retry_note(exc, expected_sha), prior_task
+            _with_same_sha_retry_note(exc, expected_sha, finding_outcomes), prior_task
         )
     generation = task.get("submission_generation", 0)
     # #1265 AC-6: a same-sha retry from review opens no new generation — the
