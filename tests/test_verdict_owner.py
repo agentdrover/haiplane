@@ -451,7 +451,7 @@ async def test_an_escalation_is_written_only_on_the_generation_it_judged(
             await repo.update_task(_db, task_id, submission_generation=2)
             await _db.commit()
             return auto_verdict.AutoStance(
-                auto_verdict.OUTCOME_ESCALATE, "x", "красный CI"
+                auto_verdict.OUTCOME_ESCALATE, "x", "красный CI", generation=1
             )
 
         monkeypatch.setattr(auto_verdict, "autopilot_stance", resubmitted_meanwhile)
@@ -510,3 +510,80 @@ async def test_a_live_actor_created_after_the_check_cancels_the_watchdog_write(
     assert await hand_over_stalled_reviews(db) == 0
     assert await _owner_state(db, task_id) == ("", "")
     assert await _events(db, task_id) == []
+
+
+async def test_an_escalation_carries_the_generation_the_stance_evaluated(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    from hub.services import auto_verdict
+    from hub.services.verdict_owner import written_owner
+
+    case = await _approved_case(db, monkeypatch, "own-stance-gen", concur=None)
+
+    async def judged_the_new_submission(_db, task_id, **_k):
+        # пересдача случилась до чтения сдачи стойкой: она судит поколение 2
+        await repo.update_task(_db, task_id, submission_generation=2)
+        await _db.commit()
+        return auto_verdict.AutoStance(
+            auto_verdict.OUTCOME_ESCALATE, "x", "красный CI", generation=2
+        )
+
+    monkeypatch.setattr(auto_verdict, "autopilot_stance", judged_the_new_submission)
+    assert await auto_verdict._decide(db, case.task_id) is False
+
+    owner, reason = written_owner(await _owner(db, case.task_id))
+    assert owner == "human" and reason.startswith("autopilot_escalated")
+    assert (await _events(db, case.task_id))[0]["generation"] == 2
+
+
+@pytest.mark.parametrize(
+    "interleaved", ["temporary_handoff", "fresh_owner_event", "status_just_entered"]
+)
+async def test_the_watchdog_write_rechecks_the_owner_and_the_grace(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, interleaved: str
+) -> None:
+    from hub.services import verdict_route as route_module
+    from hub.services.verdict_owner import (
+        OWNER_STEWARD,
+        hand_over_stalled_reviews,
+        hand_to_human,
+        write_owner,
+    )
+
+    _steward_on(monkeypatch)
+    task_id = await _ready(
+        client, db, monkeypatch, f"own-race2-{interleaved}", {"verdict": "steward"}
+    )
+    await _age(db, task_id)
+    real = route_module.verdict_route
+
+    async def route_then_a_write(_db, tid, **kwargs):
+        route = await real(_db, tid, **kwargs)
+        if interleaved == "temporary_handoff":
+            assert await hand_to_human(
+                _db, tid, "steward_daily_cap: до сброса", generation=1
+            )
+            # событие давнее: остановить запись должен именно владелец
+            await _db.execute(
+                "UPDATE events SET created_at=datetime('now','-2 hours') "
+                "WHERE task_id=? AND kind='verdict_owner_changed'",
+                (tid,),
+            )
+        elif interleaved == "fresh_owner_event":
+            assert await write_owner(
+                _db, tid, OWNER_STEWARD, "run_ordered", generation=1
+            )
+        else:
+            await _db.execute(
+                "UPDATE tasks SET status_entered_at=datetime('now') WHERE id=?", (tid,)
+            )
+        await _db.commit()
+        return route
+
+    monkeypatch.setattr(route_module, "verdict_route", route_then_a_write)
+
+    assert await hand_over_stalled_reviews(db) == 0
+    owner, reason = await _owner_state(db, task_id)
+    assert not reason.startswith("no_actor")
+    if interleaved == "temporary_handoff":
+        assert (owner, reason) == ("human", "steward_daily_cap: до сброса")

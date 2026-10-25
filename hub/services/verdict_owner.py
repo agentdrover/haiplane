@@ -97,6 +97,27 @@ def _live_actor_sql() -> str:
     )
 
 
+def _stalled_sql() -> tuple[str, tuple[str, ...]]:
+    """Условие «сторожу пора»: нет живого исполнителя, владельца и свежего события.
+
+    Один текст на выборку и на запись сторожа: передачу человеку (в том числе
+    временную, по потолку), записанную после оценки маршрута, и исполнителя,
+    появившегося после неё, запись уже не перекроет. Срок отсчитывается от
+    входа в review и от последнего ``verdict_owner_changed``.
+    """
+    window = f"-{WATCHDOG_GRACE_MINUTES} minutes"
+    sql = (
+        f"{_live_actor_sql()} "
+        "AND NOT (tasks.verdict_owner='human' "
+        "         AND tasks.verdict_owner_generation = tasks.submission_generation) "
+        "AND COALESCE(tasks.status_entered_at, tasks.updated_at) "
+        "<= datetime('now', ?) "
+        "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.task_id=tasks.id "
+        "                AND e.kind=? AND e.created_at > datetime('now', ?))"
+    )
+    return sql, (window, EVENT_CHANGED, window)
+
+
 async def write_owner(
     db: aiosqlite.Connection,
     task_id: int,
@@ -129,6 +150,7 @@ async def write_owner(
     if current <= 0 or int(generation) != current:
         return False
     text = reason.strip()[:_REASON_MAX]
+    stalled_sql, stalled_params = _stalled_sql() if only_without_actor else ("", ())
     temporary = " OR ".join("verdict_owner_reason LIKE ?" for _ in TEMPORARY_REASONS)
     cursor = await db.execute(
         "UPDATE tasks SET verdict_owner=?, verdict_owner_reason=?, "  # nosec B608 - constant fragments only
@@ -136,7 +158,7 @@ async def write_owner(
         "verdict_owner_generation=? WHERE id=? AND submission_generation=? "
         "AND NOT (verdict_owner=? AND verdict_owner_generation=? "
         f"AND NOT (? AND ({temporary}))) "
-        + (f"AND {_live_actor_sql()}" if only_without_actor else ""),
+        + (f"AND {stalled_sql}" if only_without_actor else ""),
         (
             owner,
             text,
@@ -147,6 +169,7 @@ async def write_owner(
             current,
             int(not is_temporary(text)),
             *(f"{code}%" for code in TEMPORARY_REASONS),
+            *stalled_params,
         ),
     )
     if cursor.rowcount != 1:
@@ -203,22 +226,13 @@ async def reclaim_for_steward(
 
 async def _stalled_candidates(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     """Задачи в review без живого исполнителя дольше срока и без записи «человек»."""
+    sql, params = _stalled_sql()
     rows = await fetchall(
         db,
-        "SELECT tasks.* FROM tasks WHERE tasks.status='review' AND tasks.archived=0 "  # nosec B608 - constant fragments only
+        "SELECT tasks.* FROM tasks WHERE tasks.status='review' AND tasks.archived=0 "
         "AND tasks.submission_generation > 0 "
-        f"AND {_live_actor_sql()} "
-        "AND NOT (tasks.verdict_owner='human' "
-        "         AND tasks.verdict_owner_generation = tasks.submission_generation) "
-        "AND COALESCE(tasks.status_entered_at, tasks.updated_at) "
-        "<= datetime('now', ?) "
-        "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.task_id=tasks.id "
-        "                AND e.kind=? AND e.created_at > datetime('now', ?))",
-        (
-            f"-{WATCHDOG_GRACE_MINUTES} minutes",
-            EVENT_CHANGED,
-            f"-{WATCHDOG_GRACE_MINUTES} minutes",
-        ),
+        f"AND {sql}",  # nosec B608 - constant fragments only
+        params,
     )
     return [dict(row) for row in rows]
 

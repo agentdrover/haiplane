@@ -281,6 +281,8 @@ class AutoStance:
     #: ответ верен «если они пройдут». Пусто там, где решатель.
     pending: tuple[str, ...] = ()
     facts: dict[str, Any] = field(default_factory=dict)
+    #: Поколение сдачи, о котором судила эта стойка (0 - до чтения сдачи).
+    generation: int = 0
 
 
 @dataclass
@@ -311,6 +313,7 @@ def _refuse_with(
         feed_note=note,
         audit_alerts=tuple(ctx.audit) if ctx else (),
         pending=tuple(ctx.pending) if ctx else (),
+        generation=ctx.generation if ctx else 0,
     )
 
 
@@ -321,6 +324,7 @@ def _escalate_with(code: str, reason: str, ctx: _Ctx) -> AutoStance:
         reason,
         audit_alerts=tuple(ctx.audit),
         pending=tuple(ctx.pending),
+        generation=ctx.generation,
     )
 
 
@@ -758,6 +762,7 @@ async def autopilot_stance(
             "proven_usage": ctx.proven_usage,
             "self_reviewed": bool(ctx.review.get("self_reviewed")),
         },
+        generation=ctx.generation,
     )
 
 
@@ -783,10 +788,6 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
 
 
 async def _decide(db: aiosqlite.Connection, task_id: int) -> bool:
-    # Поколение читается ДО оценки: пересдача во время неё не должна отдать
-    # человеку новую сдачу по доказательствам старой.
-    row = await repo.get_task(db, task_id)
-    evaluated = int(dict(row).get("submission_generation") or 0) if row else 0
     stance = await autopilot_stance(db, task_id)
     for alert in stance.audit_alerts:
         await repo.add_task_update(
@@ -794,7 +795,8 @@ async def _decide(db: aiosqlite.Connection, task_id: int) -> bool:
         )
         await db.commit()
     if stance.outcome == OUTCOME_ESCALATE:
-        await _escalate(db, task_id, stance.reason, evaluated)
+        # Поколение берётся из самой оценки: запись - ровно о том, что судили.
+        await _escalate(db, task_id, stance.reason, stance.generation)
         return False
     if stance.outcome != OUTCOME_APPROVE:
         if stance.feed_note:
