@@ -381,6 +381,19 @@ async def release_for_rework(db: aiosqlite.Connection, task_id: int) -> bool:
     )
 
 
+def _executor_names(task: dict[str, Any], session: Any) -> tuple[str, str, str]:
+    """Под какими именами исполнитель пишет в карточку.
+
+    Pair-start с ``open`` оставляет ``claimed_by`` пустым и записывает только
+    ``assigned_agent`` и адрес сессии; имя агента ведёт ещё и реестр.
+    """
+    return (
+        str(task.get("claimed_by") or "\0"),
+        str(task.get("assigned_agent") or "\0"),
+        str(dict(session).get("agent") or "\0") if session is not None else "\0",
+    )
+
+
 async def _executor_is_gone(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
     """Исполнитель ушёл доказанно, а не потому, что реестр промолчал (#2053).
 
@@ -388,7 +401,8 @@ async def _executor_is_gone(db: aiosqlite.Connection, task: dict[str, Any]) -> b
     идущего прогона хаба, ни открытого слота; (2) адрес захвата назван и сессия
     молчит дольше порога смерти слота проекта (``slot_dead_minutes``), а не
     десяти минут присутствия: локальная сессия без heartbeat работает и дольше;
-    (3) за то же окно захватчик ничего не писал в карточку. Запись самого
+    (3) за то же окно исполнитель (``claimed_by``, ``assigned_agent`` или агент
+    сессии) ничего не писал в карточку. Запись самого
     вердикта (автор - ревьюер) признаком жизни не считается.
     """
     from hub.services import executor_slots, project_policy
@@ -411,14 +425,15 @@ async def _executor_is_gone(db: aiosqlite.Connection, task: dict[str, Any]) -> b
     )
     if live:
         return False
+    registered = await repo.get_agent_session(db, session)
     last = await fetchall(
         db,
         "SELECT MAX(at) AS at FROM ("
         "  SELECT MAX(created_at) AS at FROM task_updates "
-        "  WHERE task_id = ? AND agent = ? "
+        "  WHERE task_id = ? AND agent IN (?, ?, ?) "
         "  UNION ALL SELECT last_seen_at FROM agent_sessions WHERE session_id = ?"
         ")",
-        (task_id, str(task.get("claimed_by") or ""), session),
+        (task_id, *_executor_names(task, registered), session),
     )
     seen = dict(last[0])["at"] if last else None
     if not seen:
@@ -441,6 +456,10 @@ async def reopen_if_executor_gone(db: aiosqlite.Connection, task_id: int) -> boo
     if found is None:
         return False
     task = dict(found)
+    if await finished_run_of(db, task) is not None:
+        # Захват закончившегося прогона хаба снимает ``release_for_rework`` (#1783):
+        # задача остаётся в running без держателя, и круг починки её видит.
+        return False
     if not await _executor_is_gone(db, task):
         return False
     if not await repo.transition_status_if(
@@ -522,3 +541,32 @@ async def release_stuck_task(db: aiosqlite.Connection, task_id: int) -> bool:
         "нет (#1783).",
         reason="stuck_claim",
     )
+
+
+async def reopen_abandoned_rework(db: aiosqlite.Connection) -> list[int]:
+    """Проход reaper'а: задача, возвращённая вердиктом «на доработку» и брошенная.
+
+    Окно покоя при самом вердикте могло ещё не кончиться, и задача осталась у
+    исполнителя; если он так и не вернулся, она иначе висела бы в running без
+    сроков. Кандидат - running с действующим вердиктом ``changes_requested`` на
+    нынешней сдаче и адресом захвата; решает тот же ``_executor_is_gone``.
+    """
+    from hub.db import write_transaction
+
+    rows = await fetchall(
+        db,
+        "SELECT id FROM tasks WHERE status = 'running' AND archived = 0 "
+        "AND review_verdict = 'changes_requested' "
+        "AND review_verdict_generation = submission_generation "
+        "AND COALESCE(claim_session_id, '') <> '' ORDER BY id",
+    )
+    reopened: list[int] = []
+    for row in rows:
+        task_id = int(dict(row)["id"])
+        try:
+            async with write_transaction(db):
+                if await reopen_if_executor_gone(db, task_id):
+                    reopened.append(task_id)
+        except Exception:  # noqa: BLE001 - одна задача не останавливает остальные
+            log.exception("rework reopen of #%d failed", task_id)
+    return reopened

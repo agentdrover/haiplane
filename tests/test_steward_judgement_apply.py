@@ -404,3 +404,57 @@ async def test_judge_uids_are_advertised_only_when_the_judge_brought_one(db):
     got = judge_findings({"findings": json.dumps(FINDINGS)})
     assert "[uid abc123]" in got[0].message
     assert "uid" not in got[1].message
+
+
+async def test_pair_start_executor_activity_is_seen_by_assigned_agent(db, monkeypatch):
+    """Codex 2 P1: pair-start с open оставляет claimed_by пустым, пишет assigned_agent."""
+    task_id = await _scene(db, monkeypatch, "jcr-assigned")
+    await _offline(db, task_id)
+    await repo.update_task(db, task_id, claimed_by=None, assigned_agent="dev")
+    await repo.add_task_update(db, task_id, "dev", "status", "работаю")
+    await db.commit()
+
+    await apply_judge_changes_requests(db)
+
+    assert (await _verdict(db, task_id))["task"]["status"] == "running"
+
+
+async def test_a_rework_task_kept_in_the_window_is_reopened_by_the_sweep(
+    db, monkeypatch
+):
+    """Codex 2 P2: исполнитель молчал в окне и так и не вернулся - проход снимает захват."""
+    from hub.services import run_claim
+
+    task_id = await _scene(db, monkeypatch, "jcr-sweep")
+    await _online(db, task_id)
+    await _silent_for(db, 11)
+    await apply_judge_changes_requests(db)
+    assert (await _verdict(db, task_id))["task"]["status"] == "running"
+    assert await run_claim.reopen_abandoned_rework(db) == []
+
+    await _silent_for(db, 120)
+    assert await run_claim.reopen_abandoned_rework(db) == [task_id]
+
+    task = (await _verdict(db, task_id))["task"]
+    assert task["status"] == "open" and not task["claim_session_id"]
+    events = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE task_id=? AND kind='executor_claim_released'",
+        (task_id,),
+    )
+    assert len(events) == 1
+    assert await run_claim.reopen_abandoned_rework(db) == []
+
+
+async def test_the_reaper_pass_runs_the_rework_recheck(db, monkeypatch):
+    from hub.services import chat_pair
+
+    task_id = await _scene(db, monkeypatch, "jcr-reaper")
+    await _online(db, task_id)
+    await _silent_for(db, 11)
+    await apply_judge_changes_requests(db)
+    await _silent_for(db, 120)
+
+    await chat_pair.release_stuck_run_claims(db)
+
+    assert (await _verdict(db, task_id))["task"]["status"] == "open"
