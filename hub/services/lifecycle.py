@@ -85,7 +85,7 @@ from hub.services import (
     rework_launch,
     verdict_guard,
 )
-from hub.services import ci_contract, ci_integrity, ci_trust
+from hub.services import ci_contract, ci_integrity, ci_trust, review_order
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
@@ -3586,7 +3586,18 @@ async def submit_for_review(
         return await _same_sha_noop_response(state)
 
     await run_steps(state, SUBMIT_STEPS_AFTER_SAME_SHA_CHECK)
-    return await _apply_submission(state)
+    try:
+        return await _apply_submission(state)
+    except _SameShaRaced as raced:
+        # #2057: параллельная сдача этого же sha легла между снимком и локом.
+        state.task = raced.live
+        return await _same_sha_noop_response(state)
+
+
+class _SameShaRaced(Exception):
+    def __init__(self, live: dict[str, Any]) -> None:
+        super().__init__("same sha already submitted")
+        self.live = live
 
 
 async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
@@ -3979,9 +3990,7 @@ async def _dispatch_cross_model_review(db: aiosqlite.Connection, task_id: int) -
     только в комментарии посреди перехода.
     """
     try:
-        from hub.services.review_order import order_after_submit
-
-        await order_after_submit(db, task_id)
+        await review_order.kick(db, task_id)
     except Exception:  # noqa: BLE001 - dispatch must never break a submit
         log.exception("cross-model review dispatch failed for task #%s", task_id)
 
@@ -4054,6 +4063,12 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
         live = dict(await repo.get_task(db, task_id) or task)
         if (
+            submission_sha
+            and live.get("status") == "review"
+            and live.get("submission_sha") == submission_sha
+        ):
+            raise _SameShaRaced(live)  # #2057: тот же sha уже сдан под локом
+        if (
             not body.finding_outcomes
             and resubmission_guard.empty_resubmission_of(live, submission_sha)
             and not await resubmission_guard.findings_answered(db, live)
@@ -4098,6 +4113,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         )
         await _store_submitted_prevention(state)
         generation = await repo.bump_submission_generation(db, task_id)
+        await review_order.record_intent(db, task_id, generation)  # #2057
         # #758: the declared implementing model rides the submission the
         # same way the branch does — a report, not an observation, kept
         # auditable next to the pinned sha.

@@ -2698,10 +2698,13 @@ async def api_submit_for_review(
     if dry_run:
         return await dry_run_submit(_db(request), task_id, body)
     # #2057: заказ ревью уходит из запроса на своё соединение по этому DSN.
-    review_order.detach_dsn.set(getattr(request.app.state, "dsn", None))
-    return await services.submit_for_review(
-        _db(request), task_id, body, principal_id=identity.principal_id
-    )
+    token = review_order.detach_dsn.set(getattr(request.app.state, "dsn", None))
+    try:
+        return await services.submit_for_review(
+            _db(request), task_id, body, principal_id=identity.principal_id
+        )
+    finally:
+        review_order.detach_dsn.reset(token)
 
 
 @app.post("/api/tasks/{task_id}/machine-review", response_model=MachineReviewView)

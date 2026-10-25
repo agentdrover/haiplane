@@ -55,7 +55,7 @@ from hub.models import (
     RiskClass,
 )
 from hub.services import call_sites, ci_integrity, ladder_attempts, project_policy
-from hub.services import report_binding
+from hub.services import report_binding, review_order
 from hub.services import review_ci_gate
 from hub.services.auto_approve import decider_hits
 from hub.services.metrics_scope import Scope
@@ -6960,6 +6960,7 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     # #1242: переспрос — ДО разбора активных строк. Заказ, закрытый упавшим
     # на этом проходе, переспрашивается на следующем, а не в ту же минуту.
     await _ask_again_lost_reviews(db)
+    await review_order.sweep_review_orders(db)  # #2057
     await settle_stopped_local_first(db)
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)

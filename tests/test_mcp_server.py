@@ -2398,7 +2398,7 @@ async def test_a_submit_timeout_says_a_same_sha_retry_is_safe(
     release = asyncio.Event()
     ordered: list[int] = []
 
-    async def slow_order(_db: Any, task_id: int) -> None:
+    async def slow_process(_db: Any, task_id: int, _generation: int) -> None:
         ordered.append(task_id)
         await release.wait()
 
@@ -2406,22 +2406,29 @@ async def test_a_submit_timeout_says_a_same_sha_retry_is_safe(
         return {"submission_generation": 3}
 
     class _Conn:
+        async def commit(self) -> None:
+            return None
+
         async def close(self) -> None:
             return None
 
     async def fake_connect(_dsn: str) -> _Conn:
         return _Conn()
 
+    async def no_intent(*_a: Any) -> None:
+        return None
+
     with (
         patch.object(review_order, "DETACH_ENABLED", True),
-        patch.object(review_order, "_dispatch_once", slow_order),
+        patch.object(review_order, "process_intent", slow_process),
+        patch.object(review_order, "record_intent", no_intent),
         patch.object(repo, "get_task", fake_task),
         patch.object(review_order, "connect", fake_connect),
     ):
-        token = review_order.detach_dsn.set("file:unused")
+        token = review_order.detach_dsn.set("unused-dsn")
         try:
             for _ in range(2):
-                await asyncio.wait_for(review_order.order_after_submit(None, 42), 2)
+                await asyncio.wait_for(review_order.kick(_Conn(), 42), 2)  # type: ignore[arg-type]
         finally:
             review_order.detach_dsn.reset(token)
         for _ in range(20):
