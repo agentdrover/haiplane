@@ -48,7 +48,7 @@ from hub import config
 from hub import repository as repo
 from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict, text_origin_of
 from hub.services import gate_grounds as grounds
-from hub.services import ci_integrity, ci_trust
+from hub.services import ci_integrity, ci_trust, verdict_owner
 from hub.services.ci_report import VALIDATION_PASS
 from hub.services.result_kind import task_automation_not_applicable
 
@@ -57,7 +57,9 @@ log = logging.getLogger(__name__)
 _POLICY_ACTOR = "policy"
 
 
-async def _escalate(db: aiosqlite.Connection, task_id: int, reason: str) -> None:
+async def _escalate(
+    db: aiosqlite.Connection, task_id: int, reason: str, generation: int
+) -> None:
     """A trigger fired: the verdict stays with the human, visibly."""
     await repo.add_task_update(
         db,
@@ -74,6 +76,13 @@ async def _escalate(db: aiosqlite.Connection, task_id: int, reason: str) -> None
         task_id=task_id,
         actor=_POLICY_ACTOR,
         payload={"reason": reason},
+    )
+    # #2052: автопилот сложил решение - владелец записан, а не выведен позже.
+    await verdict_owner.hand_to_human(
+        db,
+        task_id,
+        verdict_owner.reason_of("autopilot_escalated", reason),
+        generation=generation,
     )
     await db.commit()
 
@@ -272,6 +281,8 @@ class AutoStance:
     #: ответ верен «если они пройдут». Пусто там, где решатель.
     pending: tuple[str, ...] = ()
     facts: dict[str, Any] = field(default_factory=dict)
+    #: Поколение сдачи, о котором судила эта стойка (0 - до чтения сдачи).
+    generation: int = 0
 
 
 @dataclass
@@ -302,6 +313,7 @@ def _refuse_with(
         feed_note=note,
         audit_alerts=tuple(ctx.audit) if ctx else (),
         pending=tuple(ctx.pending) if ctx else (),
+        generation=ctx.generation if ctx else 0,
     )
 
 
@@ -312,6 +324,7 @@ def _escalate_with(code: str, reason: str, ctx: _Ctx) -> AutoStance:
         reason,
         audit_alerts=tuple(ctx.audit),
         pending=tuple(ctx.pending),
+        generation=ctx.generation,
     )
 
 
@@ -749,6 +762,7 @@ async def autopilot_stance(
             "proven_usage": ctx.proven_usage,
             "self_reviewed": bool(ctx.review.get("self_reviewed")),
         },
+        generation=ctx.generation,
     )
 
 
@@ -781,7 +795,8 @@ async def _decide(db: aiosqlite.Connection, task_id: int) -> bool:
         )
         await db.commit()
     if stance.outcome == OUTCOME_ESCALATE:
-        await _escalate(db, task_id, stance.reason)
+        # Поколение берётся из самой оценки: запись - ровно о том, что судили.
+        await _escalate(db, task_id, stance.reason, stance.generation)
         return False
     if stance.outcome != OUTCOME_APPROVE:
         if stance.feed_note:
