@@ -68,6 +68,15 @@ async def test_a_new_sha_retried_after_a_lost_answer_opens_one_generation(
         return await real_refuse(*a, **k)
 
     monkeypatch.setattr(finding_outcome, "refuse_conflicting", spy)
+    noops: list[int] = []
+    real_noop = lifecycle._same_sha_noop_response
+
+    async def noop_spy(state):
+        noops.append(state.raced)
+        assert state.task["submission_sha"] == "b" * 40, "снимок обновлён"
+        return await real_noop(state)
+
+    monkeypatch.setattr(lifecycle, "_same_sha_noop_response", noop_spy)
     other = await connect(db_dsn)
     try:
         racer = asyncio.ensure_future(lifecycle.submit_for_review(other, task.id, body))
@@ -81,6 +90,7 @@ async def test_a_new_sha_retried_after_a_lost_answer_opens_one_generation(
         await other.close()
     assert loser.submission_generation == 2, "повтор вернул текущее поколение"
     assert refused == [1], "гонка сверила исходы с записанными"
+    assert noops == [True], "свежее чтение увело проигравшего до гейтов находок"
     await db.commit()
     cur = await db.execute(
         "SELECT COUNT(*), MAX(generation) FROM submissions WHERE task_id=?", (task.id,)
@@ -115,3 +125,52 @@ async def test_a_raced_submit_refuses_conflicting_outcomes_but_not_identical(
     with pytest.raises(HTTPException) as err:
         await finding_outcome.refuse_conflicting(db, 1, 2, [item("deferred")])
     assert err.value.status_code == 409
+
+
+async def test_a_stale_snapshot_is_caught_inside_the_write_transaction(db, monkeypatch):
+    """Снимок устарел и после гейтов: под локом тот же sha уже текущая сдача."""
+    git = _install_git(monkeypatch, X)
+    task = await _running_task(db, "Устарел")
+    body = models.TaskSubmitReview(agent="dev")
+    await lifecycle.submit_for_review(db, task.id, body)
+    stale = dict(await repo.get_task(db, task.id))
+    git.tip = "b" * 40
+    await lifecycle.submit_for_review(db, task.id, body)
+    await db.commit()
+
+    state = lifecycle.SubmitContext(db=db, task_id=task.id, task=stale, body=body)
+    state.submission_sha = "b" * 40
+    with pytest.raises(lifecycle._SameShaRaced):
+        await lifecycle._apply_submission(state)
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM submissions WHERE task_id=?", (task.id,)
+    )
+    assert (await cur.fetchone())[0] == 2, "третьего поколения нет"
+
+
+async def test_the_conflict_check_runs_in_the_transaction_that_applies_outcomes(
+    db, monkeypatch
+):
+    from hub.services import finding_outcome
+
+    _install_git(monkeypatch, X)
+    task = await _running_task(db, "Один лок")
+    body = models.TaskSubmitReview(agent="dev")
+    await lifecycle.submit_for_review(db, task.id, body)
+    await db.commit()
+
+    seen: list[bool] = []
+
+    async def spy(conn, *_a):
+        seen.append(conn.in_transaction)
+
+    monkeypatch.setattr(finding_outcome, "refuse_conflicting", spy)
+    state = lifecycle.SubmitContext(
+        db=db,
+        task_id=task.id,
+        task=dict(await repo.get_task(db, task.id)),
+        body=body,
+    )
+    state.raced = True
+    await lifecycle._same_sha_noop_response(state)
+    assert seen == [True], "сверка и запись исходов - одна транзакция под локом"

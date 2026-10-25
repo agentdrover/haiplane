@@ -2369,9 +2369,16 @@ async def test_a_submit_timeout_says_a_same_sha_retry_is_safe(
     assert lost["reason"] == "transport_timeout"
     assert lost["same_sha_retry_safe"] is True
     assert lost["retry_safe"] is False
-    assert "ТЕМ ЖЕ коммитом безопасен" in lost["message"]
+    assert "ТЕМ ЖЕ expected_sha" in lost["message"]
     assert "текущее поколение" in lost["message"]
     assert "hub_task_status" in lost["message"]
+
+    # Без expected_sha обещания нет: сдача могла лечь с пустым sha.
+    mock_api_post.side_effect = HubApiError(timeout)
+    blind = json.loads(await hub_submit_for_review(42))
+    assert blind["same_sha_retry_safe"] is False
+    assert "безопасен" not in blind["message"].split("Сдача:")[1]
+    assert "hub_task_status" in blind["message"]
 
     # Не транспорт — совет не дописывается.
     mock_api_post.side_effect = HubApiError({"reason": "head_moved", "message": "x"})
