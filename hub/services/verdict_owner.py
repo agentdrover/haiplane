@@ -107,7 +107,7 @@ def _stalled_sql() -> tuple[str, tuple[str, ...]]:
     """
     window = f"-{WATCHDOG_GRACE_MINUTES} minutes"
     sql = (
-        f"{_live_actor_sql()} "
+        f"{_live_actor_sql()} "  # nosec B608 - constant fragments only
         "AND NOT (tasks.verdict_owner='human' "
         "         AND tasks.verdict_owner_generation = tasks.submission_generation) "
         "AND COALESCE(tasks.status_entered_at, tasks.updated_at) "
