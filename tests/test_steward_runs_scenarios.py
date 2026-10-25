@@ -21,6 +21,7 @@ import pytest
 from hub import config
 from hub.db import fetchall
 from hub.services import steward_cap
+from hub.services.verdict_owner import EVENT_CHANGED as EVENT_OWNER
 from hub.services.steward_dispatch import (
     EVENT_DEFERRED,
     EVENT_ORDERED,
@@ -175,7 +176,7 @@ async def _scenario_c_daily_cap(db: aiosqlite.Connection, monkeypatch) -> None:
         expect(
             "(в) одинаковый отказ",
             log.total,
-            events={EVENT_REFUSED: 1, EVENT_ORDERED: 0},
+            events={EVENT_REFUSED: 1, EVENT_ORDERED: 0, EVENT_OWNER: 1},
             notifications=1,
             orders=0,
             provider_calls=0,
@@ -192,7 +193,7 @@ async def _scenario_c_daily_cap(db: aiosqlite.Connection, monkeypatch) -> None:
         expect(
             "(в) смена поколения",
             log.total,
-            events={EVENT_REFUSED: 1},
+            events={EVENT_REFUSED: 1, EVENT_OWNER: 1},
             notifications=1,
             orders=0,
             provider_calls=0,
@@ -231,7 +232,12 @@ async def _scenario_c_daily_cap(db: aiosqlite.Connection, monkeypatch) -> None:
         expect(
             "(в) новые сутки, квота свободна",
             log.total,
-            events={EVENT_REFUSED: 0, EVENT_ORDERED: 1, EVENT_RUN_STARTED: 1},
+            events={
+                EVENT_REFUSED: 0,
+                EVENT_ORDERED: 1,
+                EVENT_RUN_STARTED: 1,
+                EVENT_OWNER: 1,  # заказ снял передачу по потолку
+            },
             notifications=0,
             orders=1,
             provider_calls=1,
