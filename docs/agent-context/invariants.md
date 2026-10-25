@@ -41,6 +41,7 @@ These are the rules most likely to be broken by “small” changes.
   pushed refs (`_resolve_ref_remote_first`): a stale local `develop` in the
   hub clone must not invent a stack or tell the implementer to merge another
   task's unreviewed branch (#1046).
+- Machine-review order after a submit (#2057) leaves the HTTP request: `review_order.order_after_submit` runs `maybe_dispatch_review` in a background task on its own connection (DSN set by the submit route), one per (task, generation); 3 attempts, then an alert naming the loss. Recovery is a same-sha resubmit from review (no-op, #1265), which orders again. MCP `hub_submit_for_review` on a transport timeout says a same-sha retry is safe (`same_sha_retry_safe`); the route stays out of `_IDEMPOTENT_WRITES` because safety holds only for the same sha.
 - Finding routing (#435, #437): `in_scope` findings are closed ONLY via a
   resubmit of the same task on the same branch (`changes_requested` →
   `running` → fix → `hub_submit_for_review`). Never spawn parallel tasks for

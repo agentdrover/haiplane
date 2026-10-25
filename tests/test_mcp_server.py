@@ -2335,6 +2335,103 @@ async def test_submit_answer_names_the_unchanged_generation(
     )
 
 
+async def test_a_submit_timeout_says_a_same_sha_retry_is_safe(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#2057: потерянный ответ сдачи не оставляет агента без совета.
+
+    Транспортный отказ строится НАСТОЯЩИМ _parse_transport_error из настоящего
+    ReadTimeout; безопасность повтора держится на том же sha, а не на маршруте,
+    поэтому generic retry_safe остаётся False. Повтор того же sha из review
+    возвращает текущее поколение без новой сдачи.
+    """
+    import httpx
+
+    from hub import mcp_server as srv
+
+    mock_api_get.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 3,
+    }
+    timeout = srv._parse_transport_error(
+        httpx.ReadTimeout(""),
+        timeout=30.0,
+        write=True,
+        method="POST",
+        path="/api/tasks/42/submit-review",
+    )
+    mock_api_post.side_effect = HubApiError(timeout)
+    sha = "a" * 40
+    lost = json.loads(await hub_submit_for_review(42, expected_sha=sha))
+    assert lost["reason"] == "transport_timeout"
+    assert lost["same_sha_retry_safe"] is True
+    assert lost["retry_safe"] is False
+    assert "ТЕМ ЖЕ коммитом безопасен" in lost["message"]
+    assert "текущее поколение" in lost["message"]
+    assert "hub_task_status" in lost["message"]
+
+    # Не транспорт — совет не дописывается.
+    mock_api_post.side_effect = HubApiError({"reason": "head_moved", "message": "x"})
+    refused = json.loads(await hub_submit_for_review(42, expected_sha=sha))
+    assert "same_sha_retry_safe" not in refused
+
+    # Повтор того же sha: то же поколение, без новой сдачи.
+    mock_api_post.side_effect = None
+    mock_api_post.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 3,
+    }
+    again = json.loads(await hub_submit_for_review(42, expected_sha=sha))
+    assert "already on review" in again["message"]
+    assert "submission #3" in again["message"]
+    assert "no new generation opened" in again["message"]
+
+    # Сервер: медленный заказ ревью не держит ответ сдачи и не множится на
+    # повторе того же поколения.
+    import asyncio
+
+    from hub import repository as repo
+    from hub.services import review_order
+
+    release = asyncio.Event()
+    ordered: list[int] = []
+
+    async def slow_order(_db: Any, task_id: int) -> None:
+        ordered.append(task_id)
+        await release.wait()
+
+    async def fake_task(_db: Any, _task_id: int) -> dict[str, Any]:
+        return {"submission_generation": 3}
+
+    class _Conn:
+        async def close(self) -> None:
+            return None
+
+    async def fake_connect(_dsn: str) -> _Conn:
+        return _Conn()
+
+    with (
+        patch.object(review_order, "DETACH_ENABLED", True),
+        patch.object(review_order, "_dispatch_once", slow_order),
+        patch.object(repo, "get_task", fake_task),
+        patch.object(review_order, "connect", fake_connect),
+    ):
+        token = review_order.detach_dsn.set("file:unused")
+        try:
+            for _ in range(2):
+                await asyncio.wait_for(review_order.order_after_submit(None, 42), 2)
+        finally:
+            review_order.detach_dsn.reset(token)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert ordered == [42], "заказ ушёл фоном, один на поколение"
+        assert review_order.inflight_count() == 1
+        release.set()
+        await review_order.drain()
+
+
 async def test_submit_answer_reads_as_new_when_the_generation_moves(
     mock_api_get: AsyncMock, mock_api_post: AsyncMock
 ) -> None:

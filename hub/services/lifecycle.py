@@ -3979,9 +3979,9 @@ async def _dispatch_cross_model_review(db: aiosqlite.Connection, task_id: int) -
     только в комментарии посреди перехода.
     """
     try:
-        from hub.services.review_dispatch import maybe_dispatch_review
+        from hub.services.review_order import order_after_submit
 
-        await maybe_dispatch_review(db, task_id)
+        await order_after_submit(db, task_id)
     except Exception:  # noqa: BLE001 - dispatch must never break a submit
         log.exception("cross-model review dispatch failed for task #%s", task_id)
 

@@ -1739,6 +1739,31 @@ def _with_known_project(
     return payload
 
 
+_SUBMIT_SAME_SHA_RETRY = (
+    "Сдача: повтор с ТЕМ ЖЕ коммитом безопасен (передай expected_sha=<полный "
+    "sha ветки>): если сдача легла, повтор из review ничего не меняет и "
+    "вернёт текущее поколение — новой записи сдачи и нового поколения не "
+    "будет; если не легла — это обычная сдача. Если ветка или коммиты "
+    "менялись, сначала hub_task_status."
+)
+
+
+def _with_same_sha_retry_note(err: HubApiError) -> HubApiError:
+    """Транспортный отказ сдачи: сказать, когда повтор безопасен (#2057).
+
+    retry_safe остаётся False: безопасность держится на неизменном sha, а не
+    на маршруте, поэтому строки в _IDEMPOTENT_WRITES нет.
+    """
+    payload = err.payload
+    if payload.get("reason") not in ("transport_timeout", "transport_error"):
+        return err
+    noted = dict(payload)
+    noted["same_sha_retry_safe"] = True
+    noted["message"] = f"{payload.get('message', '')} {_SUBMIT_SAME_SHA_RETRY}".strip()
+    noted["hint"] = f"{payload.get('hint', '')} {_SUBMIT_SAME_SHA_RETRY}".strip()
+    return HubApiError(noted)
+
+
 def _format_hub_api_error(err: HubApiError, task: dict[str, Any] | None = None) -> str:
     """Отказ для инструментов, чей УСПЕХ тоже строка.
 
@@ -2735,7 +2760,7 @@ async def hub_submit_for_review(
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:
-        return _format_hub_api_error(exc, prior_task)
+        return _format_hub_api_error(_with_same_sha_retry_note(exc), prior_task)
     generation = task.get("submission_generation", 0)
     # #1265 AC-6: a same-sha retry from review opens no new generation — the
     # prior read (BEFORE this call) and the fresh one (AFTER) share the same

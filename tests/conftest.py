@@ -112,6 +112,18 @@ def _own_database_lock(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _review_order_inline(monkeypatch):
+    """Заказ ревью после сдачи идёт на месте (#2057).
+
+    Фоновый заказ живёт на своём соединении и опаздывает к проверкам сразу
+    после ответа. Фоновый режим проверяет tests/test_review_order_background.py.
+    """
+    from hub.services import review_order
+
+    monkeypatch.setattr(review_order, "DETACH_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
 def _no_random_deep_lot(monkeypatch):
     """Жребий deep (#1403) выключен: тесты профилей не должны зависеть от хеша.
 
