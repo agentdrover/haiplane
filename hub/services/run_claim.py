@@ -381,27 +381,67 @@ async def release_for_rework(db: aiosqlite.Connection, task_id: int) -> bool:
     )
 
 
-async def reopen_if_executor_gone(db: aiosqlite.Connection, task_id: int) -> bool:
-    """changes_requested вернул задачу в running, а исполнителя на связи нет: в open.
+async def _executor_is_gone(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+    """Исполнитель ушёл доказанно, а не потому, что реестр промолчал (#2053).
 
-    Один вопрос «на связи ли исполнитель» для вердикта человека и для судьи -
-    тот же ``pair_executor_online``, что у конвейера доставки. На связи - задача
-    остаётся у него в running (как и было); иначе она никому не нужна в running,
-    и честное состояние - open с снятым захватом: её возьмёт следующий. Без
-    коммита; одно событие. Личность исполнителя (``implementer_principal_id``)
-    остаётся: запрет самоодобрения не должен исчезать оттого, что работа ушла.
+    Все три условия разом, иначе задача остаётся у него: (1) на задаче нет ни
+    идущего прогона хаба, ни открытого слота; (2) адрес захвата назван и сессия
+    молчит дольше порога смерти слота проекта (``slot_dead_minutes``), а не
+    десяти минут присутствия: локальная сессия без heartbeat работает и дольше;
+    (3) за то же окно захватчик ничего не писал в карточку. Запись самого
+    вердикта (автор - ревьюер) признаком жизни не считается.
     """
+    from hub.services import executor_slots, project_policy
     from hub.services.sessions import pair_executor_online
 
+    task_id = int(task["id"])
+    session = (task.get("claim_session_id") or "").strip()
+    if not session:
+        # Присутствие знает только реестр: захват без адреса - «неизвестно».
+        return False
+    if await pair_executor_online(db, task):
+        return False
+    live = await fetchall(
+        db,
+        "SELECT 1 FROM executor_runs WHERE task_id = ? AND outcome = 'running' "
+        "AND cost_wait_since IS NULL "
+        "UNION ALL SELECT 1 FROM executor_slots WHERE task_id = ? "
+        "AND released_at IS NULL",
+        (task_id, task_id),
+    )
+    if live:
+        return False
+    last = await fetchall(
+        db,
+        "SELECT MAX(at) AS at FROM ("
+        "  SELECT MAX(created_at) AS at FROM task_updates "
+        "  WHERE task_id = ? AND agent = ? "
+        "  UNION ALL SELECT last_seen_at FROM agent_sessions WHERE session_id = ?"
+        ")",
+        (task_id, str(task.get("claimed_by") or ""), session),
+    )
+    seen = dict(last[0])["at"] if last else None
+    if not seen:
+        return True
+    policy = await project_policy.gate_policy_for_task(db, task_id)
+    silence = await executor_slots._silence_minutes(db, str(seen))
+    return silence >= executor_slots.dead_minutes_of(policy)
+
+
+async def reopen_if_executor_gone(db: aiosqlite.Connection, task_id: int) -> bool:
+    """changes_requested вернул задачу в running, а исполнитель ушёл: в open.
+
+    Один вопрос для вердикта человека и судьи (``_executor_is_gone``). Ушёл -
+    задача открыта с снятым захватом, её возьмёт следующий; иначе остаётся у
+    исполнителя в running (как и было). Без коммита; одно событие. Личность
+    исполнителя (``implementer_principal_id``) остаётся: запрет самоодобрения не
+    должен исчезать оттого, что работа ушла.
+    """
     found = await repo.get_task(db, int(task_id))
     if found is None:
         return False
     task = dict(found)
-    if not (task.get("claim_session_id") or "").strip():
-        # Присутствие знает только реестр сессий: захват без адреса (ручной,
-        # токен окружения) - «неизвестно», а не «ушёл»; такая задача не меняется.
-        return False
-    if await pair_executor_online(db, task):
+    if not await _executor_is_gone(db, task):
         return False
     if not await repo.transition_status_if(
         db, int(task_id), expected_from="running", new_status="open"
@@ -427,7 +467,7 @@ async def reopen_if_executor_gone(db: aiosqlite.Connection, task_id: int) -> boo
         int(task_id),
         "hub",
         "status",
-        "Вердикт «на доработку» пришёл, а исполнителя на связи нет: захват снят, "
+        "Вердикт «на доработку» пришёл, а исполнитель ушёл: захват снят, "
         "задача открыта для следующего.",
     )
     await repo.insert_event(

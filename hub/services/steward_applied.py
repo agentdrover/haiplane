@@ -50,7 +50,7 @@ from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.services import verdict_owner, watch_notices
-from hub.services.finding_identity import finding_uids
+from hub.db import fetchall, write_transaction
 from hub.services.refusal_reason import CodedRefusal
 from hub.models import ReviewFinding, ReviewSeverity, ReviewVerdict, TaskReviewVerdict
 from hub.services.result_kind import (
@@ -221,7 +221,7 @@ async def apply_judgement(
 
     cycles = int(task.get("review_cycle") or 0)
     if review_budget_exhausted(cycles):
-        await _hand_to_the_human(db, task_id, cycles)
+        await _hand_to_the_human(db, task_id, cycles, generation, claim)
         return ESCALATED_TO_HUMAN, (
             f"бюджет циклов исчерпан ({cycles}) — решение за человеком"
         )
@@ -250,10 +250,10 @@ def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
     """Находки судьи в виде находок вердикта: автор получает их списком, а не текстом.
 
     Судья пишет находки свободными словарями; вердикт хранит ``ReviewFinding``.
-    ``finding_uid`` (свой или выведенный из содержимого тем же правилом, что у
-    машинного отчёта) стоит в начале сообщения: по нему автор отвечает
-    ``finding_outcomes``. Невнятная находка не теряется - её сообщением
-    становится сам словарь.
+    ``finding_uid`` стоит в сообщении только если судья принёс свой (находка
+    машинного отчёта, которую он переписал): ответ ``finding_outcomes`` хранится
+    за строкой отчёта, и uid, выведенный здесь, остался бы «неизвестным».
+    Невнятная находка не теряется - её сообщением становится сам словарь.
     """
     try:
         raw = json.loads(judgement.get("findings") or "[]")
@@ -261,7 +261,7 @@ def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
         raw = []
     entries = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
     out: list[ReviewFinding] = []
-    for number, (entry, uid) in enumerate(zip(entries, finding_uids(entries)), 1):
+    for number, entry in enumerate(entries, 1):
         text = next(
             (
                 str(entry[key]).strip()
@@ -271,6 +271,7 @@ def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
             json.dumps(entry, ensure_ascii=False),
         )
         line = entry.get("line")
+        uid = str(entry.get("finding_uid") or "").strip()
         out.append(
             ReviewFinding(
                 id=number,
@@ -278,7 +279,7 @@ def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
                     str(entry.get("severity") or "").strip().lower(),
                     ReviewSeverity.medium,
                 ),
-                message=f"[uid {entry.get('finding_uid') or uid}] {text}"[:2000],
+                message=(f"[uid {uid}] {text}" if uid else text)[:2000],
                 file=str(entry.get("file") or "")[:500],
                 line=line if isinstance(line, int) and line >= 1 else None,
                 recommendation=str(entry.get("recommendation") or "")[:2000],
@@ -372,8 +373,46 @@ async def _record(
     )
 
 
+async def _fence(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    claim: tuple[int, str] | None,
+) -> None:
+    """Эскалация по бюджету пишет только на ту сдачу, о которой судили (#2053).
+
+    Внутри её транзакции: пересдача (другое поколение), вердикт, уже стоящий на
+    этой сдаче, потерянная метка применения или отозванное право стюарда отменяют
+    решение целиком - как в записи вердикта.
+    """
+    task = dict(await repo.get_task(db, task_id) or {})
+    _refuse_if_the_submission_moved(task, generation)
+    _refuse_if_the_verdict_is_taken(task, generation)
+    if claim is None:
+        return
+    held = await fetchall(
+        db,
+        "SELECT 1 FROM steward_judgements WHERE id=? AND advisor_outcome='applying' "
+        "AND advisor_claimed_at=?",
+        (claim[0], claim[1]),
+    )
+    if not held:
+        raise CodedRefusal(
+            409, "метка применения потеряна - эскалация не записана", code="claim_lost"
+        )
+    from hub.services.steward_apply import authority_refusal
+
+    revoked = await authority_refusal(db, task_id)
+    if revoked:
+        raise CodedRefusal(422, f"{revoked[0]}: {revoked[1]}", code=revoked[0])
+
+
 async def _hand_to_the_human(
-    db: aiosqlite.Connection, task_id: int, cycles: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    cycles: int,
+    generation: int,
+    claim: tuple[int, str] | None = None,
 ) -> None:
     """Бюджет исчерпан: существующий переход в needs_decision, без арбитра.
 
@@ -381,6 +420,14 @@ async def _hand_to_the_human(
     маршруте и требует job. Заводить его сюда значило бы построить второй
     арбитраж ради одного случая; человек здесь и есть арбитр.
     """
+    async with write_transaction(db):
+        await _fence(db, task_id, generation, claim)
+        await _escalate_in_transaction(db, task_id, cycles)
+
+
+async def _escalate_in_transaction(
+    db: aiosqlite.Connection, task_id: int, cycles: int
+) -> None:
     from hub.services.orchestration import log_activity
 
     moved = await repo.transition_status_if(
