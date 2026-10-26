@@ -73,7 +73,7 @@ def classify(task: Row, by_id: Mapping[int, Row]) -> dict[str, Any]:
     else:
         state = "invalid_owner" if reason else "covered"
     view = OutcomeOwnershipView(
-        state=state,  # type: ignore[arg-type]
+        state=state,
         owner_task_id=int(owner_id) if owner_id is not None else None,
         reason=reason,
         suggested_owner_task_id=suggested,
