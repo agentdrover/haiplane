@@ -4285,18 +4285,16 @@ async def hub_outcome_debt(
     only_counts: bool = False,
     view: Literal["all", "actionable"] = "all",
 ) -> CallToolResult:
-    """Outcome promises and the answers to them (#766, #819).
+    """Outcome promises and their answers (#766, #819).
 
-    Completed tasks whose stated outcome nobody answered, plus answered ones
-    with the last verdict. Record an answer with hub_answer_outcome. Due =
-    first deploy of the fix + 14 days (#1568); due_assumed = counted from the
-    merge (#1572); outcome_deadline stays free text.
+    Completed tasks whose outcome nobody answered, plus answered ones with the
+    last verdict (hub_answer_outcome). Due = first deploy of the fix + 14 days
+    (#1568); due_assumed = counted from the merge (#1572).
 
-    Returns counters plus ONE page (#1605): status overdue by default, limit
-    1-200, offset to page on; only_counts drops the rows. Not the full list.
-    view=actionable (#2090): minus promises an explicit valid owner holds
-    (hub_set_outcome_owner); covered/invalid_owner are extra statuses.
-    Coverage is not an answer; zero actionable debt is not "all answered".
+    ONE page plus counters (#1605): status overdue by default, limit 1-200,
+    offset; only_counts drops rows. view=actionable (#2090): minus promises a
+    valid owner holds (hub_set_outcome_owner); adds statuses covered,
+    invalid_owner. Coverage is no answer.
     """
     params: dict[str, Any] = {"status": status, "limit": limit, "offset": offset}
     if view != "all":
@@ -4318,11 +4316,10 @@ async def hub_outcome_debt(
 async def hub_set_outcome_owner(
     task_id: int, owner_task_id: int | None
 ) -> CallToolResult:
-    """Say which ancestor holds this task's outcome promise (#2090).
+    """Name the ancestor holding this task's outcome promise (#2090).
 
-    Takes the task out of view=actionable debt while the link holds: the owner
-    must be an ancestor, completed, not archived, and state a metric. It is not
-    an answer. owner_task_id=None takes the promise back.
+    While valid, the task leaves view=actionable debt. Not an answer; None
+    takes it back.
     """
     try:
         result = await _api_post(
@@ -4346,19 +4343,17 @@ async def hub_answer_outcome(
     measured_value: str,
     note: str = "",
 ) -> CallToolResult:
-    """Record one check of a completed task's stated outcome (#819).
+    """Record one check of a completed task's outcome (#819).
 
-    A check is not a success: not_moved and unmeasurable are filed exactly like
-    moved. The verdict is your declaration, auditable rather than provable -
-    answered_by comes from your identity, not from an argument. Checks are
-    appended, so a task can be answered at several moments.
+    A check is not a success: not_moved and unmeasurable are filed like moved.
+    The verdict is your declaration; answered_by is your identity. Checks are
+    appended.
 
     Args:
         task_id: Completed task whose outcome_metric is being answered.
         verdict: moved | not_moved | unmeasurable.
         measured_value: What was observed - the number and where it was read.
-            Required: an answer without one is an opinion.
-        note: Optional context, caveats, or what to do next.
+        note: Optional context.
     """
     try:
         result = await _api_post(
