@@ -600,7 +600,7 @@ async def generation_delta(
     than the report claims.
 
     #1249 adds a fourth fact, about AUTHORSHIP: ``prev..current`` also carries what
-    the author pulled in by merging the base branch.
+    the author pulled in by merging the base branch (#1172).
     The author's own commits decide what the command narrows to and what the
     profile is bought for; the files that came with the base are named beside
     them, not dropped (#1238: a defect can exist only where two branches meet).
