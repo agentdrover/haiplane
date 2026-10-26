@@ -22,6 +22,7 @@ import json
 from typing import Any
 
 import aiosqlite
+from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.models import (
@@ -192,6 +193,52 @@ async def items_still_to_plan(
         for item in items
         if not (item.finding_uid in answered and item.finding_uid not in open_uids)
     ]
+
+
+async def refuse_conflicting(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    items: list[FindingOutcomeItem],
+) -> None:
+    """409, если параллельная сдача уже ответила на uid ИНАЧЕ (#2057).
+
+    Для гонки двух сдач одного sha: идентичный ответ - повтор (молчаливый
+    пропуск, #1265), другой исход - потерянное решение автора, а его
+    follow-up (deferred) никто бы не завёл. Обычный повтор того же sha вне
+    гонки ведёт себя как прежде.
+    """
+
+    def answer(outcome: Any, note: Any, linked: Any) -> tuple[str, str, int | None]:
+        return (
+            str(getattr(outcome, "value", outcome)),
+            str(note or "").strip(),
+            int(linked) if linked else None,
+        )
+
+    stored: dict[str, tuple[str, str, int | None]] = {}
+    for report in await reports_owed_an_answer(db, task_id, generation):
+        for row in await repo.list_finding_outcomes(db, int(dict(report)["id"])):
+            found = dict(row)
+            stored[str(found["finding_uid"])] = answer(
+                found["outcome"], found.get("note"), found.get("linked_task_id")
+            )
+    clashes = [
+        f"{item.finding_uid}: записано {stored[item.finding_uid]}, прислано "
+        f"{answer(item.outcome, item.note, item.linked_task_id)} "
+        "(исход, заметка, связанная задача)"
+        for item in items
+        if item.finding_uid in stored
+        and stored[item.finding_uid]
+        != answer(item.outcome, item.note, item.linked_task_id)
+    ]
+    if clashes:
+        raise HTTPException(
+            409,
+            "Параллельная сдача этого же коммита уже ответила на находки иначе: "
+            + "; ".join(clashes)
+            + ". Прочитай hub_task_status и пересдай исходы осознанно.",
+        )
 
 
 def plan_outcomes(
