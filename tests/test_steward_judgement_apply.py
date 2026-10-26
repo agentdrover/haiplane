@@ -558,3 +558,74 @@ def test_folded_findings_keep_file_line_and_mark_truncation():
     small = judge_findings({"findings": json.dumps(raw[:51])})
     assert "не показано" not in small[-1].message
     assert "hub/f51.py:51 " in small[-1].message
+
+
+async def _alerts_of(db, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "Применение советника прервано" in dict(u)["content"]
+    ]
+
+
+async def test_a_claim_left_after_the_verdict_was_written_closes_as_returned(
+    db, monkeypatch
+):
+    """(a) Вердикт уже записан, метка осталась: returned, без тревоги и без «причины»."""
+    from hub.services import steward_advisor
+
+    task_id = await _scene(db, monkeypatch, "jcr-written")
+    await _online(db, task_id)
+    assert await apply_judge_changes_requests(db) == 1
+    await _stick(db, task_id)  # исход так и не записался
+
+    await steward_advisor._escalate_interrupted(db)
+
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "returned"
+    assert await _alerts_of(db, task_id) == []
+    assert (await _verdict(db, task_id))["task"]["review_cycle"] == 1
+
+
+async def test_a_retry_that_wrote_the_verdict_and_died_is_not_called_unapplied(
+    db, monkeypatch
+):
+    """(b) Первый обрыв до записи, повтор записал вердикт и умер: не «не применено»."""
+    from hub.services import steward_advisor
+
+    task_id = await _scene(db, monkeypatch, "jcr-written2")
+    await _online(db, task_id)
+    await _stick(db, task_id)
+    await steward_advisor._escalate_interrupted(db)
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert not row["advisor_outcome_detail"], "счётчик не светится как причина отказа"
+    assert await apply_judge_changes_requests(db) == 1
+    await _stick(db, task_id)
+
+    await steward_advisor._escalate_interrupted(db)
+
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "returned"
+    assert await _alerts_of(db, task_id) == []
+
+
+def test_folded_findings_that_fit_exactly_are_all_shown():
+    from hub.services.steward_applied import _fit_folded
+
+    head = "h" * 50
+    room = 2000 - len(head)
+    first = "a" * ((room - 3) // 2)
+    second = "b" * (room - 3 - len(first))
+    got = _fit_folded(head, [first, second])
+    assert got == first + " | " + second and len(head + got) == 2000
+
+
+def test_a_long_folded_finding_does_not_hide_the_short_ones_after_it():
+    from hub.services.steward_applied import _fit_folded
+
+    head = "h" * 50
+    parts = ["hub/a.py:1 коротко", "hub/b.py:2 " + "я" * 3000, "hub/c.py:3 хвост"]
+    got = _fit_folded(head, parts)
+    assert len(head + got) <= 2000
+    assert "hub/a.py:1" in got and "hub/b.py:2" in got and "hub/c.py:3 хвост" in got
+    assert "не показано" not in got or got.endswith("не показано")

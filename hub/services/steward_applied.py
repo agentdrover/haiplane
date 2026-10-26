@@ -288,22 +288,35 @@ def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
 
 
 def _fit_folded(head: str, parts: list[str]) -> str:
-    """Склеить свёрнутые находки до 2000 знаков; не влезшее - счётом, не молча."""
+    """Склеить свёрнутые находки до 2000 знаков; не влезшее - счётом, не молча.
+
+    Сперва всё без пометки; не влезло - берём сколько помещается вместе с
+    пометкой, слишком длинную находку обрезаем до начала (file:line впереди),
+    а не обрываем на ней список.
+    """
     sep, limit = " | ", 2000 - len(head)
+    whole = sep.join(parts)
+    if len(whole) <= limit:
+        return whole
     shown: list[str] = []
     used = 0
     for index, part in enumerate(parts):
         left = len(parts) - index
-        cost = len(part) + (len(sep) if shown else 0)
-        # место под пометку берём заранее: она нужна, если остаток не влезет
-        reserve = len(f" … ещё {left} не показано") if left > 1 else 0
-        if used + cost + reserve > limit:
-            break
-        shown.append(part)
-        used += cost
-    if len(shown) == len(parts):
+        # пометка считается по худшему случаю: все оставшиеся не показаны
+        room = limit - used - len(f" … ещё {left} не показано")
+        cost = len(sep) if shown else 0
+        piece = part if len(part) <= room - cost else part[:_SHORT_HEAD] + "…"
+        if len(piece) <= room - cost:
+            shown.append(piece)
+            used += cost + len(piece)
+    omitted = len(parts) - len(shown)
+    if not omitted and len(sep.join(shown)) <= limit:
         return sep.join(shown)
-    return sep.join(shown) + f" … ещё {len(parts) - len(shown)} не показано"
+    return sep.join(shown) + f" … ещё {omitted} не показано"
+
+
+#: Начало слишком длинной находки (file:line впереди), когда целиком не влезает.
+_SHORT_HEAD = 160
 
 
 #: Сколько находок вмещает вердикт (``TaskReviewVerdict.findings``).

@@ -808,8 +808,57 @@ async def _stamp_now(db: aiosqlite.Connection) -> str:
     return str(dict(rows[0])["at"])
 
 
-#: Метка «возврат уже повторяли»: второй обрыв уходит к человеку (#2053).
-_CR_RETRY_MARK = "cr_retry_1"
+#: Событие «возврат по CR повторяли»: второй обрыв уходит к человеку (#2053).
+#: Счётчик в событии, а не в advisor_outcome_detail: тот показывается как причина отказа.
+_CR_RETRY_EVENT = "steward_cr_retry"
+
+
+async def _recover_interrupted_changes(
+    db: aiosqlite.Connection, item: dict[str, Any]
+) -> int | None:
+    """Оборванный возврат по CR: сперва смотрим, не записан ли вердикт уже.
+
+    Стоит вердикт этого поколения и задача ушла из review - возврат состоялся,
+    метка просто не снята: исход ``returned``, без тревоги. Иначе один повтор
+    (метка снимается, проход применит заново), а при втором обрыве - ``None``,
+    то есть к человеку общим путём. Возвращает число сдвинутых строк или None.
+    """
+    task_id, generation = int(item["task_id"]), int(item["generation"])
+    task = dict(await repo.get_task(db, task_id) or {})
+    if (
+        task.get("review_verdict") == "changes_requested"
+        and task.get("review_verdict_generation") == generation
+        and task.get("status") != "review"
+    ):
+        closed = await db.execute(
+            "UPDATE steward_judgements SET advisor_outcome='returned' "
+            "WHERE id=? AND advisor_outcome=?",
+            (item["id"], _OUTCOME_CLAIMED),
+        )
+        return int(closed.rowcount == 1)
+    retried = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE kind=? AND task_id=? "
+        "AND json_extract(payload, '$.judgement_id')=?",
+        (_CR_RETRY_EVENT, task_id, item["id"]),
+    )
+    if retried:
+        return None
+    released = await db.execute(
+        "UPDATE steward_judgements SET advisor_outcome='', advisor_claimed_at='' "
+        "WHERE id=? AND advisor_outcome=?",
+        (item["id"], _OUTCOME_CLAIMED),
+    )
+    if released.rowcount != 1:
+        return 0
+    await repo.insert_event(
+        db,
+        kind=_CR_RETRY_EVENT,
+        task_id=task_id,
+        actor="hub",
+        payload={"judgement_id": item["id"], "generation": generation},
+    )
+    return 1
 
 
 async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
@@ -824,7 +873,7 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     """
     rows = await fetchall(
         db,
-        "SELECT id, task_id, generation, verdict, advisor_outcome_detail "
+        "SELECT id, task_id, generation, verdict "
         "FROM steward_judgements "
         "WHERE kind='verdict' AND advisor_outcome=? "
         "AND advisor_claimed_at <= datetime('now', ?)",
@@ -834,18 +883,11 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     for row in rows:
         item = dict(row)
         is_changes = item["verdict"] == "changes_requested"
-        if is_changes and item["advisor_outcome_detail"] != _CR_RETRY_MARK:
-            # #2053: возврат автору обратим и ограждён поколением, повтор
-            # безопасен: метку снимаем один раз, проход применит заново.
-            released = await db.execute(
-                "UPDATE steward_judgements SET advisor_outcome='', "
-                "advisor_claimed_at='', advisor_outcome_detail=? "
-                "WHERE id=? AND advisor_outcome=?",
-                (_CR_RETRY_MARK, item["id"], _OUTCOME_CLAIMED),
-            )
-            if released.rowcount == 1:
-                moved += 1
-            continue
+        if is_changes:
+            handled = await _recover_interrupted_changes(db, item)
+            if handled is not None:
+                moved += handled
+                continue
         cursor = await db.execute(
             "UPDATE steward_judgements SET advisor_outcome=? "
             "WHERE id=? AND advisor_outcome=?",
