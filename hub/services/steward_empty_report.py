@@ -110,10 +110,33 @@ def refusal_of(
     )
 
 
-def _double_clean_stands(task_id: int) -> bool:
+def _double_clean_early(task_id: int) -> bool:
+    """Ранняя проверка приняла исключение двойной чистоты: годится только до записи."""
     from hub.services.steward_apply import double_clean_early
 
     return double_clean_early(task_id)
+
+
+async def _ceiling_gate_owns_it(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Решение о пустоте уже за потолком, прочитанным в ЭТОЙ транзакции.
+
+    Ранний флаг двойной чистоты устаревает: потолок могли снять после ранней
+    проверки. Поэтому исключение даёт только сам потолок: он либо подтвердил
+    двойную чистоту (её правило о пустоте), либо отказал - и тогда запись и так
+    не состоится с его, более точной причиной (``_automation_ci_gate`` зовёт его
+    следом). Чистое чтение, сети нет.
+    """
+    from hub.services.steward_apply import (
+        STEWARD_CEILING_KEY,
+        applied_double_clean,
+        ceiling_gate,
+    )
+
+    try:
+        refusal = await ceiling_gate(db, task_id, STEWARD_CEILING_KEY)
+    except Exception:  # noqa: BLE001 - не смогли проверить: исключения нет
+        return False
+    return refusal is not None or applied_double_clean(task_id) is not None
 
 
 async def _prove(
@@ -151,7 +174,7 @@ async def early_refusal(
 ) -> tuple[str, str] | None:
     """Ранняя проверка: пустой отчёт без доказанной работы. Сеть допустима - до транзакции."""
     scene = await _scene(db, task_id, generation)
-    if scene is None or _double_clean_stands(task_id):
+    if scene is None or _double_clean_early(task_id):
         return None
     task, review = scene
     proof = await _prove(db, task_id, generation, review)
@@ -178,7 +201,7 @@ async def write_refusal(
     проверки, доказательства не имеет.
     """
     scene = await _scene(db, task_id, generation)
-    if scene is None or _double_clean_stands(task_id):
+    if scene is None or await _ceiling_gate_owns_it(db, task_id):
         return None
     task, review = scene
     proof = (_PROOFS.get() or {}).get(task_id)
