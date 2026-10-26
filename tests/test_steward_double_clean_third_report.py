@@ -31,7 +31,7 @@ _THIRD = {
     "self_reviewed": ({"self_reviewed": True}, "self_reviewed:"),
     "unknown_principal": ({"principal": None}, "identity:"),
     "carried": ({"carried_from": 1}, "carried:"),
-    "no_evidence": ({"evidence": False}, "no_data:"),
+    "no_evidence": ({"evidence": False}, "no_data"),
 }
 
 

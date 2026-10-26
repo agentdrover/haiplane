@@ -165,6 +165,16 @@ def _unclean(row: dict[str, Any]) -> list[tuple[str, str]]:
                 "исполнения не видно (#750)",
             )
         )
+    if (row.get("raw_count") or 0) < 1 and report_has_evidence(row):
+        # #2082: заявленное исполнение (число агентов) не заменяет биллинг;
+        # пару составляют отчёты, в которых ревьюер показал кандидатов.
+        out.append(
+            (
+                "no_data",
+                "отчёт без кандидатов: исполнение заявлено, но не доказано "
+                "биллингом провайдера - пару такой отчёт не составляет",
+            )
+        )
     if row.get("principal_id") is None:
         out.append(("identity", "принципал отчёта неизвестен"))
     if row.get("self_reviewed") != 0:

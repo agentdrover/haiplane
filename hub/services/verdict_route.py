@@ -167,6 +167,29 @@ async def _failed_application(
     return str(judgement.get("advisor_outcome_detail") or "причина не записана")
 
 
+async def _empty_report_route(
+    db: aiosqlite.Connection, task: dict[str, Any], mode: str
+) -> tuple[VerdictRoute | None, str]:
+    """(запрет, условие) по отчёту без кандидатов: тот же предикат, без сети (#2082)."""
+    from hub.services import steward_empty_report
+
+    reading = await steward_empty_report.stored_reading(
+        db, int(task["id"]), int(task.get("submission_generation") or 0)
+    )
+    if reading is None:
+        return None, ""
+    decision, row = reading
+    if decision.code:
+        refusal = steward_empty_report.refusal_of(decision, row)
+        return _human(decision.code, refusal[1] if refusal else "", mode), ""
+    if decision.pending:
+        return None, (
+            "; отчёт без кандидатов применится, только если биллинг "
+            "провайдера докажет работу ревьюера (сеть, при показе не проверялся)"
+        )
+    return None, ""
+
+
 async def _steward_route(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -253,6 +276,10 @@ async def _steward_route(
             "; класс по диффу не выше потолка проекта (steward_approve_max_class; "
             "дифф при показе не читался)"
         )
+    # #2082: пустой отчёт - запрет или условие, в каждом режиме.
+    empty_route, empty_condition = await _empty_report_route(db, task, mode)
+    if empty_route is not None:
+        return empty_route
     handoff = await steward_cap.cap_handoff(db, int(task["id"]), generation)
     if handoff is not None:
         # #1915: одно условие с диспетчером, заказом советника и применением.
@@ -272,7 +299,10 @@ async def _steward_route(
         CODE_STEWARD_ACT,
         f"автопилот не вынесет ({stance.reason}); судит стюард",
         "если суждение — approve, советник-критик согласен на том же пакете и "
-        "привратник применения не возражает" + ceiling_condition + "; иначе "
+        "привратник применения не возражает"
+        + ceiling_condition
+        + empty_condition
+        + "; иначе "
         "вердикт остаётся человеку",
     )
 

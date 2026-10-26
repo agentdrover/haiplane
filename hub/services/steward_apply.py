@@ -329,10 +329,13 @@ async def read_ceiling(
 @asynccontextmanager
 async def ceiling_scope() -> AsyncIterator[None]:
     """Одно применение стюарда: факт ранней проверки не переживает его."""
+    from hub.services.steward_empty_report import proof_scope
+
     token = _EARLY_RISK.set({})
     clean_token = _CLEAN.set({})
     try:
-        yield
+        async with proof_scope():
+            yield
     finally:
         _CLEAN.reset(clean_token)
         _EARLY_RISK.reset(token)
@@ -1077,9 +1080,12 @@ async def write_refusal(
     чтение базы, сети нет.
     """
     from hub.services.steward_advisor import cap_refusal
+    from hub.services.steward_empty_report import write_refusal as empty_refusal
 
-    return await authority_refusal(db, task_id) or await cap_refusal(
-        db, task_id, generation
+    return (
+        await authority_refusal(db, task_id)
+        or await cap_refusal(db, task_id, generation)
+        or await empty_refusal(db, task_id, generation)  # #2082: без сети
     )
 
 
@@ -1157,6 +1163,12 @@ async def apply_refusals(
     out.extend(precondition_refusals(packet))
     async with ceiling_check_guard():
         out.extend(await ceiling_refusals(db, task_id, packet, statement))
+    # #2082: после потолка - он решает, действует ли двойная чистота.
+    from hub.services.steward_empty_report import early_refusal
+
+    empty = await early_refusal(db, task_id, packet.generation)
+    if empty:
+        out.append(empty)
     self_authored = await self_authored_refusal(db, task_id)
     if self_authored:
         out.append(self_authored)
