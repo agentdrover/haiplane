@@ -731,3 +731,27 @@ async def test_a_claim_of_a_stale_generation_without_a_verdict_closes_superseded
     assert row["advisor_outcome"] == "skipped"
     assert await _alerts_of(db, task_id) == []
     assert not await fetchall(db, "SELECT 1 FROM events WHERE kind='steward_cr_retry'")
+
+
+async def test_a_human_changes_request_that_won_the_race_is_not_a_failure(
+    db, monkeypatch
+):
+    """#2054, B-2: человек успел с changes_requested - skipped, без тревоги «решает человек»."""
+    from hub.services import steward_applied
+
+    task_id = await _scene(db, monkeypatch, "jcr-race")
+    await _online(db, task_id)
+    real_record = steward_applied._record
+
+    async def human_first(*args, **kwargs):
+        await _human_cr(db, task_id)
+        return await real_record(*args, **kwargs)
+
+    monkeypatch.setattr(steward_applied, "_record", human_first)
+    await apply_judge_changes_requests(db)
+
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "skipped", row
+    feed = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert not [c for c in feed if "не применён" in c or "Решает человек" in c], feed
+    assert await apply_judge_changes_requests(db) == 0  # и не повторяется
