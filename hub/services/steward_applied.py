@@ -270,16 +270,40 @@ def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
         findings[_VERDICT_FINDINGS_MAX - 1 :],
     )
     head = f"Ещё {len(rest)} находок судьи (не уместились в список): "
-    body = " | ".join(f.message.replace("\n", " ") for f in rest)
+    parts = [
+        (f"{f.file}:{f.line} " if f.file and f.line else f"{f.file} " if f.file else "")
+        + f.message.replace("\n", " ")
+        for f in rest
+    ]
+    body = _fit_folded(head, parts)
     top = min((f.severity for f in rest), key=_SEVERITY_ORDER.index)
     keep.append(
         ReviewFinding(
             id=_VERDICT_FINDINGS_MAX,
             severity=top,
-            message=(head + body)[:2000],
+            message=head + body,
         )
     )
     return keep
+
+
+def _fit_folded(head: str, parts: list[str]) -> str:
+    """Склеить свёрнутые находки до 2000 знаков; не влезшее - счётом, не молча."""
+    sep, limit = " | ", 2000 - len(head)
+    shown: list[str] = []
+    used = 0
+    for index, part in enumerate(parts):
+        left = len(parts) - index
+        cost = len(part) + (len(sep) if shown else 0)
+        # место под пометку берём заранее: она нужна, если остаток не влезет
+        reserve = len(f" … ещё {left} не показано") if left > 1 else 0
+        if used + cost + reserve > limit:
+            break
+        shown.append(part)
+        used += cost
+    if len(shown) == len(parts):
+        return sep.join(shown)
+    return sep.join(shown) + f" … ещё {len(parts) - len(shown)} не показано"
 
 
 #: Сколько находок вмещает вердикт (``TaskReviewVerdict.findings``).

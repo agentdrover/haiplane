@@ -808,6 +808,10 @@ async def _stamp_now(db: aiosqlite.Connection) -> str:
     return str(dict(rows[0])["at"])
 
 
+#: Метка «возврат уже повторяли»: второй обрыв уходит к человеку (#2053).
+_CR_RETRY_MARK = "cr_retry_1"
+
+
 async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     """Применение, занявшее метку и не записавшее исхода, — к человеку, вслух.
 
@@ -820,7 +824,8 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     """
     rows = await fetchall(
         db,
-        "SELECT id, task_id, generation FROM steward_judgements "
+        "SELECT id, task_id, generation, verdict, advisor_outcome_detail "
+        "FROM steward_judgements "
         "WHERE kind='verdict' AND advisor_outcome=? "
         "AND advisor_claimed_at <= datetime('now', ?)",
         (_OUTCOME_CLAIMED, f"-{config.STEWARD_ADVISOR_WAIT_MAX} minutes"),
@@ -828,6 +833,19 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     moved = 0
     for row in rows:
         item = dict(row)
+        is_changes = item["verdict"] == "changes_requested"
+        if is_changes and item["advisor_outcome_detail"] != _CR_RETRY_MARK:
+            # #2053: возврат автору обратим и ограждён поколением, повтор
+            # безопасен: метку снимаем один раз, проход применит заново.
+            released = await db.execute(
+                "UPDATE steward_judgements SET advisor_outcome='', "
+                "advisor_claimed_at='', advisor_outcome_detail=? "
+                "WHERE id=? AND advisor_outcome=?",
+                (_CR_RETRY_MARK, item["id"], _OUTCOME_CLAIMED),
+            )
+            if released.rowcount == 1:
+                moved += 1
+            continue
         cursor = await db.execute(
             "UPDATE steward_judgements SET advisor_outcome=? "
             "WHERE id=? AND advisor_outcome=?",
@@ -835,12 +853,18 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
         )
         if cursor.rowcount != 1:
             continue
+        what = (
+            "возврат на доработку по changes_requested судьи (повторное "
+            "применение тоже прервано)"
+            if is_changes
+            else "approve судьи"
+        )
         await repo.add_task_update(
             db,
             int(item["task_id"]),
             "hub",
             "alert",
-            "Применение советника прервано, решение за человеком: approve судьи "
+            f"Применение советника прервано, решение за человеком: {what} "
             f"сдачи {item['generation']} занял метку применения и не записал "
             "исхода (хаб перезапущен или упал между шагами). Повторно оно не "
             "применяется.",

@@ -486,3 +486,75 @@ async def test_a_changes_request_with_100_findings_is_applied(db, monkeypatch):
 
     got = await _verdict(db, task_id)
     assert got["task"]["status"] == "running" and len(got["findings"]) == 50
+
+
+async def _stick(db, task_id: int) -> None:
+    await db.execute(
+        "UPDATE steward_judgements SET advisor_outcome='applying', "
+        "advisor_claimed_at=datetime('now', '-61 minutes') "
+        "WHERE task_id=? AND kind='verdict'",
+        (task_id,),
+    )
+    await db.commit()
+
+
+async def test_an_interrupted_changes_request_claim_is_reapplied_once(db, monkeypatch):
+    """#2053: обрыв применения CR не уходит как approve - сдача возвращается автору."""
+    from hub.services import steward_advisor
+
+    task_id = await _scene(db, monkeypatch, "jcr-interrupt")
+    await _online(db, task_id)
+    await _stick(db, task_id)
+    assert await apply_judge_changes_requests(db) == 0, "метка занята"
+
+    await steward_advisor._escalate_interrupted(db)
+    assert await apply_judge_changes_requests(db) == 1
+
+    got = await _verdict(db, task_id)
+    assert got["task"]["status"] == "running" and got["task"]["review_cycle"] == 1
+    assert len(got["findings"]) == 2
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "returned"
+    assert await apply_judge_changes_requests(db) == 0
+
+
+async def test_a_twice_interrupted_changes_request_goes_to_the_human(db, monkeypatch):
+    from hub.services import steward_advisor
+
+    task_id = await _scene(db, monkeypatch, "jcr-interrupt2")
+    await _online(db, task_id)
+    await _stick(db, task_id)
+    await steward_advisor._escalate_interrupted(db)
+    await _stick(db, task_id)  # повтор тоже оборвался
+
+    await steward_advisor._escalate_interrupted(db)
+
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "escalated"
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "Применение советника прервано" in dict(u)["content"]
+    ]
+    assert len(alerts) == 1 and "возврат на доработку" in alerts[0]
+    assert "approve судьи" not in alerts[0]
+
+
+def test_folded_findings_keep_file_line_and_mark_truncation():
+    from hub.services.steward_applied import judge_findings
+
+    raw = [
+        {"title": f"дефект {n} " + "я" * 60, "file": f"hub/f{n}.py", "line": n}
+        for n in range(1, 101)
+    ]
+    got = judge_findings({"findings": json.dumps(raw)})
+    msg = got[-1].message
+    assert len(msg) <= 2000
+    assert "hub/f50.py:50 " in msg
+    shown = sum(1 for n in range(50, 101) if f"hub/f{n}.py:{n} " in msg)
+    hidden = 51 - shown
+    assert hidden > 0 and msg.endswith(f"… ещё {hidden} не показано")
+
+    small = judge_findings({"findings": json.dumps(raw[:51])})
+    assert "не показано" not in small[-1].message
+    assert "hub/f51.py:51 " in small[-1].message
