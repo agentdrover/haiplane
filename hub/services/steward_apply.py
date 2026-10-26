@@ -1039,21 +1039,15 @@ async def policy_refusal(
     )
 
 
-async def write_refusal(
-    db: aiosqlite.Connection, task_id: int, generation: int
+async def authority_refusal(
+    db: aiosqlite.Connection, task_id: int
 ) -> tuple[str, str] | None:
-    """Право на автономное одобрение, как оно есть СЕЙЧАС (#2037, #2040): отказ или ``None``.
+    """Есть ли у стюарда право двигать задачу СЕЙЧАС: ``act`` выдан и вердикт ему отдан.
 
-    Зовётся внутри write-транзакции, что записывает approve стюарда
-    (``lifecycle._automation_ci_gate``): ранние проверки читали делегирование и
-    cap-handoff до неё, а между ними и записью вердикт могли забрать себе
-    (``verdict=human``), сдачу передали человеку из-за потолка или стюарда
-    выключили (#2040: глобальный допуск ``act``, чистое чтение
-    ``steward_shadow.act_granted_now``). Читатели те же, что у ранних проверок
-    (``policy_refusal`` и ``cap_refusal``), без копий условий; причина отказа -
-    та же строка. Только чтение базы, сети нет.
+    Чистое чтение, для write-транзакции. Один вопрос и для одобрения
+    (``write_refusal``), и для возврата на доработку (#2053): копия условия
+    разошлась бы ровно там, где право отозвали.
     """
-    from hub.services.steward_advisor import cap_refusal
     from hub.services.steward_shadow import act_granted_now, act_unmet_now
 
     # #2040: глобальный допуск act - тот же вопрос, что у ранних проверок
@@ -1066,7 +1060,25 @@ async def write_refusal(
             "выдана - применять нечего"
             + "".join(f" [{item}]" for item in await act_unmet_now(db)),
         )
-    return await policy_refusal(db, task_id) or await cap_refusal(
+    return await policy_refusal(db, task_id)
+
+
+async def write_refusal(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[str, str] | None:
+    """Право на автономное одобрение, как оно есть СЕЙЧАС (#2037, #2040): отказ или ``None``.
+
+    Зовётся внутри write-транзакции, что записывает approve стюарда
+    (``lifecycle._automation_ci_gate``): ранние проверки читали делегирование и
+    cap-handoff до неё, а между ними и записью вердикт могли забрать себе
+    (``verdict=human``), сдачу передали человеку из-за потолка или стюарда
+    выключили. Читатели те же, что у ранних проверок (``authority_refusal`` и
+    ``cap_refusal``), без копий условий; причина отказа - та же строка. Только
+    чтение базы, сети нет.
+    """
+    from hub.services.steward_advisor import cap_refusal
+
+    return await authority_refusal(db, task_id) or await cap_refusal(
         db, task_id, generation
     )
 
