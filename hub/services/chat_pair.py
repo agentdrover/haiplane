@@ -1400,9 +1400,10 @@ async def release_stuck_run_claims(
 ) -> list[int]:
     """Второй проход reaper'а — от задач, а не от сессий (#1783).
 
-    Первый проход идёт от мёртвых сессий, а purge их удаляет; здесь кандидат -
-    сама задача с захватом закончившегося прогона, решает ``run_claim`` под
-    write-локом. Тем же проходом - брошенный возврат на доработку (#2053).
+    Первый проход находит задачу по мёртвой сессии; purge удаляет эти строки,
+    и задача с захватом завершённого прогона хаба становилась невидимой. Здесь
+    кандидат — сама задача: running/claimed, ``executor_run_id`` указывает на
+    закончившийся прогон. Решение — под write-локом в ``run_claim``.
     """
     from hub.services import run_claim
 
@@ -1425,7 +1426,6 @@ async def release_stuck_run_claims(
             continue
         if done:
             freed.append(task_id)
-    await run_claim.reopen_abandoned_rework(db)  # #2053
     return freed
 
 

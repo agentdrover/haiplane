@@ -55,20 +55,22 @@ async def _judge_cr(db, task_id: int, *, generation: int = 1) -> None:
     )
 
 
-async def _online(db, task_id: int) -> None:
+async def _online(db, task_id: int, session: str = "sess-2053") -> None:
     await services.register_session(
-        db, SessionRegister(session_id="sess-2053"), agent="dev", principal_id=None
+        db, SessionRegister(session_id=session), agent="dev", principal_id=None
     )
     await repo.update_task(
-        db, task_id, claimed_by="dev", claim_session_id="sess-2053", claimed_at="x"
+        db, task_id, claimed_by="dev", claim_session_id=session, claimed_at="x"
     )
     await db.commit()
 
 
-async def _offline(db, task_id: int) -> None:
-    await _online(db, task_id)
+async def _offline(db, task_id: int, session: str = "sess-2053") -> None:
+    await _online(db, task_id, session)
     await db.execute(
-        "UPDATE agent_sessions SET last_seen_at = datetime('now', '-1 day')"
+        "UPDATE agent_sessions SET last_seen_at = datetime('now', '-1 day') "
+        "WHERE session_id = ?",
+        (session,),
     )
     await db.commit()
 
@@ -124,53 +126,6 @@ async def test_after_the_return_nothing_shows_in_the_owners_inbox(db, monkeypatc
 
     queue = (await inbox_decisions.collect(db, {}))["queue"]
     assert not any(e["task_id"] == task_id for e in queue)
-
-
-async def test_an_offline_executor_gets_no_running_task_but_an_open_one(
-    db, monkeypatch
-):
-    task_id = await _scene(db, monkeypatch, "jcr-offline")
-    await _offline(db, task_id)
-
-    await apply_judge_changes_requests(db)
-
-    task = (await _verdict(db, task_id))["task"]
-    assert task["status"] == "open"
-    assert not task["claimed_by"] and not task["claim_session_id"]
-    assert task["review_cycle"] == 1
-    events = await fetchall(
-        db,
-        "SELECT payload FROM events WHERE task_id=? AND kind='executor_claim_released'",
-        (task_id,),
-    )
-    assert len(events) == 1
-    assert json.loads(dict(events[0])["payload"])["reason"] == (
-        "changes_requested_executor_offline"
-    )
-
-
-async def test_a_human_changes_request_checks_the_executor_too(db, monkeypatch):
-    from hub.services.lifecycle import record_review_verdict
-
-    project_id = await _project(db, "jcr-human")
-    gone = await _client_task(db, project_id)
-    await _offline(db, gone)
-    here = await _client_task(db, project_id)
-    await services.register_session(
-        db, SessionRegister(session_id="sess-here"), agent="dev2", principal_id=None
-    )
-    await repo.update_task(db, here, claimed_by="dev2", claim_session_id="sess-here")
-    await db.commit()
-
-    body = TaskReviewVerdict(
-        agent="rev", verdict=ReviewVerdict.changes_requested, comments="чинить"
-    )
-    await record_review_verdict(db, gone, body)
-    await record_review_verdict(db, here, body)
-
-    assert dict(await repo.get_task(db, gone))["status"] == "open"
-    assert dict(await repo.get_task(db, here))["status"] == "running"
-    assert dict(await repo.get_task(db, here))["claimed_by"] == "dev2"
 
 
 async def test_a_judgement_of_a_stale_generation_changes_nothing(db, monkeypatch):
@@ -232,82 +187,6 @@ async def test_a_spent_cycle_budget_goes_to_needs_decision(db, monkeypatch):
     queue = (await inbox_decisions.collect(db, {}))["queue"]
     assert not any(e["task_id"] == task_id and e["action"] == "verdict" for e in queue)
     assert await apply_judge_changes_requests(db) == 0
-
-
-async def test_a_claim_without_an_address_stays_with_its_holder(db, monkeypatch):
-    """Присутствие знает только реестр: захват без адреса - не «ушёл»."""
-    task_id = await _scene(db, monkeypatch, "jcr-noaddr")
-    await repo.update_task(db, task_id, claimed_by="dev", claim_session_id="")
-    await db.commit()
-
-    await apply_judge_changes_requests(db)
-
-    task = (await _verdict(db, task_id))["task"]
-    assert task["status"] == "running" and task["claimed_by"] == "dev"
-
-
-async def _silent_for(db, minutes: int) -> None:
-    await db.execute(
-        "UPDATE agent_sessions SET last_seen_at = datetime('now', ?)",
-        (f"-{minutes} minutes",),
-    )
-    await db.commit()
-
-
-async def test_a_session_silent_past_the_ttl_but_inside_the_dead_window_keeps_the_task(
-    db, monkeypatch
-):
-    """Codex P1: 11 минут без heartbeat - не «ушёл»; порог - slot_dead_minutes."""
-    task_id = await _scene(db, monkeypatch, "jcr-ttl")
-    await _online(db, task_id)
-    await _silent_for(db, 11)
-
-    await apply_judge_changes_requests(db)
-
-    task = (await _verdict(db, task_id))["task"]
-    assert task["status"] == "running" and task["claimed_by"] == "dev"
-
-
-async def test_the_project_dead_window_decides_when_the_executor_is_gone(
-    db, monkeypatch
-):
-    task_id = await _scene(db, monkeypatch, "jcr-window")
-    await db.execute(
-        "UPDATE projects SET gate_policy=?",
-        (json.dumps({"verdict": "steward", "slot_dead_minutes": 5}),),
-    )
-    await _online(db, task_id)
-    await _silent_for(db, 11)
-
-    await apply_judge_changes_requests(db)
-
-    assert (await _verdict(db, task_id))["task"]["status"] == "open"
-
-
-async def test_recent_activity_of_the_claimer_keeps_the_task(db, monkeypatch):
-    task_id = await _scene(db, monkeypatch, "jcr-activity")
-    await _offline(db, task_id)
-    await repo.add_task_update(db, task_id, "dev", "status", "правлю, ещё в работе")
-    await db.commit()
-
-    await apply_judge_changes_requests(db)
-
-    assert (await _verdict(db, task_id))["task"]["status"] == "running"
-
-
-async def test_a_live_run_or_open_slot_keeps_the_task(db, monkeypatch):
-    task_id = await _scene(db, monkeypatch, "jcr-run")
-    await _offline(db, task_id)
-    await db.execute(
-        "INSERT INTO executor_slots (task_id, channel, slot, captured_at) "
-        "VALUES (?, 'slot', 'slot-1', datetime('now'))",
-        (task_id,),
-    )
-    await db.commit()
-
-    await apply_judge_changes_requests(db)
-
-    assert (await _verdict(db, task_id))["task"]["status"] == "running"
 
 
 async def test_the_budget_escalation_of_an_old_generation_does_not_touch_the_new_one(
@@ -406,55 +285,130 @@ async def test_judge_uids_are_advertised_only_when_the_judge_brought_one(db):
     assert "uid" not in got[1].message
 
 
-async def test_pair_start_executor_activity_is_seen_by_assigned_agent(db, monkeypatch):
-    """Codex 2 P1: pair-start с open оставляет claimed_by пустым, пишет assigned_agent."""
-    task_id = await _scene(db, monkeypatch, "jcr-assigned")
-    await _offline(db, task_id)
-    await repo.update_task(db, task_id, claimed_by=None, assigned_agent="dev")
-    await repo.add_task_update(db, task_id, "dev", "status", "работаю")
+async def _silent_for(db, minutes: int, session: str = "sess-2053") -> None:
+    await db.execute(
+        "UPDATE agent_sessions SET last_seen_at = datetime('now', ?) "
+        "WHERE session_id = ?",
+        (f"-{minutes} minutes", session),
+    )
     await db.commit()
 
-    await apply_judge_changes_requests(db)
 
-    assert (await _verdict(db, task_id))["task"]["status"] == "running"
+async def _human_cr(db, task_id: int) -> None:
+    from hub.services.lifecycle import record_review_verdict
+
+    await record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            agent="rev", verdict=ReviewVerdict.changes_requested, comments="чинить"
+        ),
+    )
 
 
-async def test_a_rework_task_kept_in_the_window_is_reopened_by_the_sweep(
+async def _alerts(db, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "исполнитель молчит" in dict(u)["content"]
+    ]
+
+
+async def _unchanged(db, task_id: int) -> None:
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running"
+    assert task["claimed_by"] == "dev" and task["claim_session_id"] == "sess-2053"
+
+
+async def test_a_silent_claimer_is_named_once_per_generation_and_keeps_the_task(
     db, monkeypatch
 ):
-    """Codex 2 P2: исполнитель молчал в окне и так и не вернулся - проход снимает захват."""
-    from hub.services import run_claim
+    from hub.services import rework_silence
 
-    task_id = await _scene(db, monkeypatch, "jcr-sweep")
-    await _online(db, task_id)
-    await _silent_for(db, 11)
+    task_id = await _scene(db, monkeypatch, "jcr-silent")
+    await _offline(db, task_id)
+
     await apply_judge_changes_requests(db)
-    assert (await _verdict(db, task_id))["task"]["status"] == "running"
-    assert await run_claim.reopen_abandoned_rework(db) == []
 
-    await _silent_for(db, 120)
-    assert await run_claim.reopen_abandoned_rework(db) == [task_id]
+    await _unchanged(db, task_id)
+    alerts = await _alerts(db, task_id)
+    assert len(alerts) == 1 and "60 мин" in alerts[0]
+    # Повтор на том же поколении молчит; следующая сдача - новая запись.
+    assert not await rework_silence.note_if_silent(db, task_id)
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+    assert await rework_silence.note_if_silent(db, task_id)
+    assert len(await _alerts(db, task_id)) == 2
+    await _unchanged(db, task_id)
 
-    task = (await _verdict(db, task_id))["task"]
-    assert task["status"] == "open" and not task["claim_session_id"]
-    events = await fetchall(
-        db,
-        "SELECT 1 FROM events WHERE task_id=? AND kind='executor_claim_released'",
-        (task_id,),
+
+async def test_a_human_changes_request_names_a_silent_claimer_too(db, monkeypatch):
+    project_id = await _project(db, "jcr-human-silent")
+    task_id = await _client_task(db, project_id)
+    await _offline(db, task_id)
+
+    await _human_cr(db, task_id)
+
+    await _unchanged(db, task_id)
+    assert len(await _alerts(db, task_id)) == 1
+
+
+async def test_an_active_claimer_gets_no_alert(db, monkeypatch):
+    """Свежая запись исполнителя, живой слот, молчание короче окна - подсказки нет."""
+    project_id = await _project(db, "jcr-active")
+    quiet_updates = await _client_task(db, project_id)
+    await _offline(db, quiet_updates, "s-quiet")
+    await repo.add_task_update(db, quiet_updates, "dev", "status", "правлю")
+
+    short = await _client_task(db, project_id)
+    await _online(db, short, "s-short")
+    await _silent_for(db, 11, "s-short")
+
+    slot = await _client_task(db, project_id)
+    await _offline(db, slot, "s-slot")
+    await db.execute(
+        "INSERT INTO executor_slots (task_id, channel, slot, captured_at) "
+        "VALUES (?, 'slot', 'slot-1', datetime('now'))",
+        (slot,),
     )
-    assert len(events) == 1
-    assert await run_claim.reopen_abandoned_rework(db) == []
+    await db.commit()
+
+    for task_id in (quiet_updates, short, slot):
+        await _human_cr(db, task_id)
+        task = dict(await repo.get_task(db, task_id))
+        assert task["status"] == "running" and task["claimed_by"] == "dev"
+        assert await _alerts(db, task_id) == []
 
 
-async def test_the_reaper_pass_runs_the_rework_recheck(db, monkeypatch):
-    from hub.services import chat_pair
-
-    task_id = await _scene(db, monkeypatch, "jcr-reaper")
+async def test_the_project_window_sets_the_alert_threshold(db, monkeypatch):
+    task_id = await _scene(db, monkeypatch, "jcr-window")
+    await db.execute(
+        "UPDATE projects SET gate_policy=?",
+        (json.dumps({"verdict": "steward", "slot_dead_minutes": 5}),),
+    )
     await _online(db, task_id)
     await _silent_for(db, 11)
+
     await apply_judge_changes_requests(db)
-    await _silent_for(db, 120)
 
-    await chat_pair.release_stuck_run_claims(db)
+    await _unchanged(db, task_id)
+    assert "5 мин" in (await _alerts(db, task_id))[0]
 
-    assert (await _verdict(db, task_id))["task"]["status"] == "open"
+
+async def test_a_failing_silence_check_never_blocks_the_verdict(db, monkeypatch):
+    from hub.services import rework_silence
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("signal broke")
+
+    monkeypatch.setattr(rework_silence, "silence_minutes", boom)
+    project_id = await _project(db, "jcr-boom")
+    task_id = await _client_task(db, project_id)
+    await _offline(db, task_id)
+
+    await _human_cr(db, task_id)
+
+    assert dict(await repo.get_task(db, task_id))["review_verdict"] == (
+        "changes_requested"
+    )
+    assert await _alerts(db, task_id) == []

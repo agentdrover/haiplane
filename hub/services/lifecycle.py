@@ -5037,12 +5037,15 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
                 # claimed_by; живая работа и живые сессии освобождение блокируют.
                 from hub.services import run_claim
 
-                # B-3: исполнителя на связи нет - задача открыта, захват снят.
-                if not await run_claim.reopen_if_executor_gone(db, task_id):
-                    await run_claim.release_for_rework(db, task_id)
-                    # #451 restored the workspace to base on submit; on rework put it
-                    # back on the task branch so fixes don't land on local base (#457).
-                    await _try_switch_pair_workspace_to_task(db, task_id)
+                await run_claim.release_for_rework(db, task_id)
+                # #451 restored the workspace to base on submit; on rework put it
+                # back on the task branch so fixes don't land on local base (#457).
+                await _try_switch_pair_workspace_to_task(db, task_id)
+                from hub.services import rework_silence
+
+                await rework_silence.note_if_silent(
+                    db, task_id
+                )  # #2053: только сказать
 
         await repo.insert_event(
             db,

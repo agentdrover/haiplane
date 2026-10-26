@@ -45,10 +45,6 @@ async def _task_in_review(
     )
     assert resp.status_code in (200, 201), resp.text
     task_id = resp.json()["id"]
-    # Исполнитель на связи: вердикт «на доработку» возвращает работу ему, а не открывает задачу.
-    await client.post(
-        "/api/sessions/register", json={"session_id": "s-1010"}, headers=h
-    )
     await client.post(
         f"/api/tasks/{task_id}/updates",
         json={"agent": "dev", "kind": "status", "content": "Plan: do it"},
