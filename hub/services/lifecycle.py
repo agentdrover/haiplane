@@ -2629,6 +2629,9 @@ class SubmitContext:
     #: #1265 — та же вершина ветки пришла повторно из review: сдача не
     #: открывает новое поколение, и вызывающий получает ответ без перехода.
     same_sha_noop: bool = False
+    #: #2057 — тот же sha уже сдан параллельным запросом: исходы сверяются с
+    #: записанными в той же транзакции, что и их применение.
+    raced: bool = False
     #: #1436: запись «Контракт сдачи нарушен» при warn; пусто — нарушений нет
     #: или контракт выключен.
     contract_alert: str = ""
@@ -3249,6 +3252,20 @@ async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
         and state.submission_sha == state.replaced_sha
     ):
         state.same_sha_noop = True
+        return
+    # #2057: снимок задачи мог устареть - параллельная сдача этого sha легла
+    # после него. Свежее чтение ДО гейтов находок, которые на устаревшем
+    # снимке ответили бы 422 даже на тот же набор исходов.
+    if state.submission_sha:
+        fresh = await repo.get_task(state.db, state.task_id)
+        if (
+            fresh is not None
+            and fresh["status"] == "review"
+            and (fresh["submission_sha"] or "") == state.submission_sha
+        ):
+            state.task = dict(fresh)
+            state.same_sha_noop = True
+            state.raced = True
 
 
 async def _step_empty_resubmission(state: SubmitContext) -> None:
@@ -3524,7 +3541,19 @@ async def submit_for_review(
         return await _same_sha_noop_response(state)
 
     await run_steps(state, SUBMIT_STEPS_AFTER_SAME_SHA_CHECK)
-    return await _apply_submission(state)
+    try:
+        return await _apply_submission(state)
+    except _SameShaRaced as raced:
+        # #2057: параллельная сдача этого же sha легла между снимком и локом.
+        state.task = raced.live
+        state.raced = True
+        return await _same_sha_noop_response(state)
+
+
+class _SameShaRaced(Exception):
+    def __init__(self, live: dict[str, Any]) -> None:
+        super().__init__("same sha already submitted")
+        self.live = live
 
 
 async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
@@ -3590,6 +3619,10 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         #
         # Отчёты — те же, из которых собран open_items (#1331): у поколения без ревью это отчёты
         # последнего поколения с ревью, иначе «отвечено» и «открыто» разойдутся.
+        if state.raced:  # #2057: под тем же локом, что и запись исходов ниже
+            await finding_outcome.refuse_conflicting(
+                db, task_id, generation, body.finding_outcomes or []
+            )
         pending = await finding_outcome.items_still_to_plan(
             db, task_id, generation, open_items, body.finding_outcomes
         )
@@ -3975,6 +4008,12 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         # #1783: «пустая ли пересдача» решали по снимку до лока; параллельная
         # сдача и вердикт «на доработку» могли пройти между — решаем по базе.
         live = dict(await repo.get_task(db, task_id) or task)
+        if (
+            submission_sha
+            and live.get("status") == "review"
+            and live.get("submission_sha") == submission_sha
+        ):
+            raise _SameShaRaced(live)  # #2057: тот же sha уже сдан под локом
         if (
             not body.finding_outcomes
             and resubmission_guard.empty_resubmission_of(live, submission_sha)
