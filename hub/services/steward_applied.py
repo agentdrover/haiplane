@@ -303,11 +303,13 @@ def _fit_folded(head: str, parts: list[str]) -> str:
     def render() -> str:
         shown = [x for x in kept if x is not None]
         omitted = len(parts) - len(shown)
-        return sep.join(shown) + f" … ещё {omitted} не показано"
+        text = sep.join(shown)
+        # Пометка только если что-то опущено: «ещё 0» - ложь и лишние знаки.
+        return text + (f" … ещё {omitted} не показано" if omitted else "")
 
-    # Корректно по построению: пока с пометкой не помещается - сначала
-    # обрезаем самую длинную находку до начала (file:line впереди), потом
-    # выбрасываем последнюю; пометка пересчитывается с новым счётом.
+    # Корректно по построению: пока не помещается - сначала обрезаем самую
+    # длинную находку до начала (file:line впереди), потом выбрасываем
+    # последнюю; пометка пересчитывается с новым счётом.
     while len(render()) > limit:
         live = [i for i, x in enumerate(kept) if x is not None]
         longest = max(live, key=lambda i: len(kept[i] or ""))

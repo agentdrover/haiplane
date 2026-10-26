@@ -675,3 +675,59 @@ async def test_a_human_changes_request_over_a_stale_claim_is_not_ours(db, monkey
     row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
     assert row["advisor_outcome"] == "skipped"
     assert await _alerts_of(db, task_id) == []
+
+
+def test_pieces_that_fit_without_a_suffix_are_all_kept():
+    from hub.services.steward_applied import _fit_folded
+
+    head = "h" * 50
+    parts = ["a" * 162] + ["b" * 160] * 7 + ["c" * 159] * 4
+    # Берём бюджет впритык: ровно без пометки.
+    total = len(" | ".join(parts))
+    got = _fit_folded("h" * (2000 - total), parts)
+    assert got == " | ".join(parts) and "ещё" not in got
+    out = _fit_folded(head, parts)
+    # 1951 знак при бюджете 1950: режется одна находка, но все 12 на месте.
+    assert len(head + out) <= 2000 and "ещё" not in out
+    assert len(out.split(" | ")) == 12
+
+
+async def test_a_claim_whose_task_was_resubmitted_before_recovery_closes(
+    db, monkeypatch
+):
+    """Автор пересдал (gen 2) до разбора: по записанному факту returned, без ложного повтора."""
+    from hub.services import steward_advisor
+
+    task_id = await _scene(db, monkeypatch, "jcr-resubmit")
+    await _online(db, task_id)
+    assert await apply_judge_changes_requests(db) == 1
+    await _stick(db, task_id)
+    await repo.update_task(db, task_id, status="review", submission_generation=2)
+    await db.commit()
+
+    await steward_advisor._escalate_interrupted(db)
+
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "returned"
+    assert await _alerts_of(db, task_id) == []
+    retries = await fetchall(db, "SELECT 1 FROM events WHERE kind='steward_cr_retry'")
+    assert not retries
+
+
+async def test_a_claim_of_a_stale_generation_without_a_verdict_closes_superseded(
+    db, monkeypatch
+):
+    from hub.services import steward_advisor
+
+    task_id = await _scene(db, monkeypatch, "jcr-superseded")
+    await _online(db, task_id)
+    await _stick(db, task_id)
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+
+    await steward_advisor._escalate_interrupted(db)
+
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "skipped"
+    assert await _alerts_of(db, task_id) == []
+    assert not await fetchall(db, "SELECT 1 FROM events WHERE kind='steward_cr_retry'")

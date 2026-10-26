@@ -825,18 +825,20 @@ async def _recover_interrupted_changes(
     """
     task_id, generation = int(item["task_id"]), int(item["generation"])
     task = dict(await repo.get_task(db, task_id) or {})
-    if (
-        task.get("review_verdict") == "changes_requested"
-        and task.get("review_verdict_generation") == generation
-        and task.get("status") != "review"
-    ):
-        # Вердикт мог лечь от человека, пока метка висела: тогда это не наш
-        # возврат, и «returned» было бы ложью - закрываем без тревоги и повтора.
-        ours = await _steward_verdict_recorded(db, item, "changes_requested")
+    # Решает записанный факт, а не статус: автор мог пересдать до разбора.
+    if await _steward_verdict_recorded(db, item, "changes_requested"):
+        close = "returned"
+    elif await _human_cr_recorded(db, task, item):
+        close = "skipped"  # вердикт человека: не наш возврат
+    elif int(task.get("submission_generation") or 0) > generation:
+        close = "skipped"  # сдача устарела: применять нечего
+    else:
+        close = ""
+    if close:
         closed = await db.execute(
             "UPDATE steward_judgements SET advisor_outcome=? "
             "WHERE id=? AND advisor_outcome=?",
-            ("returned" if ours else "skipped", item["id"], _OUTCOME_CLAIMED),
+            (close, item["id"], _OUTCOME_CLAIMED),
         )
         return int(closed.rowcount == 1)
     retried = await fetchall(
@@ -929,6 +931,36 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
 
 
 failure_reason = reason_line  # #2040: закрытый словарь, hub/services/refusal_reason.py
+
+
+async def _human_cr_recorded(
+    db: aiosqlite.Connection, task: dict[str, Any], item: dict[str, Any]
+) -> bool:
+    """Лёг ли на это поколение changes_requested не от стюарда (событием или полем)."""
+    generation = int(item["generation"])
+    if (
+        task.get("review_verdict") == "changes_requested"
+        and task.get("review_verdict_generation") == generation
+    ):
+        return True
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind='review_verdict_recorded' "
+        "AND task_id=? ORDER BY id DESC",
+        (int(item["task_id"]),),
+    )
+    for row in rows:
+        try:
+            payload = json.loads(dict(row)["payload"] or "{}")
+        except ValueError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("verdict") == "changes_requested"
+            and payload.get("submission_generation") == generation
+        ):
+            return True
+    return False
 
 
 async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
