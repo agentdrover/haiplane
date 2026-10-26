@@ -67,6 +67,7 @@ LADDER_SURFACES: tuple[str, ...] = (
     # (исключение «двойной чистоты», согласие советника).
     "hub/services/steward_double_clean.py",
     "hub/services/steward_advisor.py",
+    "hub/services/steward_empty_report.py",  # #2082
     # #1231: здесь же лежит правило самостоятельного одобрения. Модуль
     # появился после #1147 и в перечень тогда не попал — а именно он
     # решает, уедет ли сдача без человека вовсе. Задача, меняющая это
@@ -94,6 +95,7 @@ APPROVAL_DECIDERS: tuple[str, ...] = (
     "hub/services/steward_apply.py",
     "hub/services/steward_double_clean.py",  # #1986
     "hub/services/steward_advisor.py",  # #1986
+    "hub/services/steward_empty_report.py",  # #2082
     "hub/services/steward_applied.py",
     "hub/services/steward_dispatch.py",
     "hub/services/steward_evidence.py",

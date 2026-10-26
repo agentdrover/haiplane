@@ -205,7 +205,13 @@ async def apply_judgement(
                 f"({refusal[0]}): {refusal[1]}",
                 code=refusal[0],
             )
-        await _record(db, task_id, ReviewVerdict.approved, generation, claim=claim)
+        # #2082: пустой отчёт без доказанной работы. Доказательство добывается
+        # здесь, ДО транзакции записи; ей остаётся чистая перепроверка.
+        from hub.services import steward_empty_report
+
+        async with steward_empty_report.proof_scope():
+            await steward_empty_report.require(db, task_id, generation)
+            await _record(db, task_id, ReviewVerdict.approved, generation, claim=claim)
         return APPLIED, f"approve применён к сдаче {generation}"
 
     if verdict != "changes_requested":
