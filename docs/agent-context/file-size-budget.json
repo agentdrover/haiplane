@@ -35,7 +35,7 @@
     },
     {
       "path": "hub/integrations/git_ops.py",
-      "measured": 4707,
+      "measured": 4708,
       "max": 4906,
       "removed_by": "unclaimed"
     },

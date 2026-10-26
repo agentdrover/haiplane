@@ -977,9 +977,8 @@ async def _diff_ends(base: str, sha: str, repo: str) -> tuple[str, str] | None:
     return base_sha, head_sha
 
 
-# Ancestry between two task branches (#1184). The names say which side of the
-# pair the HEAD branch — the one being submitted — sits on, so a caller never
-# has to remember argument order to read the answer.
+# Ancestry between two task branches (#1184). The names say which side of the pair
+# the HEAD branch (the one being submitted) sits on: no argument order to remember.
 STACK_ANCESTRY_HEAD_IS_DESCENDANT = "head_is_descendant"
 STACK_ANCESTRY_HEAD_IS_ANCESTOR = "head_is_ancestor"
 STACK_ANCESTRY_UNRELATED = "unrelated"
@@ -1183,10 +1182,13 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> str:
         """Which of two branches stands on the other (#1184).
 
-        ``branch_contains_unmerged_commits_of`` is symmetric for a stacked pair
-        (both branches carry the ancestor's commits), so an advisory built on it
-        named the merge order from whichever task was submitting. The order is a
-        property of the branches: ask git about it directly.
+        ``branch_contains_unmerged_commits_of`` answers whether two branches
+        INTERSECT, and that answer is symmetric: for a stacked pair it is true
+        read in either direction, because both branches carry the ancestor's
+        commits. The advisory built on it therefore named the merge order from
+        whichever task happened to be submitting, and flipped when the other
+        one submitted. The order is a property of the branches, so ask git
+        about it directly.
 
         Returns one of ``STACK_ANCESTRY_*``, each named by its value:
 
@@ -1832,9 +1834,9 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         unnoticed, since a release that just succeeded looks like the opposite
         of an outage.
 
-        Restores from the release branch, not from a local ref (whatever an
-        earlier checkout left behind; after the merge both carry the same
-        content). Never forces: if the branch is there, it is left as it is.
+        Restores from the release branch, not from a local ref: after the merge
+        integration and release carry the same content, a local ref is whatever
+        an earlier checkout left behind. Never forces: a branch there stays as is.
         """
         if not repo:
             return ("unavailable", "у проекта нет рабочего клона — пушить неоткуда")
@@ -3446,9 +3448,8 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         outcome, detail = await self._forge_for(forge).pr_mergeability(
             pr_number, repo=repo, gh_repo=gh_repo
         )
-        # Форж, который не умеет мержить, обычно не умеет и предсказывать мерж
-        # (#1116). Тогда вопрос задаётся git: пробное слияние в одноразовом
-        # рабочем дереве — единственный способ узнать ответ, не тронув ничего.
+        # Форж без мержа обычно не умеет и предсказывать мерж (#1116): вопрос
+        # задаётся git — пробное слияние в одноразовом дереве ничего не трогает.
         if outcome is MergeabilityOutcome.unavailable and not (
             self._forge_for(forge).can_merge_via_api
         ):
