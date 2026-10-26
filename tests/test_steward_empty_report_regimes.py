@@ -44,14 +44,19 @@ async def test_double_clean_pair_with_zero_candidates_is_refused(db, monkeypatch
 
 
 async def test_double_clean_pair_with_one_empty_report_is_refused(db, monkeypatch):
-    case = await build_case(
-        db, monkeypatch, "dc-one-empty", main={"raw": 2}, extra={"raw": 0}
-    )
+    for label, main, extra in (("main", 0, 2), ("extra", 2, 0)):
+        case = await build_case(
+            db,
+            monkeypatch,
+            f"dc-one-empty-{label}",
+            main={"raw": main},
+            extra={"raw": extra},
+        )
 
-    result = await apply_self_approval(db, case.task_id, 1)
+        result = await apply_self_approval(db, case.task_id, 1)
 
-    assert result is not None and result[0] == ESCALATED_TO_HUMAN, result
-    assert await verdict_of(db, case.task_id) == ""
+        assert result is not None and result[0] == ESCALATED_TO_HUMAN, (label, result)
+        assert await verdict_of(db, case.task_id) == "", label
 
 
 async def test_double_clean_pair_with_candidates_still_applies(db, monkeypatch):

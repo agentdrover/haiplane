@@ -11,12 +11,15 @@
 * чтение без сети для readiness и маршрута вердикта: непроверенный биллинг
   называется условием, а не выдаётся за доказанный.
 
-Режим двойной чистоты (#1986) своё правило о пустоте несёт сам - пара отчётов с
-пином и признаками исполнения; он выведен из-под этого правила.
+Правило ОДНО на все режимы, включая двойную чистоту (#1986): признаки исполнения
+(пин, число агентов) работу ревьюера не доказывают. Отчёты пары без кандидатов
+режим отвергает сам (``steward_double_clean._unclean``), а последний отчёт
+сдачи проходит это правило, как любой другой.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -47,26 +50,42 @@ class EmptyProof:
     usage: int | None
 
 
-_PROOFS: ContextVar[dict[int, EmptyProof] | None] = ContextVar(
-    "steward_empty_proofs", default=None
-)
+@dataclass
+class _Scope:
+    """Область одного применения: принадлежит Task, которая её открыла."""
+
+    owner: asyncio.Task[Any] | None
+    proofs: dict[int, EmptyProof]
+
+
+_SCOPE: ContextVar[_Scope | None] = ContextVar("steward_empty_scope", default=None)
+
+
+def _own() -> dict[int, EmptyProof] | None:
+    """Доказательства ЭТОГО применения; дочерняя Task унаследованную область не видит."""
+    scope = _SCOPE.get()
+    if scope is None or scope.owner is not asyncio.current_task():
+        return None
+    return scope.proofs
 
 
 @asynccontextmanager
 async def proof_scope() -> AsyncIterator[None]:
-    """Одно применение стюарда: доказательство не переживает его.
+    """Одно применение стюарда: доказательство не переживает его и Task его открывшей.
 
-    Вложенный вход делит область внешнего: ранняя проверка и применение одного
-    суждения спрашивают провайдера один раз.
+    Вложенный вход той же Task делит область внешнего: ранняя проверка и
+    применение одного суждения спрашивают провайдера один раз. Контекст
+    копируется в дочернюю Task вместе с областью, но владелец у неё другой - она
+    открывает свою и доказательство заново.
     """
-    if _PROOFS.get() is not None:
+    if _own() is not None:
         yield
         return
-    token = _PROOFS.set({})
+    token = _SCOPE.set(_Scope(asyncio.current_task(), {}))
     try:
         yield
     finally:
-        _PROOFS.reset(token)
+        _SCOPE.reset(token)
 
 
 async def _scene(
@@ -110,33 +129,24 @@ def refusal_of(
     )
 
 
-def _double_clean_early(task_id: int) -> bool:
-    """Ранняя проверка приняла исключение двойной чистоты: годится только до записи."""
-    from hub.services.steward_apply import double_clean_early
+async def _run_is_of_this_report(
+    db: aiosqlite.Connection, task_id: int, generation: int, review: dict[str, Any]
+) -> bool:
+    """Завершённый запуск, чей биллинг будет спрошен, породил ИМЕННО этот отчёт.
 
-    return double_clean_early(task_id)
-
-
-async def _ceiling_gate_owns_it(db: aiosqlite.Connection, task_id: int) -> bool:
-    """Решение о пустоте уже за потолком, прочитанным в ЭТОЙ транзакции.
-
-    Ранний флаг двойной чистоты устаревает: потолок могли снять после ранней
-    проверки. Поэтому исключение даёт только сам потолок: он либо подтвердил
-    двойную чистоту (её правило о пустоте), либо отказал - и тогда запись и так
-    не состоится с его, более точной причиной (``_automation_ci_gate`` зовёт его
-    следом). Чистое чтение, сети нет.
+    Предикат автопилота берёт последний завершённый запуск поколения; для
+    доказательства стюарда этого мало: биллинг запуска A не доказывает работу,
+    результатом которой стал отчёт B. Нет своего запуска - нет доказательства.
     """
-    from hub.services.steward_apply import (
-        STEWARD_CEILING_KEY,
-        applied_double_clean,
-        ceiling_gate,
-    )
+    from hub.services.review_dispatch import dispatch_for_report
 
-    try:
-        refusal = await ceiling_gate(db, task_id, STEWARD_CEILING_KEY)
-    except Exception:  # noqa: BLE001 - не смогли проверить: исключения нет
-        return False
-    return refusal is not None or applied_double_clean(task_id) is not None
+    owner = await dispatch_for_report(db, task_id, generation, review)
+    settled = await repo.get_settled_review_dispatch(db, task_id, generation)
+    return (
+        owner is not None
+        and settled is not None
+        and int(owner["id"]) == int(settled["id"])
+    )
 
 
 async def _prove(
@@ -150,7 +160,7 @@ async def _prove(
     Сеть, поэтому звать ТОЛЬКО до транзакции записи. Сбой провайдера - «не
     доказано» (отсутствие данных), а не исключение и не «доказано».
     """
-    known = _PROOFS.get()
+    known = _own()
     cached = (known or {}).get(task_id)
     if (
         cached is not None
@@ -158,11 +168,14 @@ async def _prove(
         and cached.generation == generation
     ):
         return cached
-    try:
-        usage = await auto_verdict._proven_empty_usage(db, task_id, generation, review)
-    except Exception as exc:  # noqa: BLE001 - провайдер недоступен: не доказано
-        log.warning("empty-report billing proof failed for #%s: %s", task_id, exc)
-        usage = None
+    usage = None
+    if await _run_is_of_this_report(db, task_id, generation, review):
+        try:
+            usage = await auto_verdict._proven_empty_usage(
+                db, task_id, generation, review
+            )
+        except Exception as exc:  # noqa: BLE001 - провайдер недоступен: не доказано
+            log.warning("empty-report billing proof failed for #%s: %s", task_id, exc)
     proof = EmptyProof(task_id, generation, int(review["id"]), usage)
     if known is not None:
         known[task_id] = proof
@@ -174,7 +187,7 @@ async def early_refusal(
 ) -> tuple[str, str] | None:
     """Ранняя проверка: пустой отчёт без доказанной работы. Сеть допустима - до транзакции."""
     scene = await _scene(db, task_id, generation)
-    if scene is None or _double_clean_early(task_id):
+    if scene is None:
         return None
     task, review = scene
     proof = await _prove(db, task_id, generation, review)
@@ -201,10 +214,10 @@ async def write_refusal(
     проверки, доказательства не имеет.
     """
     scene = await _scene(db, task_id, generation)
-    if scene is None or await _ceiling_gate_owns_it(db, task_id):
+    if scene is None:
         return None
     task, review = scene
-    proof = (_PROOFS.get() or {}).get(task_id)
+    proof = (_own() or {}).get(task_id)
     decision = auto_verdict.empty_report_decision(
         task, review, _bound_usage(proof, review), checked=True
     )

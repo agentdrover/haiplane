@@ -259,13 +259,11 @@ async def _steward_route(
         key=key,
     )
     ceiling_condition = ""
-    double_clean = False
     if found is not None and found[0] == BLOCKED:
         from hub.services.steward_double_clean import may_apply_to_class
 
         if not await may_apply_to_class(db, int(task["id"]), task.get("risk_class")):
             return _human(found[1]["code"], found[1]["detail"], mode)
-        double_clean = True
         # #1986: выше потолка, но в пределах класса двойной чистоты: судит стюард,
         # а применится ли, решат пара отчётов, CI и советник (чтением не проверить).
         ceiling_condition = (
@@ -278,10 +276,8 @@ async def _steward_route(
             "; класс по диффу не выше потолка проекта (steward_approve_max_class; "
             "дифф при показе не читался)"
         )
-    # #2082: пустой отчёт - запрет или условие; двойная чистота несёт своё правило.
-    empty_route, empty_condition = (
-        (None, "") if double_clean else await _empty_report_route(db, task, mode)
-    )
+    # #2082: пустой отчёт - запрет или условие, в каждом режиме.
+    empty_route, empty_condition = await _empty_report_route(db, task, mode)
     if empty_route is not None:
         return empty_route
     handoff = await steward_cap.cap_handoff(db, int(task["id"]), generation)

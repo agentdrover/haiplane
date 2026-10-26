@@ -351,11 +351,6 @@ def applied_double_clean(task_id: int) -> dict[str, Any] | None:
     return ((_CLEAN.get() or {}).get(task_id) or {}).get("applied")
 
 
-def double_clean_early(task_id: int) -> bool:
-    """Ранняя проверка этого применения приняла исключение двойной чистоты (#1986)."""
-    return bool(((_CLEAN.get() or {}).get(task_id) or {}).get("early"))
-
-
 def double_clean_payload(task_id: int) -> dict[str, Any]:
     """Поле аудита для события вердикта: пусто, если исключения не было (#1986)."""
     audit = applied_double_clean(task_id)

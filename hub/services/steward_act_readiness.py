@@ -190,9 +190,7 @@ async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | Non
         )
     elif ceiling:
         (blocked if ceiling[0] == BLOCKED else unknown).append(ceiling[1])
-    empty = (
-        None if double_clean else await _empty_report_reason(db, task_id, generation)
-    )
+    empty = await _empty_report_reason(db, task_id, generation)
     if empty:
         (blocked if empty[0] == BLOCKED else unknown).append(empty[1])
     # Передача по суточному потолку - известный запрет и при действительном
