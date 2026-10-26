@@ -55,7 +55,15 @@ from hub.services.result_kind import (
     task_automation_not_applicable,
 )
 from hub.services import steward_advisor_skip as advisor_skip
-from hub.services.refusal_reason import CAP_HANDOFF, exception_facts, reason_line
+from hub.services.refusal_reason import (
+    CAP_HANDOFF,
+    RACE_CODES,
+    TRANSIENT_APPLY_CODES,
+    code_of,
+    code_of_reason_line,
+    exception_facts,
+    reason_line,
+)
 from hub.services import steward_cap, verdict_owner
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
@@ -1006,8 +1014,14 @@ async def _finish_outcome(
     outcome: str,
     detail: str,
     error: Exception | None = None,
+    *,
+    race: bool = False,
 ) -> bool:
     """Финальная запись исхода, условная ТОЙ ЖЕ меткой; ``True`` - исход записан.
+
+    ``race`` (#2054, B-2): другой писатель успел первым (вердикт уже стоит, сдача
+    или поколение сдвинулись). Исход записан, но к человеку это не передача: ни
+    владельца, ни тревоги, ни события отказа - нечего применять и нечего повторять.
 
     Если применение уже переведено в escalated (прервано и названо вслух),
     чужой исход не перезаписывается. Исход ``failed`` с причиной (#2040) -
@@ -1035,7 +1049,7 @@ async def _finish_outcome(
                 **(exception_facts(error) if error is not None else {}),
             },
         )
-    if final.rowcount == 1 and outcome != OUTCOME_APPROVED:
+    if final.rowcount == 1 and outcome != OUTCOME_APPROVED and not race:
         # #2052: исход, после которого стюард вердикт не вынесет, - в владельца,
         # в той же транзакции, что и сам исход.
         await verdict_owner.hand_to_human(
@@ -1077,8 +1091,6 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
     метку и уходит. Крах между занятием и записью исхода оставляет метку
     ``applying``: задача идёт человеческим маршрутом, как до этого контура.
     """
-    from hub.services.steward_applied import ESCALATED_TO_HUMAN, APPLIED
-    from hub.services.steward_applied import apply_self_approval
     from hub.services.steward_shadow import effective_mode
 
     # Прервавшееся применение называется вслух в ЛЮБОМ режиме: метка осталась
@@ -1098,46 +1110,141 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
     )
     applied = 0
     for row in rows:
-        item = dict(row)
-        task_id, generation = int(item["task_id"]), int(item["generation"])
-        if await task_automation_not_applicable(db, task_id):
-            continue  # #1647: исход советника к state-задаче не применяется
-        state = await advisor_state(db, task_id, generation)
-        if state.state in (STATE_NOT_ORDERED, STATE_PENDING, STATE_NOT_APPLICABLE):
-            continue
-        if await steward_cap.cap_handoff(db, task_id, generation) is not None:
-            continue  # #1915: сдача у человека до reset_at — исход не применяется
-        stamp = await _stamp_now(db)
-        detail = ""
-        error: Exception | None = None
-        cursor = await db.execute(
-            "UPDATE steward_judgements SET advisor_outcome=?, "
-            "advisor_claimed_at=? "
-            "WHERE id=? AND advisor_outcome=''",
-            (_OUTCOME_CLAIMED, stamp, item["id"]),
-        )
-        await db.commit()
-        if cursor.rowcount != 1:
-            continue
-        claim = (int(item["id"]), stamp)
-        try:
-            result = await apply_self_approval(db, task_id, generation, claim=claim)
-        except Exception as exc:  # noqa: BLE001 — исход записывается в любом случае
-            log.warning("advisor outcome not applied for #%s: %s", task_id, exc)
-            outcome = OUTCOME_FAILED
-            detail = failure_reason(exc)  # #2040: причина не остаётся в логе
-            error = exc
-        else:
-            if result is None:
-                outcome = OUTCOME_SKIPPED
-            elif result[0] == APPLIED:
-                outcome = OUTCOME_APPROVED
-            else:
-                outcome = (
-                    OUTCOME_ESCALATED
-                    if result[0] == ESCALATED_TO_HUMAN
-                    else OUTCOME_SKIPPED
-                )
-        if await _finish_outcome(db, item, stamp, outcome, detail, error):
+        if await _apply_one(db, dict(row)):
             applied += 1
     return applied
+
+
+async def _apply_one(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
+    """Применить approve одного суждения; ``True`` - исход записан этим проходом.
+
+    Одна дорога и для прохода поллера, и для повтора после подтверждённого CI
+    (#2054): метка занимается условным UPDATE, тот, кто занял, и применяет.
+    """
+    from hub.services.steward_applied import ESCALATED_TO_HUMAN, APPLIED
+    from hub.services.steward_applied import apply_self_approval
+
+    task_id, generation = int(item["task_id"]), int(item["generation"])
+    if await task_automation_not_applicable(db, task_id):
+        return False  # #1647: исход советника к state-задаче не применяется
+    state = await advisor_state(db, task_id, generation)
+    if state.state in (STATE_NOT_ORDERED, STATE_PENDING, STATE_NOT_APPLICABLE):
+        return False
+    if await steward_cap.cap_handoff(db, task_id, generation) is not None:
+        return False  # #1915: сдача у человека до reset_at — исход не применяется
+    stamp = await _stamp_now(db)
+    detail = ""
+    error: Exception | None = None
+    race = False
+    cursor = await db.execute(
+        "UPDATE steward_judgements SET advisor_outcome=?, "
+        "advisor_claimed_at=? "
+        "WHERE id=? AND advisor_outcome=''",
+        (_OUTCOME_CLAIMED, stamp, item["id"]),
+    )
+    await db.commit()
+    if cursor.rowcount != 1:
+        return False
+    claim = (int(item["id"]), stamp)
+    try:
+        result = await apply_self_approval(db, task_id, generation, claim=claim)
+    except Exception as exc:  # noqa: BLE001 — исход записывается в любом случае
+        log.warning("advisor outcome not applied for #%s: %s", task_id, exc)
+        detail = failure_reason(exc)  # #2040: причина не остаётся в логе
+        race = code_of(exc) in RACE_CODES  # #2054, B-2: чужая запись успела первой
+        outcome = OUTCOME_SKIPPED if race else OUTCOME_FAILED
+        error = None if race else exc
+    else:
+        if result is None:
+            outcome = OUTCOME_SKIPPED
+        elif result[0] == APPLIED:
+            outcome = OUTCOME_APPROVED
+        else:
+            outcome = (
+                OUTCOME_ESCALATED
+                if result[0] == ESCALATED_TO_HUMAN
+                else OUTCOME_SKIPPED
+            )
+    return await _finish_outcome(db, item, stamp, outcome, detail, error, race=race)
+
+
+#: Событие «применение после подтверждённого CI повторяли» (#2054): одно на суждение.
+EVENT_APPLY_RETRY = "steward_apply_retry"
+
+
+async def _retry_candidate(
+    db: aiosqlite.Connection, task_id: int
+) -> dict[str, Any] | None:
+    """Суждение, у которого применение отказало переходящей причиной, или None.
+
+    Только текущая сдача, в review, без вердикта этого поколения, и только код
+    из ``TRANSIENT_APPLY_CODES``: постоянный отказ остаётся у человека.
+    """
+    task = dict(await repo.get_task(db, task_id) or {})
+    generation = int(task.get("submission_generation") or 0)
+    if task.get("status") != "review" or generation <= 0:
+        return None
+    if task.get("review_verdict_generation") == generation:
+        return None  # вердикт этой сдачи уже записан
+    rows = await fetchall(
+        db,
+        "SELECT j.id, j.task_id, j.generation, j.advisor_outcome_detail "  # nosec B608 - constant fragments only
+        f"FROM steward_judgements j WHERE {PICKED_APPROVE_SQL} "
+        "AND j.task_id=? AND j.generation=? AND j.advisor_outcome=?",
+        (task_id, generation, OUTCOME_FAILED),
+    )
+    if not rows:
+        return None
+    item = dict(rows[0])
+    if code_of_reason_line(item["advisor_outcome_detail"]) not in TRANSIENT_APPLY_CODES:
+        return None
+    if await _approve_recorded(db, item):
+        return None
+    return item
+
+
+async def retry_transient_apply(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Повторить применение, упавшее переходящей причиной: CI стал verified (#2054).
+
+    Не больше одного повтора на суждение: событие пишется ДО повтора и в одной
+    транзакции с возвратом метки ``failed`` -> пусто, так что второй отчёт CI и
+    второй тик ничего не делают. Гонки 409 сюда не попадают: они не ``failed``.
+    ``True`` - повтор выполнен (его исход записан или применение ждёт поллера).
+    """
+    from hub.db import write_transaction
+    from hub.services.steward_shadow import effective_mode
+
+    if await effective_mode(db) != "act":
+        return False
+    async with write_transaction(db):
+        item = await _retry_candidate(db, task_id)
+        if item is None:
+            return False
+        retried = await fetchall(
+            db,
+            "SELECT 1 FROM events WHERE kind=? AND task_id=? "
+            "AND json_extract(payload, '$.judgement_id')=?",
+            (EVENT_APPLY_RETRY, task_id, item["id"]),
+        )
+        if retried:
+            return False
+        released = await db.execute(
+            "UPDATE steward_judgements SET advisor_outcome='', advisor_claimed_at='' "
+            "WHERE id=? AND advisor_outcome=?",
+            (item["id"], OUTCOME_FAILED),
+        )
+        if released.rowcount != 1:
+            return False
+        await repo.insert_event(
+            db,
+            kind=EVENT_APPLY_RETRY,
+            task_id=task_id,
+            actor="hub",
+            payload={
+                "judgement_id": int(item["id"]),
+                "generation": int(item["generation"]),
+                "code": code_of_reason_line(item["advisor_outcome_detail"]),
+            },
+        )
+    await _apply_one(db, item)
+    return True

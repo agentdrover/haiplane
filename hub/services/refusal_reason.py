@@ -27,6 +27,9 @@ CAP_HANDOFF = "steward_cap_handoff"
 #: Проверка потолка класса бросила исключение: «не смогли проверить» - не то же
 #: самое, что «класс выше потолка» (``class_above_policy_ceiling``).
 CEILING_CHECK_FAILED = "ceiling_check_failed"
+#: Факт ранней проверки класса не привязан к этой сдаче (поколение или коммит) -
+#: класс не вычислен, а не «выше потолка»: переходящая причина (#2054).
+CEILING_FACT_UNBOUND = "ceiling_fact_unbound"
 WHERE = "подробности в журнале хаба"
 
 #: Окончание каждого текста: перечень причин устаревает и врёт, как только ворота
@@ -43,6 +46,7 @@ _CLAIMS: dict[str, str] = {
     "ci_integrity": "проверка входов CI не пройдена",
     "class_above_policy_ceiling": "класс сдачи не прошёл проверку потолка политики проекта",
     CEILING_CHECK_FAILED: "проверка потолка класса не выполнена из-за сбоя",
+    CEILING_FACT_UNBOUND: "факт класса ранней проверки не привязан к этой сдаче",
     "precondition_failed": "не выполнено предусловие применения",
     "verdict_already_stands": "на эту сдачу вердикт уже стоит",
     "verdict_generation_moved": "поколение сдачи уже другое",
@@ -64,6 +68,24 @@ REASON_TEXTS: dict[str, str] = {
 }
 
 
+#: Причины, которые проходят сами, когда CI закреплённого коммита подтверждён (#2054):
+#: после этого применение approve повторяется один раз на сдачу.
+TRANSIENT_APPLY_CODES = frozenset(
+    {"ci_not_green", CEILING_CHECK_FAILED, CEILING_FACT_UNBOUND}
+)
+#: Гонки 409: другой писатель успел первым. Это не сбой применения: не ``failed``
+#: и не повторяется (#2054, B-2).
+RACE_CODES = frozenset(
+    {
+        "verdict_taken",
+        "submission_moved",
+        "generation_moved",
+        "verdict_generation_moved",
+        "verdict_not_written",
+    }
+)
+
+
 class CodedRefusal(HTTPException):
     """Отказ с кодом причины, названным самим писателем (ключ ``REASON_TEXTS``)."""
 
@@ -80,6 +102,16 @@ def _code_of(exc: HTTPException) -> str:
         reason = exc.detail.get("reason") or exc.detail.get("code")
         return reason if isinstance(reason, str) else ""
     return str(exc.detail).split(":", 1)[0].strip()
+
+
+def code_of(exc: Exception) -> str:
+    """Код причины исключения применения; пусто, если это не отказ ворот."""
+    return _code_of(exc) if isinstance(exc, HTTPException) else ""
+
+
+def code_of_reason_line(detail: str) -> str:
+    """Код из сохранённой причины (``reason_line``): слово до первого двоеточия."""
+    return (detail or "").split(":", 1)[0].strip()
 
 
 def reason_line(exc: Exception) -> str:

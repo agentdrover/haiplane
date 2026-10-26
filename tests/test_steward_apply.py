@@ -1856,3 +1856,50 @@ async def test_the_ceiling_is_rechecked_inside_the_verdict_transaction(
     async with ceiling_scope():
         await apply_refusals(db, outside)
     await refused(outside)
+
+
+async def test_a_transient_apply_failure_is_retried_when_ci_turns_verified(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#2054: approve судьи с согласием советника не применился из-за ``ci_not_green``;
+    CI закреплённого коммита стал verified - применение повторяется один раз, вердикт
+    записан; гонка 409 не метит ``failed`` и не повторяется."""
+    from fastapi import HTTPException
+
+    from tests import ci_wake_support as wake
+    from tests.steward_double_clean_support import (
+        build_case,
+        policy_of,
+        verdict_of,
+    )
+
+    case = await build_case(
+        db, monkeypatch, "retry-ci", policy=policy_of("r2", None, None), risk="R2"
+    )
+    await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
+    failed = await wake.judgement_of(db, case.task_id)
+    assert failed["advisor_outcome"] == "failed"
+    assert failed["advisor_outcome_detail"].startswith("ci_not_green: ")
+    assert await verdict_of(db, case.task_id) == ""
+
+    await wake.ci_report_arrives(db, monkeypatch, case.task_id)
+
+    assert await verdict_of(db, case.task_id) == "approved"
+    assert (await wake.judgement_of(db, case.task_id))["advisor_outcome"] == "approved"
+    assert len(await wake.events_of(db, wake.RETRY_EVENT, case.task_id)) == 1
+
+    # Гонка: вердикт уже взят - не failed и не повторяется.
+    raced = await build_case(
+        db, monkeypatch, "retry-race", policy=policy_of("r2", None, None), risk="R2"
+    )
+    taken = HTTPException(409, "verdict_taken: вердикт уже записан")
+    await wake.fail_the_apply(db, monkeypatch, exc=taken)
+    row = await wake.judgement_of(db, raced.task_id)
+    assert row["advisor_outcome"] != "failed", row
+    before = await wake.count_events(db, raced.task_id)
+    await wake.ci_report_arrives(db, monkeypatch, raced.task_id)
+    assert await wake.events_of(db, wake.RETRY_EVENT, raced.task_id) == []
+    assert (await wake.judgement_of(db, raced.task_id))["advisor_outcome"] == (
+        row["advisor_outcome"]
+    )
+    assert await wake.count_events(db, raced.task_id) == before + 1  # только метка

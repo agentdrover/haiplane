@@ -238,6 +238,10 @@ async def settle_ci_run_report(db: Any, task_id: int, stored: dict) -> dict:
         if current
         else (ci_trust.UNVERIFIED, "pending")
     )
+    if applied and standing is not None and standing.verified:
+        from hub.services.ci_verified_wake import wake_on_verified
+
+        await wake_on_verified(db, task_id, head_sha, applied=True)  # #2054
     return {
         "applied": applied,
         "reason": applied_reason,

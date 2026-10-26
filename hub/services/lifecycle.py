@@ -4568,7 +4568,9 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
             else "auto_approve_max_class",
         )
     if ceiling:
-        raise HTTPException(422, f"{ceiling[0]}: {ceiling[1]}")
+        from hub.services.steward_apply import unbound_fact_refusal
+
+        raise unbound_fact_refusal(f"{ceiling[0]}: {ceiling[1]}")
     await ci_integrity.verdict_gate(state)  # #1688
 
 
