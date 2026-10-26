@@ -74,8 +74,12 @@ async def settle_dispatch(
     *,
     usage: int | str | None,
     generation: int = 1,
+    report_id: int | None = None,
 ) -> list[tuple[Any, ...]]:
-    """Завершённый заказ хаба и подставленный ответ биллинга; журнал обращений к нему."""
+    """Завершённый заказ хаба и подставленный ответ биллинга; журнал обращений к нему.
+
+    ``report_id`` - отчёт, который этот заказ породил (привязка #1946).
+    """
     dispatch_id = await repo.create_review_dispatch(
         db,
         task_id=task_id,
@@ -85,6 +89,11 @@ async def settle_dispatch(
         model="grok-4.6",
     )
     await repo.set_review_dispatch_status(db, dispatch_id, "done")
+    if report_id is not None:
+        await db.execute(
+            "UPDATE machine_reviews SET dispatch_id=? WHERE id=?",
+            (dispatch_id, report_id),
+        )
     await db.commit()
     calls: list[tuple[Any, ...]] = []
 
@@ -118,7 +127,11 @@ async def empty_case(
         pair=False,
         order=False,
     )
-    await add_report(db, case.task_id, raw_count=raw_count, tokens_spent=tokens_spent)
-    calls = await settle_dispatch(db, case.task_id, monkeypatch, usage=usage)
+    report = await add_report(
+        db, case.task_id, raw_count=raw_count, tokens_spent=tokens_spent
+    )
+    calls = await settle_dispatch(
+        db, case.task_id, monkeypatch, usage=usage, report_id=report
+    )
     await judge_and_advise(db, case.task_id)
     return case, calls
