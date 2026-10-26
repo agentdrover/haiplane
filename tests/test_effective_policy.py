@@ -1745,3 +1745,8 @@ async def test_the_steward_daily_cap_is_visible(
     ):
         assert cli.main() in (0, None)
     assert capsys.readouterr().out.strip() == mcp_text.strip()
+
+
+from tests.steward_empty_report_cases import (  # noqa: E402,F401  (#2082)
+    test_an_empty_report_blocks_candidate_readiness,
+)

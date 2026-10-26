@@ -42,6 +42,7 @@ from hub.services.steward_applied import (
 )
 from hub.services.steward_evidence import ReviewBrief
 from tests.ci_trust_support import seed_verified_report
+from tests.steward_empty_report_cases import *  # noqa: F403  (#2082)
 from tests.test_steward_shadow import _project
 from tests.test_steward_shadow import _task as _shadow_task
 
