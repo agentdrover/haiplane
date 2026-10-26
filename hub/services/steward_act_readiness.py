@@ -174,12 +174,10 @@ async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | Non
     ceiling = ceiling_reason(
         project_policy.steward_approve_max_class_of(policy), row["risk_class"]
     )
-    double_clean = bool(
-        ceiling
-        and ceiling[0] == BLOCKED
-        and await may_apply_to_class(db, task_id, row["risk_class"])
-    )
-    if double_clean:
+    double_clean = False
+    if ceiling and ceiling[0] == BLOCKED:
+        double_clean = await may_apply_to_class(db, task_id, row["risk_class"])
+    if ceiling and double_clean:
         # #1986: выше обычного потолка, но не выше двойной чистоты. Пара отчётов,
         # CI и согласие советника чтением не проверяются: непроверенное - unknown.
         unknown.append(

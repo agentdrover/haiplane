@@ -83,6 +83,7 @@ async def add_report(
     self_reviewed: bool = False,
     carried_from: int | None = None,
     evidence: bool = True,
+    raw: int | None = None,
 ) -> int:
     """Отчёт ревью; ``pinned`` - с пином, проверенным хабом (#1985)."""
     review_id = await repo.insert_machine_review(
@@ -95,7 +96,10 @@ async def add_report(
         duration_ms=1000,
         orchestrator="cursor",
         model="grok-4.6",
-        raw_count=len(confirmed) if evidence else 0,
+        # Исполнение видно: ревьюер видел кандидатов; пустой отчёт - частный случай.
+        raw_count=raw
+        if raw is not None
+        else (len(confirmed) + 1 if evidence else 0),
         findings_confirmed=json.dumps(list(confirmed)),
         findings_rejected="[]",
         unresolved=json.dumps(list(unresolved)),
