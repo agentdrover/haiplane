@@ -412,3 +412,77 @@ async def test_a_failing_silence_check_never_blocks_the_verdict(db, monkeypatch)
         "changes_requested"
     )
     assert await _alerts(db, task_id) == []
+
+
+async def test_a_shadow_only_project_is_skipped_without_a_trace(db, monkeypatch):
+    """Codex 4 P2: тень - не делегирование; суждение не занимается и не падает."""
+    task_id = await _scene(db, monkeypatch, "jcr-shadow-only")
+    await db.execute(
+        "UPDATE projects SET gate_policy=?",
+        (json.dumps({"steward_shadow": True}),),
+    )
+    await db.commit()
+
+    assert await apply_judge_changes_requests(db) == 0
+
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == ""
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"
+    assert await _alerts(db, task_id) == []
+    # Делегирование позже применяет то же суждение.
+    await db.execute(
+        "UPDATE projects SET gate_policy=?", (json.dumps({"verdict": "steward"}),)
+    )
+    await db.commit()
+    assert await apply_judge_changes_requests(db) == 1
+
+
+def test_more_findings_than_a_verdict_holds_are_folded_not_lost():
+    from hub.models import TaskReviewVerdict
+    from hub.services.steward_applied import judge_findings
+
+    for total in (50, 51, 100):
+        raw = [
+            {"finding_uid": f"u{n:03d}", "title": f"дефект {n}", "severity": "low"}
+            for n in range(1, total + 1)
+        ]
+        raw[-1]["severity"] = "high"
+        got = judge_findings({"findings": json.dumps(raw)})
+        assert len(got) == 50
+        # Вердикт принимает их без ValidationError.
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested, comments="x", findings=got
+        )
+        if total == 50:
+            assert "Ещё" not in got[-1].message
+            continue
+        folded = total - 49
+        assert got[-1].message.startswith(f"Ещё {folded} находок")
+        assert "[uid u050]" in got[-1].message
+        assert got[-1].severity.value == "high"
+
+
+async def test_a_changes_request_with_100_findings_is_applied(db, monkeypatch):
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    _grant_act(monkeypatch)
+    project_id = await _project(db, "jcr-100")
+    task_id = await _client_task(db, project_id)
+    await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind="verdict",
+            verdict="changes_requested",
+            confidence="high",
+            grounds=[{"source": "ci_pinned_sha", "detail": "ci 1 ok"}],
+            findings=[{"title": f"дефект {n}"} for n in range(100)],
+            model="gpt-5.3-codex",
+        ),
+        TokenIdentity("steward-bot", "steward", principal_id=42),
+    )
+
+    assert await apply_judge_changes_requests(db) == 1
+
+    got = await _verdict(db, task_id)
+    assert got["task"]["status"] == "running" and len(got["findings"]) == 50

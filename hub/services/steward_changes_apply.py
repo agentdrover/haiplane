@@ -79,7 +79,7 @@ async def apply_judge_changes_requests(db: aiosqlite.Connection) -> int:
         if await task_automation_not_applicable(db, task_id):
             continue  # #1647: state-задачу стюард не двигает
         project = await repo.resolve_project_for_task(db, task_id)
-        if not _policy_wants_steward(project, gate="verdict"):
+        if not _policy_wants_steward(project, gate="verdict", shadow=False):
             continue
         stamp = await _stamp_now(db)
         cursor = await db.execute(

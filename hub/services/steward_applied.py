@@ -260,32 +260,54 @@ def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
     except ValueError:
         raw = []
     entries = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
-    out: list[ReviewFinding] = []
-    for number, entry in enumerate(entries, 1):
-        text = next(
-            (
-                str(entry[key]).strip()
-                for key in ("message", "title", "summary", "detail")
-                if str(entry.get(key) or "").strip()
-            ),
-            json.dumps(entry, ensure_ascii=False),
+    findings = [_judge_finding(number, e) for number, e in enumerate(entries, 1)]
+    if len(findings) <= _VERDICT_FINDINGS_MAX:
+        return findings
+    # Судья принимает до 100 находок, вердикт хранит 50: лишние не теряются, а
+    # складываются в последнюю - со счётом и uid, сколько уместится в сообщение.
+    keep, rest = (
+        findings[: _VERDICT_FINDINGS_MAX - 1],
+        findings[_VERDICT_FINDINGS_MAX - 1 :],
+    )
+    head = f"Ещё {len(rest)} находок судьи (не уместились в список): "
+    body = " | ".join(f.message.replace("\n", " ") for f in rest)
+    top = min((f.severity for f in rest), key=_SEVERITY_ORDER.index)
+    keep.append(
+        ReviewFinding(
+            id=_VERDICT_FINDINGS_MAX,
+            severity=top,
+            message=(head + body)[:2000],
         )
-        line = entry.get("line")
-        uid = str(entry.get("finding_uid") or "").strip()
-        out.append(
-            ReviewFinding(
-                id=number,
-                severity=_SEVERITY_OF.get(
-                    str(entry.get("severity") or "").strip().lower(),
-                    ReviewSeverity.medium,
-                ),
-                message=(f"[uid {uid}] {text}" if uid else text)[:2000],
-                file=str(entry.get("file") or "")[:500],
-                line=line if isinstance(line, int) and line >= 1 else None,
-                recommendation=str(entry.get("recommendation") or "")[:2000],
-            )
-        )
-    return out
+    )
+    return keep
+
+
+#: Сколько находок вмещает вердикт (``TaskReviewVerdict.findings``).
+_VERDICT_FINDINGS_MAX = 50
+_SEVERITY_ORDER = [ReviewSeverity.high, ReviewSeverity.medium, ReviewSeverity.low]
+
+
+def _judge_finding(number: int, entry: dict[str, Any]) -> ReviewFinding:
+    text = next(
+        (
+            str(entry[key]).strip()
+            for key in ("message", "title", "summary", "detail")
+            if str(entry.get(key) or "").strip()
+        ),
+        json.dumps(entry, ensure_ascii=False),
+    )
+    line = entry.get("line")
+    uid = str(entry.get("finding_uid") or "").strip()
+    return ReviewFinding(
+        id=number,
+        severity=_SEVERITY_OF.get(
+            str(entry.get("severity") or "").strip().lower(), ReviewSeverity.medium
+        ),
+        message=(f"[uid {uid}] {text}" if uid else text)[:2000],
+        file=str(entry.get("file") or "")[:500],
+        line=line if isinstance(line, int) and line >= 1 else None,
+        recommendation=str(entry.get("recommendation") or "")[:2000],
+    )
 
 
 def _refuse_if_the_submission_moved(task: dict[str, Any], generation: int) -> None:
