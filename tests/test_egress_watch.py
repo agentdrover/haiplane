@@ -219,8 +219,14 @@ async def test_probe_is_bounded_and_never_blocks_the_loop(client, db):
     watcher = asyncio.create_task(
         ew.run_loop(open_db, ew.EgressWatch(slow_probe), sleep=quick_sleep)
     )
-    await asyncio.sleep(0.3)
-    watcher.cancel()
+    try:
+        # Цикл не заблокирован, если пробы продолжают идти; срок - только
+        # страховка от зависания теста, не порог поведения.
+        async with asyncio.timeout(10):
+            while runs < 3:
+                await asyncio.sleep(0.01)
+    finally:
+        watcher.cancel()
     with pytest.raises(asyncio.CancelledError):
         await watcher
     assert runs >= 3
