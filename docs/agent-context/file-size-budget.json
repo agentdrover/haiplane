@@ -35,7 +35,7 @@
     },
     {
       "path": "hub/integrations/git_ops.py",
-      "measured": 4672,
+      "measured": 4708,
       "max": 4906,
       "removed_by": "unclaimed"
     },
@@ -95,7 +95,7 @@
     },
     {
       "path": "hub/services/review_dispatch.py",
-      "measured": 8017,
+      "measured": 7959,
       "max": 8295,
       "removed_by": "unclaimed"
     },
