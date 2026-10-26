@@ -72,6 +72,7 @@ class Spawn:
         self.procs: list[Any] = []
         self.attached = asyncio.Event()
         self.release = asyncio.Event()
+        self.reaping = asyncio.Event()
 
     @property
     def pid(self) -> int:
@@ -105,6 +106,14 @@ async def spawn_log(monkeypatch):
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", watched)
+
+    real_reap = dispatch_mod._reap_spawned
+
+    async def observed_reap(spawned):
+        spawn.reaping.set()
+        await real_reap(spawned)
+
+    monkeypatch.setattr(dispatch_mod, "_reap_spawned", observed_reap)
     yield spawn
     spawn.release.set()
     for proc in spawn.procs:
@@ -144,28 +153,45 @@ async def _wait_for(condition, what: str, seconds: float = WAIT) -> None:
         await asyncio.sleep(0.01)
 
 
+async def _hold_until_pipe_full(spawn: Spawn) -> None:
+    """Держит spawn, пока ребёнок не заполнит трубу, затем отпускает его.
+
+    Срок submit (SUBMIT_TIMEOUT) начинается только после этого: на медленном
+    старте ребёнок иначе убит до заполнения трубы, и дефектный reap не виснет.
+    """
+    await _wait_for(spawn.attached.is_set, "процесс запущен, spawn удержан")
+    await _wait_for(spawn.pipe_full, "труба заполнена, читатель остановлен")
+    spawn.release.set()
+
+
 async def test_a_timed_out_submit_returns_on_a_full_pipe(flooding_child, spawn_log):
+    spawn_log.hold = True
+    task = asyncio.ensure_future(
+        dispatch_mod.DispatchIntegration().submit_task("m", task_id=1)
+    )
+    await _hold_until_pipe_full(spawn_log)
     started = time.monotonic()
     with pytest.raises(TimeoutError):
-        await _within(
-            dispatch_mod.DispatchIntegration().submit_task("m", task_id=1),
-            TEST_TIMEOUT + CEILING,
-        )
+        await _within(task, TEST_TIMEOUT + CEILING)
     assert time.monotonic() - started < TEST_TIMEOUT + CEILING
     await _wait_for(lambda: not _alive(spawn_log.pid), "смерть дочернего процесса")
 
 
-async def test_a_full_pipe_timeout_frees_the_booking(db, monkeypatch, flooding_child):
+async def test_a_full_pipe_timeout_frees_the_booking(
+    db, monkeypatch, flooding_child, spawn_log
+):
     from hub.services import rework_launch
 
     monkeypatch.setattr(plugins, "dispatch", dispatch_mod.DispatchIntegration())
     task_id = await _task_in(db, "needs_decision", submission_generation=1)
 
+    spawn_log.hold = True
+    decide = asyncio.ensure_future(
+        services.decide_task(db, task_id, TaskDecide(**REWORK))
+    )
+    await _hold_until_pipe_full(spawn_log)
     with pytest.raises(TimeoutError):
-        await _within(
-            services.decide_task(db, task_id, TaskDecide(**REWORK)),
-            TEST_TIMEOUT + CEILING,
-        )
+        await _within(decide, TEST_TIMEOUT + CEILING)
 
     rows = await db.execute_fetchall(
         "SELECT state, boot_id FROM rework_launches WHERE task_id=?", (task_id,)
@@ -204,10 +230,8 @@ async def test_a_second_cancel_does_not_skip_the_group_reap(flooding_child, spaw
     await _wait_for(spawn_log.attached.is_set, "процесс запущен, spawn удержан")
     await _wait_for(spawn_log.pipe_full, "труба заполнена, читатель остановлен")
     task.cancel()
-    # Очистка (_finish) ждёт удержанный spawn; несколько оборотов цикла дают
-    # первой отмене дойти до неё. Это порядок событий, а не отрезок времени.
-    for _ in range(20):
-        await asyncio.sleep(0)
+    # Вторая отмена должна прийти, пока очистка (_finish) ждёт удержанный spawn.
+    await _wait_for(spawn_log.reaping.is_set, "очистка началась")
     assert not task.done(), "очистка должна ещё ждать удержанный spawn"
     task.cancel()
     spawn_log.release.set()
