@@ -1410,6 +1410,14 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
         parts.append(f"Project: {_project_slug(task)}")
     if task.get("outcome_status"):
         parts.append(f"Outcome hypothesis: {task['outcome_status']}")
+    own = task.get("outcome_ownership") or {}
+    if own.get("state") == "covered":
+        parts.append(f"Outcome promise: held by #{own.get('owner_task_id')}")
+    elif own.get("state") == "invalid_owner":
+        parts.append(
+            f"Outcome promise: link to #{own.get('owner_task_id')} does not hold "
+            f"({own.get('reason')})"
+        )
     parts += [
         f"Source: {task.get('source', 'human')}",
         f"Runtime: {task.get('runtime', 'auto')}",
@@ -4160,7 +4168,8 @@ def _ownership_line(item: dict[str, Any]) -> list[str]:
     """Who holds the promise, for rows of the actionable view (#2090)."""
     own = item.get("ownership") or {}
     if own.get("state") == "covered":
-        return [f"    held by #{own.get('owner_task_id')} (not answered)"]
+        answered = "" if "latest_answer" in item else " (not answered)"
+        return [f"    held by #{own.get('owner_task_id')}{answered}"]
     if own.get("state") == "invalid_owner":
         return [
             f"    owner link to #{own.get('owner_task_id')} does not hold: "
@@ -4214,7 +4223,7 @@ _ACTIONABLE_HINT = (
 def _actionable_head(data: dict[str, Any]) -> str:
     """Head of the actionable view: zero debt here never means "all answered"."""
     others = (
-        f"{data.get('covered_total', 0)} covered by an owner (not answered), "
+        f"{data.get('covered_total', 0)} covered by an owner (coverage is not an answer), "
         f"{data.get('invalid_owner_total', 0)} with an invalid owner link, "
         f"{data.get('answered_total', 0)} answered"
     )
@@ -4327,12 +4336,16 @@ async def hub_set_outcome_owner(
         )
     except HubApiError as exc:
         return _error_result(exc)
-    held = result.get("owner_task_id")
-    text = (
-        f"Task #{task_id}: promise held by #{held}."
-        if held
-        else f"Task #{task_id}: promise is independent again."
-    )
+    own = result.get("ownership") or {}
+    if own.get("state") == "covered":
+        text = f"Task #{task_id}: promise held by #{own.get('owner_task_id')}."
+    elif own.get("state") == "invalid_owner":
+        text = (
+            f"Task #{task_id}: link to #{own.get('owner_task_id')} saved, but it "
+            f"does not hold now ({own.get('reason')}); the promise is not freed."
+        )
+    else:
+        text = f"Task #{task_id}: promise is independent."
     return structured_echo_result(text, outcome_owner=result)
 
 

@@ -373,7 +373,7 @@ async def _check_cli_and_mcp(db: aiosqlite.Connection) -> None:
     text = result.content[0].text
     data = result.structuredContent["outcome_debt"]
     assert data["view"] == "actionable" and data["covered_total"] == 2
-    assert "covered by an owner" in text and "not answered" in text
+    assert "covered by an owner" in text and "not an answer" in text
 
     # Нулевой долг в срезе не значит «на всё есть ответ».
     quiet = {
@@ -520,3 +520,43 @@ async def test_set_owner_rest_validates_and_records(
     assert api.call_args.args[2] == {"owner_task_id": epic}
     rc, api = _run_main(["outcome-owner", str(child), "--clear"], api_result={})
     assert api.call_args.args[2] == {"owner_task_id": None}
+
+
+async def test_set_owner_answer_carries_the_verdict_and_the_journal_survives(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """Ответ записи называет действие ссылки; запись в ленте переживает запрос."""
+    from hub import mcp_server
+
+    epic = await _task(db, "Open epic", task_type="epic", status="running")
+    child = await _task(db, "Child", parent_id=epic)
+
+    resp = await client.post(
+        f"/api/tasks/{child}/outcome-owner", json={"owner_task_id": epic}
+    )
+
+    body = resp.json()
+    assert body["ownership"]["state"] == "invalid_owner"
+    assert body["ownership"]["reason"] == "owner_not_completed"
+    feed = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=?", (child,)
+    )
+    assert [r[0] for r in feed] == [f"Outcome promise delegated to #{epic}"]
+    with patch.object(mcp_server, "_api_post", AsyncMock(return_value=body)):
+        result = await mcp_server.hub_set_outcome_owner(child, epic)
+    assert "does not hold" in result.content[0].text
+    assert "held by" not in result.content[0].text
+
+
+async def test_ownership_context_does_not_depend_on_bound_variable_count(
+    db: aiosqlite.Connection,
+):
+    """Десятки тысяч id не упираются в лимит переменных SQLite."""
+    epic = await _task(db, "Epic", task_type="epic")
+    child = await _task(db, "Child", parent_id=epic)
+
+    rows = await repo.list_ownership_context(
+        db, [child, *range(100_000, 140_000)], [epic] * 40_000
+    )
+
+    assert {r["id"] for r in rows} == {epic}

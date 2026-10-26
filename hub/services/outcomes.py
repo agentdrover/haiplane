@@ -420,9 +420,9 @@ async def _actionable_debt(db: aiosqlite.Connection) -> dict[str, Any]:
         "note": (
             "`total` = promises nobody answered and no valid owner holds "
             "(overdue + observing + unknown). `covered`: the task points at an "
-            "ancestor that holds the promise - the promise is NOT answered, it "
-            "is somebody else's to check. `invalid_owner`: the link does not "
-            "hold (`ownership.reason`) and the promise stays in debt. "
+            "ancestor that holds the promise; coverage is NOT an answer (an "
+            "answer, if any, is in `latest_answer`). `invalid_owner`: the link "
+            "does not hold (`ownership.reason`) and never frees the promise. "
             "`independent_total`, `covered_total` and `invalid_owner_total` "
             "split ONE population (`population_total`); answered and due are "
             "other dimensions and are not additive with them. A metric on an "

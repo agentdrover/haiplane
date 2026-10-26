@@ -19,6 +19,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository
+from hub.db import write_transaction
 from hub.models import OutcomeOwnershipView
 
 Row = Mapping[str, Any]
@@ -120,38 +121,57 @@ async def set_outcome_owner(
 ) -> dict[str, Any]:
     """Delegate the task's promise to an ancestor, or take it back with None.
 
-    Only the chain is checked here. Whether the owner is finished and states a
-    metric is judged at read time: a child may delegate to an epic that is still
-    open, and the link then shows as invalid until the owner completes.
+    Only the chain is checked on write. Whether the owner is finished and states
+    a metric is judged at read time: a child may delegate to an epic that is
+    still open, and the link then shows as invalid until the owner completes -
+    the answer carries that verdict (``ownership``), so a caller is never told
+    "held" about a link that does not hold. Check, write and feed entry are one
+    transaction.
     """
-    row = await repository.get_task(db, task_id)
-    if row is None:
-        raise LookupError(f"task {task_id} not found")
-    task = dict(row)
-    if owner_task_id is not None:
-        if owner_task_id == task_id:
-            raise ValueError(f"task #{task_id} cannot hold its own promise by a link")
-        if await repository.get_task(db, owner_task_id) is None:
-            raise LookupError(f"task {owner_task_id} not found")
-        context = await repository.list_ownership_context(db, [task_id], [])
-        chain = _ancestors(task, {int(r["id"]): dict(r) for r in context})
-        if all(int(a["id"]) != owner_task_id for a in chain):
-            raise ValueError(
-                f"task #{owner_task_id} is not an ancestor of task #{task_id}: "
-                "only a parent, a grandparent and so on can hold its promise"
+    async with write_transaction(db):
+        row = await repository.get_task(db, task_id)
+        if row is None:
+            raise LookupError(f"task {task_id} not found")
+        task = dict(row)
+        if owner_task_id is not None:
+            await _require_ancestor(db, task, owner_task_id)
+        previous = task.get("outcome_owner_task_id")
+        await repository.set_outcome_owner_column(db, task_id, owner_task_id)
+        if previous != owner_task_id:
+            await repository.add_task_update(
+                db,
+                task_id,
+                set_by,
+                "status",
+                (
+                    f"Outcome promise delegated to #{owner_task_id}"
+                    if owner_task_id is not None
+                    else "Outcome promise taken back (independent)"
+                ),
             )
-    previous = task.get("outcome_owner_task_id")
-    await repository.set_outcome_owner_column(db, task_id, owner_task_id)
-    if previous != owner_task_id:
-        await repository.add_task_update(
-            db,
-            task_id,
-            set_by,
-            "status",
-            (
-                f"Outcome promise delegated to #{owner_task_id}"
-                if owner_task_id is not None
-                else "Outcome promise taken back (independent)"
-            ),
+        view = await ownership_for_task(
+            db, {**task, "outcome_owner_task_id": owner_task_id}
         )
-    return {"task_id": task_id, "owner_task_id": owner_task_id, "previous": previous}
+    return {
+        "task_id": task_id,
+        "owner_task_id": owner_task_id,
+        "previous": previous,
+        "ownership": view.model_dump() if view else None,
+    }
+
+
+async def _require_ancestor(
+    db: aiosqlite.Connection, task: Row, owner_task_id: int
+) -> None:
+    task_id = int(task["id"])
+    if owner_task_id == task_id:
+        raise ValueError(f"task #{task_id} cannot hold its own promise by a link")
+    if await repository.get_task(db, owner_task_id) is None:
+        raise LookupError(f"task {owner_task_id} not found")
+    context = await repository.list_ownership_context(db, [task_id], [])
+    chain = _ancestors(task, {int(r["id"]): dict(r) for r in context})
+    if all(int(a["id"]) != owner_task_id for a in chain):
+        raise ValueError(
+            f"task #{owner_task_id} is not an ancestor of task #{task_id}: "
+            "only a parent, a grandparent and so on can hold its promise"
+        )
