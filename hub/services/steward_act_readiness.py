@@ -127,6 +127,35 @@ def _advisor_reason(state: Any) -> tuple[str, dict[str, str]] | None:
     return UNKNOWN, _reason(adv.REFUSED_ADVISOR, detail)
 
 
+async def _empty_report_reason(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[str, dict[str, str]] | None:
+    """(BLOCKED|UNKNOWN, причина) по пустому отчёту (#2082): чтение, без сети.
+
+    Известный запрет - класс выше потолка пустого ревью; биллинг не проверен -
+    ``unknown``, потому что ``ready`` обещало бы то, чего чтение не видело.
+    """
+    from hub.services.steward_empty_report import (
+        CODE_NO_DATA,
+        refusal_of,
+        stored_reading,
+    )
+
+    reading = await stored_reading(db, task_id, generation)
+    if reading is None:
+        return None
+    decision, task = reading
+    if decision.code:
+        return BLOCKED, _reason(*(refusal_of(decision, task) or ("", "")))
+    if decision.pending:
+        return UNKNOWN, _reason(
+            CODE_NO_DATA,
+            "пустой отчёт — нет данных: биллинг провайдера не проверен "
+            "(чтение без сети), работа ревьюера не доказана",
+        )
+    return None
+
+
 async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | None:
     from hub.services.steward_advisor import advisor_state, cap_refusal
     from hub.services.steward_apply import policy_refusal
@@ -145,11 +174,12 @@ async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | Non
     ceiling = ceiling_reason(
         project_policy.steward_approve_max_class_of(policy), row["risk_class"]
     )
-    if (
+    double_clean = bool(
         ceiling
         and ceiling[0] == BLOCKED
         and await may_apply_to_class(db, task_id, row["risk_class"])
-    ):
+    )
+    if double_clean:
         # #1986: выше обычного потолка, но не выше двойной чистоты. Пара отчётов,
         # CI и согласие советника чтением не проверяются: непроверенное - unknown.
         unknown.append(
@@ -162,6 +192,11 @@ async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | Non
         )
     elif ceiling:
         (blocked if ceiling[0] == BLOCKED else unknown).append(ceiling[1])
+    empty = (
+        None if double_clean else await _empty_report_reason(db, task_id, generation)
+    )
+    if empty:
+        (blocked if empty[0] == BLOCKED else unknown).append(empty[1])
     # Передача по суточному потолку - известный запрет и при действительном
     # согласии; спрашивается тем же читателем, что и применение (чистое чтение).
     handoff = await cap_refusal(db, task_id, generation)

@@ -1806,8 +1806,18 @@ async def test_an_empty_report_blocks_candidate_readiness(
     # Маршрут вердикта (общий для REST, MCP и CLI) называет условие и запрет.
     from tests.steward_double_clean_support import grant_act
 
+    from hub.services import steward_shadow
+
     await grant_act(monkeypatch)
     monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    real_mode = steward_shadow.mode_report
+
+    async def _act_mode(_db):
+        return {**await real_mode(_db), "effective": "act"}
+
+    monkeypatch.setattr(steward_shadow, "mode_report", _act_mode)
+    for case in (proofless, above):
+        await repo.update_task(db, case.task_id, submission_model="claude-opus-5")
     waiting = await verdict_route(db, proofless.task_id)
     assert waiting.decider == "steward" and "биллинг" in waiting.condition
     forbidden = await verdict_route(db, above.task_id)

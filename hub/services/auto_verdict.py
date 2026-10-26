@@ -409,46 +409,77 @@ async def _loud_grounds(
     return None
 
 
+@dataclass(frozen=True)
+class EmptyReportDecision:
+    """Решение по отчёту без кандидатов: общее для автопилота и стюарда (#2082).
+
+    ``code`` пуст - отчёт не мешает. ``pending`` - биллинг не спрашивали, ответ
+    верен «если докажется».
+    """
+
+    code: str = ""
+    reason: str = ""
+    note: str = ""
+    pending: bool = False
+
+
+def empty_report_decision(
+    task: dict, review: dict, usage: int | None, *, checked: bool
+) -> EmptyReportDecision:
+    """Чистое правило пустого отчёта (#769, #835): без сети и без записи.
+
+    ``usage`` - доказанный биллингом объём работы ревьюера или ``None``;
+    ``checked`` - спрашивали ли провайдера вообще. Добыть доказательство -
+    дело вызывающего, до транзакции; здесь только решение.
+    """
+    if (review.get("raw_count") or 0) >= 1:
+        return EmptyReportDecision()
+    if checked and usage is None:
+        return EmptyReportDecision(
+            CODE_NO_DATA, "отчёт без единого кандидата — это «нет данных»"
+        )
+    pending = not checked
+    # Proven work is not proven capability (#835): an empty report may stand in
+    # for a review only where a miss costs no more than this reviewer is worth.
+    if _within_proven_empty_ceiling(task):
+        return EmptyReportDecision(pending=pending)
+    ceiling = _proven_empty_ceiling()
+    note = (
+        "Автовердикт НЕ вынесен: пустое ревью выше потолка "
+        f"класса. Класс задачи: {task.get('risk_class') or 'не вычислен'}, "
+        f"потолок для пустого ревью: {ceiling.value if ceiling else 'путь закрыт'} "
+        f"(HAIPLANE_PROVEN_EMPTY_MAX_CLASS="
+        f"{config.PROVEN_EMPTY_MAX_CLASS!r}). "
+        f"Работа ревьюера доказана (usage={usage}), способность — нет. "
+        "Вердикт остаётся человеку."
+    )
+    return EmptyReportDecision(
+        CODE_ABOVE_CEILING,
+        "пустое ревью выше потолка класса: способность ревьюера не доказана",
+        note,
+        pending,
+    )
+
+
 async def _empty_report_stage(
     db: aiosqlite.Connection, task_id: int, ctx: _Ctx
 ) -> AutoStance | None:
     """``raw_count`` 0 is "no data" unless the provider's billing proves work (#769)."""
-    # "No candidates at all" is no data, not no findings (harness v7) —
-    # unless the provider's billing proves the reviewer worked (#769).
-    if not ctx.observe:
-        # Биллинг провайдера — сеть; без неё ответ «если докажется».
-        ctx.pending.append(PENDING_PROVIDER_USAGE)
-    else:
+    # Биллинг провайдера - сеть; без неё ответ «если докажется».
+    if ctx.observe:
         ctx.proven_usage = await _proven_empty_usage(
             db, task_id, ctx.generation, ctx.review
         )
-        if ctx.proven_usage is None:
-            return _refuse_with(
-                CODE_NO_DATA, "отчёт без единого кандидата — это «нет данных»", ctx
-            )
-    # Proven work is not proven capability (#835): an empty report may
-    # stand in for a review only where a miss costs no more than this
-    # reviewer is worth. Refused quietly — no trigger fired, the human
-    # gate simply stands — but the reason goes to the feed so the
+    decision = empty_report_decision(
+        ctx.task, ctx.review, ctx.proven_usage, checked=ctx.observe
+    )
+    if decision.pending:
+        ctx.pending.append(PENDING_PROVIDER_USAGE)
+    if not decision.code:
+        return None
+    # Quiet refusal: the human gate stands, the reason goes to the feed so the
     # digest (#739) can show what the ceiling actually held back.
-    if not _within_proven_empty_ceiling(ctx.task):
-        ceiling = _proven_empty_ceiling()
-        note = (
-            "Автовердикт НЕ вынесен: пустое ревью выше потолка "
-            f"класса. Класс задачи: {ctx.task.get('risk_class') or 'не вычислен'}, "
-            f"потолок для пустого ревью: {ceiling.value if ceiling else 'путь закрыт'} "
-            f"(HAIPLANE_PROVEN_EMPTY_MAX_CLASS="
-            f"{config.PROVEN_EMPTY_MAX_CLASS!r}). "
-            f"Работа ревьюера доказана (usage={ctx.proven_usage}), способность — нет. "
-            "Вердикт остаётся человеку."
-        )
-        return _refuse_with(
-            CODE_ABOVE_CEILING,
-            "пустое ревью выше потолка класса: способность ревьюера не доказана",
-            ctx,
-            note=note,
-        )
-    return None
+    return _refuse_with(decision.code, decision.reason, ctx, note=decision.note)
 
 
 def text_origin_refusal(review: dict) -> tuple[str, str] | None:

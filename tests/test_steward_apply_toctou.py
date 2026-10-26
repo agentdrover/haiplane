@@ -520,7 +520,7 @@ def test_a_fixed_text_is_a_general_claim_with_a_pointer_to_the_log():
     """
     from hub.services.refusal_reason import REASON_TEXTS, WHERE
 
-    assert len(REASON_TEXTS) == 19
+    assert len(REASON_TEXTS) == 21
     for code, text in REASON_TEXTS.items():
         assert text.endswith("точная причина в журнале хаба"), code
         claim = text.split(" — ", 1)[0]
