@@ -14,7 +14,6 @@ from hub.services.ci_report import VALIDATION_PASS, settle_ci_run_report
 from tests.ci_trust_support import VERIFIED_ROW, upsert_hub_report
 
 SHA = "a" * 40
-WAKE_EVENT = "ci_verified_wake"
 RETRY_EVENT = "steward_apply_retry"
 
 
@@ -73,6 +72,23 @@ async def events_of(db: aiosqlite.Connection, kind: str, task_id: int) -> list[d
         (kind, task_id),
     )
     return [json.loads(dict(r)["payload"] or "{}") for r in rows]
+
+
+async def wake_rows(db: aiosqlite.Connection, task_id: int) -> list[tuple[int, str]]:
+    """Строки durable-дедупа автопилота: (поколение, коммит)."""
+    rows = await fetchall(
+        db,
+        "SELECT generation, head_sha FROM ci_verified_wakes WHERE task_id=? "
+        "ORDER BY generation",
+        (task_id,),
+    )
+    return [(int(dict(r)["generation"]), str(dict(r)["head_sha"])) for r in rows]
+
+
+async def prune_all_events(db: aiosqlite.Connection) -> None:
+    """Как ``prune_events`` через две недели: журнал пуст, дедуп обязан устоять."""
+    await db.execute("DELETE FROM events")
+    await db.commit()
 
 
 async def count_events(db: aiosqlite.Connection, task_id: int) -> int:

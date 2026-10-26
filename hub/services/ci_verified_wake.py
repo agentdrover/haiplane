@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 
+from typing import Any
+
 import aiosqlite
 
 from hub import repository as repo
@@ -31,39 +33,50 @@ log = logging.getLogger("hub.ci_verified_wake")
 EVENT_CI_VERIFIED_WAKE = "ci_verified_wake"
 
 
-async def _first_wake(
+async def _claim_wake(
     db: aiosqlite.Connection, task_id: int, generation: int, head_sha: str
 ) -> bool:
-    """Занять переход «verified» для (поколение, коммит): ``True`` - занят этим вызовом.
+    """Занять пробуждение автопилота для (задача, поколение, коммит); ``True`` - занято нами.
 
-    Одна транзакция: задача перечитывается и должна всё ещё стоять на том же
-    поколении и закреплённом коммите, на которых отчёт стал verified, - иначе
-    пересдача между проверкой и пробуждением съела бы чужой повтор.
+    Дедуп держит строка ``ci_verified_wakes`` (PRIMARY KEY, не чистится): занимает
+    ``INSERT OR IGNORE``. Задача перечитывается в той же транзакции и должна стоять
+    на том же поколении и закреплённом коммите, иначе пересдача съела бы чужое.
     """
     async with write_transaction(db):
-        task = dict(await repo.get_task(db, task_id) or {})
-        if (
-            int(task.get("submission_generation") or 0) != generation
-            or (task.get("submission_sha") or "").strip() != head_sha
-        ):
+        if await _standing(db, task_id, generation, head_sha) is None:
             return False
-        seen = await fetchall(
-            db,
-            "SELECT 1 FROM events WHERE kind=? AND task_id=? "
-            "AND json_extract(payload, '$.generation')=? "
-            "AND json_extract(payload, '$.head_sha')=?",
-            (EVENT_CI_VERIFIED_WAKE, task_id, generation, head_sha),
+        claimed = await db.execute(
+            "INSERT OR IGNORE INTO ci_verified_wakes (task_id, generation, head_sha) "
+            "VALUES (?, ?, ?)",
+            (task_id, generation, head_sha),
         )
-        if seen:
-            return False
-        await repo.insert_event(
-            db,
-            kind=EVENT_CI_VERIFIED_WAKE,
-            task_id=task_id,
-            actor="hub",
-            payload={"generation": generation, "head_sha": head_sha},
-        )
-    return True
+        return claimed.rowcount == 1
+
+
+async def _standing(
+    db: aiosqlite.Connection, task_id: int, generation: int, head_sha: str
+) -> dict[str, Any] | None:
+    """Задача, если она в review на этом поколении и этом закреплённом коммите."""
+    task = dict(await repo.get_task(db, task_id) or {})
+    if (
+        task.get("status") == "review"
+        and int(task.get("submission_generation") or 0) == generation
+        and (task.get("submission_sha") or "").strip() == head_sha
+    ):
+        return task
+    return None
+
+
+async def _already_woken(
+    db: aiosqlite.Connection, task_id: int, generation: int, head_sha: str
+) -> bool:
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM ci_verified_wakes WHERE task_id=? AND generation=? "
+        "AND head_sha=?",
+        (task_id, generation, head_sha),
+    )
+    return bool(rows)
 
 
 async def _has_current_report(
@@ -83,16 +96,19 @@ def _nested() -> bool:
 async def wake_on_verified(
     db: aiosqlite.Connection, task_id: int, head_sha: str, generation: int
 ) -> bool:
-    """Разбудить автопилота и повторить применение; ``True`` - это первый переход.
+    """Разбудить автопилота и повторить применение; ``True`` - что-то сделано.
 
-    ``generation`` - поколение, под которым проверка CI началась: пробуждение
-    идёт только пока задача стоит на нём и на ``head_sha``. Вызов из чужой
-    открытой транзакции или из применения не будит: проекция там не закоммичена
-    либо будить из себя же нельзя.
+    ``generation`` - поколение, под которым проверка CI началась: будим, пока задача
+    в review на нём и на ``head_sha``. Дешёвый путь идёт первым и без записей: один
+    запрос задачи, затем только то, что ещё не сделано (строка пробуждения,
+    упавшее суждение). Из чужой транзакции или из применения не будим и ничего не
+    занимаем: следующий разбор разбудит.
     """
     if generation <= 0 or db.in_transaction or _nested():
         return False
     try:
+        if await _standing(db, task_id, generation, head_sha) is None:
+            return False
         asked = await _ask_autopilot(db, task_id, generation, head_sha)
         retried = await _retry_steward(db, task_id, generation, head_sha)
     except Exception:  # noqa: BLE001 - degradation is the contract
@@ -107,9 +123,11 @@ async def _ask_autopilot(
     """Автопилот - один раз на (поколение, коммит), и только когда есть что решать."""
     from hub.services.auto_verdict import maybe_auto_verdict
 
+    if await _already_woken(db, task_id, generation, head_sha):
+        return False
     if not await _has_current_report(db, task_id, generation):
         return False  # отчёта нет: автопилота позовёт сам приход отчёта
-    if not await _first_wake(db, task_id, generation, head_sha):
+    if not await _claim_wake(db, task_id, generation, head_sha):
         return False
     try:
         await maybe_auto_verdict(db, task_id)
@@ -121,7 +139,7 @@ async def _ask_autopilot(
 async def _retry_steward(
     db: aiosqlite.Connection, task_id: int, generation: int, head_sha: str
 ) -> bool:
-    """Повтор применения стюарда: свой счётчик (одно на суждение), не событие пробуждения."""
+    """Повтор применения стюарда: метка на самом суждении, а не событие."""
     from hub.services.steward_advisor import retry_transient_apply
 
     return await retry_transient_apply(db, task_id, generation, head_sha)

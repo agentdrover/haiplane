@@ -1177,8 +1177,9 @@ async def _retry_candidate(
 ) -> dict[str, Any] | None:
     """Суждение, у которого применение отказало переходящей причиной, или None.
 
-    Только текущая сдача, в review, без вердикта этого поколения, и только код
-    из ``TRANSIENT_APPLY_CODES``: постоянный отказ остаётся у человека.
+    Только текущая сдача на том же коммите, в review, без вердикта этого поколения,
+    без метки ``transient_retry_at`` (повтор уже был) и только код из
+    ``TRANSIENT_APPLY_CODES``: постоянный отказ остаётся у человека.
     """
     task = dict(await repo.get_task(db, task_id) or {})
     generation = int(task.get("submission_generation") or 0)
@@ -1195,7 +1196,8 @@ async def _retry_candidate(
         db,
         "SELECT j.id, j.task_id, j.generation, j.advisor_outcome_detail "  # nosec B608 - constant fragments only
         f"FROM steward_judgements j WHERE {PICKED_APPROVE_SQL} "
-        "AND j.task_id=? AND j.generation=? AND j.advisor_outcome=?",
+        "AND j.task_id=? AND j.generation=? AND j.advisor_outcome=? "
+        "AND j.transient_retry_at IS NULL",
         (task_id, generation, OUTCOME_FAILED),
     )
     if not rows:
@@ -1213,31 +1215,28 @@ async def retry_transient_apply(
 ) -> bool:
     """Повторить применение, упавшее переходящей причиной: CI стал verified (#2054).
 
-    Не больше одного повтора на суждение: событие пишется ДО повтора и в одной
-    транзакции с возвратом метки ``failed`` -> пусто, так что второй отчёт CI и
-    второй тик ничего не делают. Гонки 409 сюда не попадают: они не ``failed``.
-    ``True`` - повтор выполнен (его исход записан или применение ждёт поллера).
+    Не больше одного повтора на суждение, и держит это метка ``transient_retry_at``
+    на самой строке суждения: она ставится в той же записи, что возвращает
+    ``failed`` в очередь, и события (их чистит ``prune_events``) не участвуют.
+    Сначала дешёвое чтение без записи и без глобальных запросов: нет упавшего
+    переходящей причиной суждения - выходим, ``effective_mode`` не спрашиваем.
+    Гонки 409 сюда не попадают: они не ``failed``.
     """
     from hub.db import write_transaction
     from hub.services.steward_shadow import effective_mode
 
+    if await _retry_candidate(db, task_id, expected_generation, expected_sha) is None:
+        return False
     if await effective_mode(db) != "act":
         return False
     async with write_transaction(db):
         item = await _retry_candidate(db, task_id, expected_generation, expected_sha)
         if item is None:
             return False
-        retried = await fetchall(
-            db,
-            "SELECT 1 FROM events WHERE kind=? AND task_id=? "
-            "AND json_extract(payload, '$.judgement_id')=?",
-            (EVENT_APPLY_RETRY, task_id, item["id"]),
-        )
-        if retried:
-            return False
         released = await db.execute(
-            "UPDATE steward_judgements SET advisor_outcome='', advisor_claimed_at='' "
-            "WHERE id=? AND advisor_outcome=?",
+            "UPDATE steward_judgements SET advisor_outcome='', advisor_claimed_at='', "
+            "transient_retry_at=datetime('now') "
+            "WHERE id=? AND advisor_outcome=? AND transient_retry_at IS NULL",
             (item["id"], OUTCOME_FAILED),
         )
         if released.rowcount != 1:

@@ -175,7 +175,7 @@ async def _resubmitted_during_the_check(db, monkeypatch, slug, new_gen, new_sha)
     monkeypatch.setattr(ci_trust, "_refresh_locked", resubmitted_meanwhile)
     await ci_trust.refresh(db, case.task_id, wake.SHA)
 
-    assert await wake.events_of(db, wake.WAKE_EVENT, case.task_id) == []
+    assert await wake.wake_rows(db, case.task_id) == []
     assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
     row = dict(await repo.get_steward_judgement(db, case.task_id, new_gen, "verdict"))
     assert row["advisor_outcome"] == "failed"
@@ -263,3 +263,154 @@ async def test_a_repin_during_the_autopilot_call_does_not_consume_the_retry(
 
     assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
     assert (await wake.judgement_of(db, case.task_id))["advisor_outcome"] == "failed"
+
+
+async def test_dedup_survives_the_event_retention(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Через две недели журнал пуст: ни второго вызова автопилота, ни второго повтора."""
+    from hub import repository as repo
+    from hub.services import auto_verdict, ci_trust, ci_verified_wake
+
+    case = await _case(db, monkeypatch, "wake-retention")
+    await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
+    asked: list[int] = []
+
+    async def has_report(*_a, **_k):
+        return True
+
+    async def spy(_db, task_id):
+        asked.append(task_id)
+        return False
+
+    monkeypatch.setattr(ci_verified_wake, "_has_current_report", has_report)
+    monkeypatch.setattr(auto_verdict, "maybe_auto_verdict", spy)
+
+    async def still_red(*_a, **_k):
+        return "нет отчёта CI"
+
+    monkeypatch.setattr(ci_trust, "pass_gap", still_red)
+    await repo.set_ci_run_report_trust(
+        db, case.task_id, wake.SHA, trust="unverified", trust_reason="p", attempt_key=""
+    )
+    await db.commit()
+    await wake.verified_by_github(monkeypatch)
+    await ci_trust.refresh(db, case.task_id, wake.SHA)
+    assert asked == [case.task_id]
+    assert len(await wake.events_of(db, wake.RETRY_EVENT, case.task_id)) == 1
+    assert (await wake.judgement_of(db, case.task_id))["advisor_outcome"] == "failed"
+
+    await wake.prune_all_events(db)  # prune_events через 14 дней
+    await ci_trust.refresh(db, case.task_id, wake.SHA)
+    await ci_trust.refresh(db, case.task_id, wake.SHA)
+
+    assert asked == [case.task_id], "автопилота второй раз не зовут"
+    assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
+    row = await wake.judgement_of(db, case.task_id)
+    assert row["transient_retry_at"], "повтор был - метка на самом суждении"
+
+
+async def test_an_already_deduped_refresh_asks_nothing_global(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """P2-2: разбор с уже занятым дедупом - без effective_mode, записей и событий."""
+    from hub.services import ci_trust, ci_verified_wake, steward_shadow
+
+    case = await _case(db, monkeypatch, "wake-cheap")
+    await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
+    await db.execute(  # повтор уже был, пробуждение автопилота уже занято
+        "UPDATE steward_judgements SET transient_retry_at=datetime('now') "
+        "WHERE task_id=?",
+        (case.task_id,),
+    )
+    await db.execute(
+        "INSERT INTO ci_verified_wakes (task_id, generation, head_sha) VALUES (?, 1, ?)",
+        (case.task_id, wake.SHA),
+    )
+    await db.commit()
+
+    async def has_report(*_a, **_k):
+        return True
+
+    modes: list[int] = []
+
+    async def mode_asked(*_a, **_k):
+        modes.append(1)
+        return "act"
+
+    monkeypatch.setattr(ci_verified_wake, "_has_current_report", has_report)
+    monkeypatch.setattr(steward_shadow, "effective_mode", mode_asked)
+    await wake.verified_by_github(monkeypatch)
+    statements: list[str] = []
+    await db.set_trace_callback(statements.append)
+    try:
+        await ci_trust.refresh(db, case.task_id, wake.SHA)
+    finally:
+        await db.set_trace_callback(None)
+
+    assert modes == [], "effective_mode спрошен до проверки допустимости"
+    # После записи самой проверки (первый COMMIT) - только чтения.
+    mine = statements[statements.index("COMMIT") + 1 :]
+    assert not [s for s in mine if s.startswith(("INSERT", "UPDATE", "BEGIN"))], mine
+    assert not [s for s in mine if "events" in s or "steward_runs" in s], mine
+
+
+async def test_the_wake_claim_is_taken_once(db: aiosqlite.Connection, monkeypatch):
+    """Занять строку пробуждения можно один раз; второй заход видит rowcount 0."""
+    from hub.services import ci_verified_wake
+
+    case = await _case(db, monkeypatch, "wake-claim")
+    assert await ci_verified_wake._claim_wake(db, case.task_id, 1, wake.SHA) is True
+    assert await ci_verified_wake._claim_wake(db, case.task_id, 1, wake.SHA) is False
+    assert await wake.wake_rows(db, case.task_id) == [(1, wake.SHA)]
+
+
+_OURS = ("create_ci_verified_wakes", "add_steward_judgements_transient_retry_at")
+
+
+async def _wake_schema(conn) -> tuple[list[str], list[str]]:
+    key = [
+        r[1]
+        for r in sorted(
+            await conn.execute_fetchall("PRAGMA table_info(ci_verified_wakes)"),
+            key=lambda r: r[5],
+        )
+        if r[5]
+    ]
+    cols = [
+        r[1]
+        for r in await conn.execute_fetchall("PRAGMA table_info(steward_judgements)")
+    ]
+    return key, cols
+
+
+async def test_the_dedup_schema_exists_on_a_fresh_and_an_upgraded_database(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Миграция #2054: свежая база и обновление базы, где строки суждений уже есть."""
+    import hub.db as db_module
+    from hub.db import _SCHEMA, _migrate
+
+    key, cols = await _wake_schema(db)
+    assert key == ["task_id", "generation", "head_sha"]
+    assert "transient_retry_at" in cols
+
+    old = [(n, q) for n, q in db_module._MIGRATIONS if n not in _OURS]
+    async with aiosqlite.connect(":memory:") as conn:
+        monkeypatch.setattr(db_module, "_MIGRATIONS", old)
+        await conn.executescript(_SCHEMA)
+        await _migrate(conn)
+        assert (await _wake_schema(conn))[0] == []  # таблицы ещё нет
+        monkeypatch.undo()
+        await _migrate(conn)
+        key, cols = await _wake_schema(conn)
+        assert key == ["task_id", "generation", "head_sha"]
+        assert "transient_retry_at" in cols
+        await conn.execute(
+            "INSERT INTO ci_verified_wakes (task_id, generation, head_sha) VALUES (1, 1, 'a')"
+        )
+        dup = await conn.execute(
+            "INSERT OR IGNORE INTO ci_verified_wakes (task_id, generation, head_sha) "
+            "VALUES (1, 1, 'a')"
+        )
+        assert dup.rowcount == 0
