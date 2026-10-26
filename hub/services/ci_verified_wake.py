@@ -127,6 +127,8 @@ async def _ask_autopilot(
         return False
     if not await _has_current_report(db, task_id, generation):
         return False  # отчёта нет: автопилота позовёт сам приход отчёта
+    if not await _green(db, task_id, head_sha):
+        return False  # подтверждён красный отчёт: пробуждение не тратим
     if not await _claim_wake(db, task_id, generation, head_sha):
         return False
     try:
@@ -136,10 +138,23 @@ async def _ask_autopilot(
     return True
 
 
+async def _green(db: aiosqlite.Connection, task_id: int, head_sha: str) -> bool:
+    """Зелёный подтверждённый пропуск закреплённого коммита - тот же предикат, что у ворот."""
+    from hub.services import ci_trust
+
+    return await ci_trust.pass_gap(db, task_id, head_sha) is None
+
+
 async def _retry_steward(
     db: aiosqlite.Connection, task_id: int, generation: int, head_sha: str
 ) -> bool:
     """Повтор применения стюарда: метка на самом суждении, а не событие."""
     from hub.services.steward_advisor import retry_transient_apply
 
-    return await retry_transient_apply(db, task_id, generation, head_sha)
+    return await retry_transient_apply(
+        db,
+        task_id,
+        generation,
+        head_sha,
+        confirmed=lambda: _green(db, task_id, head_sha),
+    )

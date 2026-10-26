@@ -82,6 +82,11 @@ RACE_CODES = frozenset(
         "generation_moved",
         "verdict_generation_moved",
         "verdict_not_written",
+        # Другой писатель (человек, автопилот) уже поставил или закрыл вердикт:
+        "verdict_already_stands",
+        "verdict_window_closed",
+        # Метка применения уже переведена другим путём (эскалация прервавшегося):
+        "claim_lost",
     }
 )
 

@@ -6,7 +6,13 @@ import aiosqlite
 from fastapi import HTTPException
 
 from tests import ci_wake_support as wake
+from hub.services import steward_apply
 from tests.steward_double_clean_support import build_case, policy_of, verdict_of
+
+
+async def _breaks(*_args, **_kwargs):
+    """Поздняя проверка потолка падает переходящей причиной: повтор состоялся и отказал."""
+    raise PermissionError("policy read")
 
 
 async def _case(db, monkeypatch, slug):
@@ -66,13 +72,9 @@ async def test_the_retry_happens_once_per_generation(
     """Повтор тоже отказал переходящей причиной - второго повтора нет, события не множатся."""
     case = await _case(db, monkeypatch, "wake-once")
     await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
-    from hub.services import ci_trust
-
-    async def still_red(*_a, **_k):
-        return "нет отчёта CI"
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(ci_trust, "pass_gap", still_red)
+        scoped.setattr(steward_apply, "ceiling_gate", _breaks)
         await wake.ci_report_arrives(db, monkeypatch, case.task_id)
     assert len(await wake.events_of(db, wake.RETRY_EVENT, case.task_id)) == 1
     again = await wake.judgement_of(db, case.task_id)
@@ -120,17 +122,13 @@ async def test_the_retry_itself_is_recorded_and_runs_once(
     db: aiosqlite.Connection, monkeypatch
 ):
     """Повтор пишет событие и не выполняется второй раз, даже если зовут напрямую."""
-    from hub.services import ci_trust
     from hub.services.steward_advisor import retry_transient_apply
 
     case = await _case(db, monkeypatch, "wake-direct")
     await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
 
-    async def still_red(*_a, **_k):
-        return "нет отчёта CI"
-
     with monkeypatch.context() as scoped:
-        scoped.setattr(ci_trust, "pass_gap", still_red)
+        scoped.setattr(steward_apply, "ceiling_gate", _breaks)
         assert await retry_transient_apply(db, case.task_id, 1, wake.SHA) is True
         assert await retry_transient_apply(db, case.task_id, 1, wake.SHA) is False
     assert len(await wake.events_of(db, wake.RETRY_EVENT, case.task_id)) == 1
@@ -286,10 +284,7 @@ async def test_dedup_survives_the_event_retention(
     monkeypatch.setattr(ci_verified_wake, "_has_current_report", has_report)
     monkeypatch.setattr(auto_verdict, "maybe_auto_verdict", spy)
 
-    async def still_red(*_a, **_k):
-        return "нет отчёта CI"
-
-    monkeypatch.setattr(ci_trust, "pass_gap", still_red)
+    monkeypatch.setattr(steward_apply, "ceiling_gate", _breaks)
     await repo.set_ci_run_report_trust(
         db, case.task_id, wake.SHA, trust="unverified", trust_reason="p", attempt_key=""
     )
@@ -448,3 +443,79 @@ async def test_the_dedup_schema_exists_on_a_fresh_and_an_upgraded_database(
             "VALUES (1, 1, 'a')"
         )
         assert dup.rowcount == 0
+
+
+async def test_a_verified_red_report_spends_neither_the_ask_nor_the_retry(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """F1: GitHub подтвердил КРАСНЫЙ отчёт - это не зелёный пропуск; зелёная пересдача на том же sha будит."""
+    from hub import repository as repo
+    from hub.services import auto_verdict, ci_trust, ci_verified_wake
+
+    case = await _case(db, monkeypatch, "wake-red")
+    await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
+    asked: list[int] = []
+
+    async def has_report(*_a, **_k):
+        return True
+
+    async def spy(_db, task_id):
+        asked.append(task_id)
+        return False
+
+    monkeypatch.setattr(ci_verified_wake, "_has_current_report", has_report)
+    monkeypatch.setattr(auto_verdict, "maybe_auto_verdict", spy)
+    await wake.verified_by_github(monkeypatch)
+
+    async def mark(status: str) -> None:
+        await db.execute(
+            "UPDATE ci_run_reports SET validation_status=? WHERE task_id=?",
+            (status, case.task_id),
+        )
+        await repo.set_ci_run_report_trust(
+            db,
+            case.task_id,
+            wake.SHA,
+            trust="unverified",
+            trust_reason="p",
+            attempt_key="",
+        )
+        await db.commit()
+
+    await mark("fail")  # verified, но validation_status=fail: pass_gap не пуст
+    await ci_trust.refresh(db, case.task_id, wake.SHA)
+    assert asked == []
+    assert await wake.wake_rows(db, case.task_id) == []
+    assert (await wake.judgement_of(db, case.task_id))["transient_retry_at"] is None
+    assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
+
+    await mark("pass")  # зелёная пересдача того же sha
+    await ci_trust.refresh(db, case.task_id, wake.SHA)
+    await ci_trust.refresh(db, case.task_id, wake.SHA)
+    assert asked == [case.task_id]
+    assert len(await wake.events_of(db, wake.RETRY_EVENT, case.task_id)) == 1
+    assert await verdict_of(db, case.task_id) == "approved"
+
+
+async def test_a_race_that_says_someone_else_moved_first_is_not_a_failure(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """F2: verdict_already_stands (и прочие 409 «уже сдвинули») - skipped, без alert и повтора."""
+    for code in ("verdict_already_stands", "verdict_window_closed"):
+        case = await _case(db, monkeypatch, f"wake-{code}")
+        await wake.fail_the_apply(
+            db, monkeypatch, exc=HTTPException(409, f"{code}: уже сдвинули")
+        )
+        row = await wake.judgement_of(db, case.task_id)
+        assert row["advisor_outcome"] == "skipped", (code, row)
+        assert await wake.events_of(db, "steward_apply_failed", case.task_id) == []
+        feed = [dict(u)["content"] for u in await repo_updates(db, case.task_id)]
+        assert not [c for c in feed if "не применено" in c], feed
+        await wake.ci_report_arrives(db, monkeypatch, case.task_id)
+        assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
+
+
+async def repo_updates(db, task_id):
+    from hub import repository as repo
+
+    return await repo.get_task_updates(db, task_id)

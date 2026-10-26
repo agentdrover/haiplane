@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import aiosqlite
@@ -1211,7 +1212,12 @@ async def _retry_candidate(
 
 
 async def retry_transient_apply(
-    db: aiosqlite.Connection, task_id: int, expected_generation: int, expected_sha: str
+    db: aiosqlite.Connection,
+    task_id: int,
+    expected_generation: int,
+    expected_sha: str,
+    *,
+    confirmed: Callable[[], Awaitable[bool]] | None = None,
 ) -> bool:
     """Повторить применение, упавшее переходящей причиной: CI стал verified (#2054).
 
@@ -1227,6 +1233,8 @@ async def retry_transient_apply(
 
     if await _retry_candidate(db, task_id, expected_generation, expected_sha) is None:
         return False
+    if confirmed is not None and not await confirmed():
+        return False  # повод не наступил (CI не зелёный): единственный повтор цел
     if await effective_mode(db) != "act":
         return False
     async with write_transaction(db):
