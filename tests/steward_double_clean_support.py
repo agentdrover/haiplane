@@ -97,9 +97,7 @@ async def add_report(
         orchestrator="cursor",
         model="grok-4.6",
         # Исполнение видно: ревьюер видел кандидатов; пустой отчёт - частный случай.
-        raw_count=raw
-        if raw is not None
-        else (len(confirmed) + 1 if evidence else 0),
+        raw_count=raw if raw is not None else (len(confirmed) + 1 if evidence else 0),
         findings_confirmed=json.dumps(list(confirmed)),
         findings_rejected="[]",
         unresolved=json.dumps(list(unresolved)),
