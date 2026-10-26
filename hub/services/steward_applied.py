@@ -39,6 +39,7 @@ at-most-once — вердикт привязан к генерации, — и �
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -49,8 +50,9 @@ from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.services import verdict_owner, watch_notices
+from hub.db import fetchall, write_transaction
 from hub.services.refusal_reason import CodedRefusal
-from hub.models import ReviewVerdict, TaskReviewVerdict
+from hub.models import ReviewFinding, ReviewSeverity, ReviewVerdict, TaskReviewVerdict
 from hub.services.result_kind import (
     AUTOMATION_REFUSAL,
     automation_not_applicable,
@@ -219,13 +221,135 @@ async def apply_judgement(
 
     cycles = int(task.get("review_cycle") or 0)
     if review_budget_exhausted(cycles):
-        await _hand_to_the_human(db, task_id, cycles)
+        await _hand_to_the_human(db, task_id, cycles, generation, claim)
         return ESCALATED_TO_HUMAN, (
             f"бюджет циклов исчерпан ({cycles}) — решение за человеком"
         )
 
-    await _record(db, task_id, ReviewVerdict.changes_requested, generation)
+    await _record(
+        db,
+        task_id,
+        ReviewVerdict.changes_requested,
+        generation,
+        claim=claim,
+        findings=judge_findings(dict(judgement)),
+    )
     return RETURNED, f"работа возвращена автору, цикл {cycles + 1}"
+
+
+_SEVERITY_OF = {
+    "high": ReviewSeverity.high,
+    "p1": ReviewSeverity.high,
+    "critical": ReviewSeverity.high,
+    "low": ReviewSeverity.low,
+    "p3": ReviewSeverity.low,
+}
+
+
+def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
+    """Находки судьи в виде находок вердикта: автор получает их списком, а не текстом.
+
+    Судья пишет находки свободными словарями; вердикт хранит ``ReviewFinding``.
+    ``finding_uid`` стоит в сообщении только если судья принёс свой (находка
+    машинного отчёта, которую он переписал): ответ ``finding_outcomes`` хранится
+    за строкой отчёта, и uid, выведенный здесь, остался бы «неизвестным».
+    Невнятная находка не теряется - её сообщением становится сам словарь.
+    """
+    try:
+        raw = json.loads(judgement.get("findings") or "[]")
+    except ValueError:
+        raw = []
+    entries = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    findings = [_judge_finding(number, e) for number, e in enumerate(entries, 1)]
+    if len(findings) <= _VERDICT_FINDINGS_MAX:
+        return findings
+    # Судья принимает до 100 находок, вердикт хранит 50: лишние не теряются, а
+    # складываются в последнюю - со счётом и uid, сколько уместится в сообщение.
+    keep, rest = (
+        findings[: _VERDICT_FINDINGS_MAX - 1],
+        findings[_VERDICT_FINDINGS_MAX - 1 :],
+    )
+    head = f"Ещё {len(rest)} находок судьи (не уместились в список): "
+    parts = [
+        (f"{f.file}:{f.line} " if f.file and f.line else f"{f.file} " if f.file else "")
+        + f.message.replace("\n", " ")
+        for f in rest
+    ]
+    body = _fit_folded(head, parts)
+    top = min((f.severity for f in rest), key=_SEVERITY_ORDER.index)
+    keep.append(
+        ReviewFinding(
+            id=_VERDICT_FINDINGS_MAX,
+            severity=top,
+            message=head + body,
+        )
+    )
+    return keep
+
+
+def _fit_folded(head: str, parts: list[str]) -> str:
+    """Склеить свёрнутые находки до 2000 знаков; не влезшее - счётом, не молча.
+
+    Сперва всё без пометки; не влезло - берём сколько помещается вместе с
+    пометкой, слишком длинную находку обрезаем до начала (file:line впереди),
+    а не обрываем на ней список.
+    """
+    sep, limit = " | ", 2000 - len(head)
+    whole = sep.join(parts)
+    if len(whole) <= limit:
+        return whole
+    kept: list[str | None] = list(parts)
+
+    def render() -> str:
+        shown = [x for x in kept if x is not None]
+        omitted = len(parts) - len(shown)
+        text = sep.join(shown)
+        # Пометка только если что-то опущено: «ещё 0» - ложь и лишние знаки.
+        return text + (f" … ещё {omitted} не показано" if omitted else "")
+
+    # Корректно по построению: пока не помещается - сначала обрезаем самую
+    # длинную находку до начала (file:line впереди), потом выбрасываем
+    # последнюю; пометка пересчитывается с новым счётом.
+    while len(render()) > limit:
+        live = [i for i, x in enumerate(kept) if x is not None]
+        longest = max(live, key=lambda i: len(kept[i] or ""))
+        if len(kept[longest] or "") > _SHORT_HEAD + 1:
+            kept[longest] = (kept[longest] or "")[:_SHORT_HEAD] + "…"
+        else:
+            kept[live[-1]] = None
+    return render()
+
+
+#: Начало слишком длинной находки (file:line впереди), когда целиком не влезает.
+_SHORT_HEAD = 160
+
+
+#: Сколько находок вмещает вердикт (``TaskReviewVerdict.findings``).
+_VERDICT_FINDINGS_MAX = 50
+_SEVERITY_ORDER = [ReviewSeverity.high, ReviewSeverity.medium, ReviewSeverity.low]
+
+
+def _judge_finding(number: int, entry: dict[str, Any]) -> ReviewFinding:
+    text = next(
+        (
+            str(entry[key]).strip()
+            for key in ("message", "title", "summary", "detail")
+            if str(entry.get(key) or "").strip()
+        ),
+        json.dumps(entry, ensure_ascii=False),
+    )
+    line = entry.get("line")
+    uid = str(entry.get("finding_uid") or "").strip()
+    return ReviewFinding(
+        id=number,
+        severity=_SEVERITY_OF.get(
+            str(entry.get("severity") or "").strip().lower(), ReviewSeverity.medium
+        ),
+        message=(f"[uid {uid}] {text}" if uid else text)[:2000],
+        file=str(entry.get("file") or "")[:500],
+        line=line if isinstance(line, int) and line >= 1 else None,
+        recommendation=str(entry.get("recommendation") or "")[:2000],
+    )
 
 
 def _refuse_if_the_submission_moved(task: dict[str, Any], generation: int) -> None:
@@ -285,6 +409,7 @@ async def _record(
     generation: int,
     *,
     claim: tuple[int, str] | None = None,
+    findings: list[ReviewFinding] | None = None,
 ) -> None:
     """Записать вердикт ТЕМ ЖЕ путём, которым его пишет человек.
 
@@ -302,6 +427,7 @@ async def _record(
             agent=_STEWARD_ACTOR,
             verdict=verdict,
             comments=f"Применено стюардом по суждению генерации {generation}.",
+            findings=findings or [],
         ),
         # #1601: вердикт пишется ТОЛЬКО на то поколение, о котором судили, и
         # только пока на него нет вердикта — условие стоит в самой записи.
@@ -311,8 +437,46 @@ async def _record(
     )
 
 
+async def _fence(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    claim: tuple[int, str] | None,
+) -> None:
+    """Эскалация по бюджету пишет только на ту сдачу, о которой судили (#2053).
+
+    Внутри её транзакции: пересдача (другое поколение), вердикт, уже стоящий на
+    этой сдаче, потерянная метка применения или отозванное право стюарда отменяют
+    решение целиком - как в записи вердикта.
+    """
+    task = dict(await repo.get_task(db, task_id) or {})
+    _refuse_if_the_submission_moved(task, generation)
+    _refuse_if_the_verdict_is_taken(task, generation)
+    if claim is None:
+        return
+    held = await fetchall(
+        db,
+        "SELECT 1 FROM steward_judgements WHERE id=? AND advisor_outcome='applying' "
+        "AND advisor_claimed_at=?",
+        (claim[0], claim[1]),
+    )
+    if not held:
+        raise CodedRefusal(
+            409, "метка применения потеряна - эскалация не записана", code="claim_lost"
+        )
+    from hub.services.steward_apply import authority_refusal
+
+    revoked = await authority_refusal(db, task_id)
+    if revoked:
+        raise CodedRefusal(422, f"{revoked[0]}: {revoked[1]}", code=revoked[0])
+
+
 async def _hand_to_the_human(
-    db: aiosqlite.Connection, task_id: int, cycles: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    cycles: int,
+    generation: int,
+    claim: tuple[int, str] | None = None,
 ) -> None:
     """Бюджет исчерпан: существующий переход в needs_decision, без арбитра.
 
@@ -320,6 +484,14 @@ async def _hand_to_the_human(
     маршруте и требует job. Заводить его сюда значило бы построить второй
     арбитраж ради одного случая; человек здесь и есть арбитр.
     """
+    async with write_transaction(db):
+        await _fence(db, task_id, generation, claim)
+        await _escalate_in_transaction(db, task_id, cycles)
+
+
+async def _escalate_in_transaction(
+    db: aiosqlite.Connection, task_id: int, cycles: int
+) -> None:
     from hub.services.orchestration import log_activity
 
     moved = await repo.transition_status_if(

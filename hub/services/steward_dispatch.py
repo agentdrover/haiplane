@@ -1369,6 +1369,7 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
         apply_advisor_outcomes,
         order_due_advisors,
     )
+    from hub.services.steward_changes_apply import apply_judge_changes_requests
     from hub.services.steward_judgement import stamp_judgement_usage
     from hub.services.steward_shadow import check_escalation_corridor, start_due_runs
 
@@ -1401,6 +1402,8 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     await start_due_runs(db)
     # Применение approve судьи — только после ответа советника и только в act.
     await apply_advisor_outcomes(db)
+    # #2053: возврат на доработку судьи применяется тем же проходом, без советника.
+    await apply_judge_changes_requests(db)
     await check_escalation_corridor(db)
     # #2052: сторож «забыли записать» - после заказов, чтобы заказ этого
     # прохода уже считался живым исполнителем. Сбой не роняет проход.

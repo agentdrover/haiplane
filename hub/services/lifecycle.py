@@ -4483,6 +4483,27 @@ async def _ac_tests_gate(state: VerdictContext) -> None:
             raise HTTPException(422, f"ac_tests_not_green: {ac_gap}")
 
 
+async def _steward_return_gate(state: VerdictContext) -> None:
+    """Возврат на доработку по суждению стюарда: право и поколение - по базе СЕЙЧАС (#2053).
+
+    Ранние проверки поллера стояли до метки и могли устареть: проект забрал
+    вердикт себе, ``act`` сняли. Пересдача между ними и записью отменяет решение.
+    """
+    from hub.services.steward_apply import authority_refusal
+
+    task = dict(await repo.get_task(state.db, state.task_id) or state.task)
+    if int(task.get("submission_generation") or 0) != state.expected_generation:
+        raise CodedRefusal(
+            409,
+            f"вердикт о сдаче {state.expected_generation} не записан: поколение "
+            "уже другое",
+            code="generation_moved",
+        )
+    revoked = await authority_refusal(state.db, state.task_id)
+    if revoked:
+        raise HTTPException(422, f"{revoked[0]}: {revoked[1]}")
+
+
 async def _automation_ci_gate(state: VerdictContext) -> None:
     """An approval by automation (the autopilot, the steward) needs a confirmed green pass.
 
@@ -4494,6 +4515,12 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
     """
     from hub.services.auto_verdict import _POLICY_ACTOR
 
+    if (
+        state.applied_by_steward
+        and state.claim is not None  # применение поллера; прямой вызов метки не имеет
+        and state.body.verdict.value == "changes_requested"
+    ):
+        await _steward_return_gate(state)  # #2053
     automated = state.applied_by_steward or state.body.agent == _POLICY_ACTOR
     if not automated or state.body.verdict.value != "approved":
         await ci_integrity.verdict_gate(state)  # #1688: an agent's self-approval
@@ -5053,6 +5080,11 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
                 # #451 restored the workspace to base on submit; on rework put it
                 # back on the task branch so fixes don't land on local base (#457).
                 await _try_switch_pair_workspace_to_task(db, task_id)
+                from hub.services import rework_silence
+
+                await rework_silence.note_if_silent(
+                    db, task_id
+                )  # #2053: только сказать
 
         await repo.insert_event(
             db,

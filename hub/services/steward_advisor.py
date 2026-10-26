@@ -808,6 +808,64 @@ async def _stamp_now(db: aiosqlite.Connection) -> str:
     return str(dict(rows[0])["at"])
 
 
+#: Событие «возврат по CR повторяли»: второй обрыв уходит к человеку (#2053).
+#: Счётчик в событии, а не в advisor_outcome_detail: тот показывается как причина отказа.
+_CR_RETRY_EVENT = "steward_cr_retry"
+
+
+async def _recover_interrupted_changes(
+    db: aiosqlite.Connection, item: dict[str, Any]
+) -> int | None:
+    """Оборванный возврат по CR: сперва смотрим, не записан ли вердикт уже.
+
+    Стоит вердикт этого поколения и задача ушла из review - возврат состоялся,
+    метка просто не снята: исход ``returned``, без тревоги. Иначе один повтор
+    (метка снимается, проход применит заново), а при втором обрыве - ``None``,
+    то есть к человеку общим путём. Возвращает число сдвинутых строк или None.
+    """
+    task_id, generation = int(item["task_id"]), int(item["generation"])
+    task = dict(await repo.get_task(db, task_id) or {})
+    # Решает записанный факт, а не статус: автор мог пересдать до разбора.
+    if await _steward_verdict_recorded(db, item, "changes_requested"):
+        close = "returned"
+    elif await _human_cr_recorded(db, task, item):
+        close = "skipped"  # вердикт человека: не наш возврат
+    elif int(task.get("submission_generation") or 0) > generation:
+        close = "skipped"  # сдача устарела: применять нечего
+    else:
+        close = ""
+    if close:
+        closed = await db.execute(
+            "UPDATE steward_judgements SET advisor_outcome=? "
+            "WHERE id=? AND advisor_outcome=?",
+            (close, item["id"], _OUTCOME_CLAIMED),
+        )
+        return int(closed.rowcount == 1)
+    retried = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE kind=? AND task_id=? "
+        "AND json_extract(payload, '$.judgement_id')=?",
+        (_CR_RETRY_EVENT, task_id, item["id"]),
+    )
+    if retried:
+        return None
+    released = await db.execute(
+        "UPDATE steward_judgements SET advisor_outcome='', advisor_claimed_at='' "
+        "WHERE id=? AND advisor_outcome=?",
+        (item["id"], _OUTCOME_CLAIMED),
+    )
+    if released.rowcount != 1:
+        return 0
+    await repo.insert_event(
+        db,
+        kind=_CR_RETRY_EVENT,
+        task_id=task_id,
+        actor="hub",
+        payload={"judgement_id": item["id"], "generation": generation},
+    )
+    return 1
+
+
 async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     """Применение, занявшее метку и не записавшее исхода, — к человеку, вслух.
 
@@ -820,7 +878,8 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     """
     rows = await fetchall(
         db,
-        "SELECT id, task_id, generation FROM steward_judgements "
+        "SELECT id, task_id, generation, verdict "
+        "FROM steward_judgements "
         "WHERE kind='verdict' AND advisor_outcome=? "
         "AND advisor_claimed_at <= datetime('now', ?)",
         (_OUTCOME_CLAIMED, f"-{config.STEWARD_ADVISOR_WAIT_MAX} minutes"),
@@ -828,6 +887,12 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     moved = 0
     for row in rows:
         item = dict(row)
+        is_changes = item["verdict"] == "changes_requested"
+        if is_changes:
+            handled = await _recover_interrupted_changes(db, item)
+            if handled is not None:
+                moved += handled
+                continue
         cursor = await db.execute(
             "UPDATE steward_judgements SET advisor_outcome=? "
             "WHERE id=? AND advisor_outcome=?",
@@ -835,12 +900,18 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
         )
         if cursor.rowcount != 1:
             continue
+        what = (
+            "возврат на доработку по changes_requested судьи (повторное "
+            "применение тоже прервано)"
+            if is_changes
+            else "approve судьи"
+        )
         await repo.add_task_update(
             db,
             int(item["task_id"]),
             "hub",
             "alert",
-            "Применение советника прервано, решение за человеком: approve судьи "
+            f"Применение советника прервано, решение за человеком: {what} "
             f"сдачи {item['generation']} занял метку применения и не записал "
             "исхода (хаб перезапущен или упал между шагами). Повторно оно не "
             "применяется.",
@@ -862,8 +933,44 @@ async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
 failure_reason = reason_line  # #2040: закрытый словарь, hub/services/refusal_reason.py
 
 
+async def _human_cr_recorded(
+    db: aiosqlite.Connection, task: dict[str, Any], item: dict[str, Any]
+) -> bool:
+    """Лёг ли на это поколение changes_requested не от стюарда (событием или полем)."""
+    generation = int(item["generation"])
+    if (
+        task.get("review_verdict") == "changes_requested"
+        and task.get("review_verdict_generation") == generation
+    ):
+        return True
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind='review_verdict_recorded' "
+        "AND task_id=? ORDER BY id DESC",
+        (int(item["task_id"]),),
+    )
+    for row in rows:
+        try:
+            payload = json.loads(dict(row)["payload"] or "{}")
+        except ValueError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("verdict") == "changes_requested"
+            and payload.get("submission_generation") == generation
+        ):
+            return True
+    return False
+
+
 async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
-    """Записал ли approve ЭТОГО применения (стюард): сбой мог быть после записи вердикта.
+    return await _steward_verdict_recorded(db, item, "approved")
+
+
+async def _steward_verdict_recorded(
+    db: aiosqlite.Connection, item: dict[str, Any], verdict: str
+) -> bool:
+    """Записал ли вердикт ЭТОГО применения (стюард): сбой мог быть после записи вердикта.
 
     Признак - событие вердикта задачи с источником стюарда
     (``steward_applied``), approved, то же поколение; последующий вердикт
@@ -885,7 +992,7 @@ async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> b
         if (
             isinstance(payload, dict)
             and payload.get("source") == "steward_applied"
-            and payload.get("verdict") == "approved"
+            and payload.get("verdict") == verdict
             and payload.get("submission_generation") == int(item["generation"])
         ):
             return True
