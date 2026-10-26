@@ -239,3 +239,89 @@ async def test_a_second_cancel_does_not_skip_the_group_reap(flooding_child, spaw
     with pytest.raises(asyncio.CancelledError):
         await _within(task, CEILING)
     await _wait_for(lambda: not _alive(spawn_log.pid), "смерть дочернего процесса")
+
+
+class ContractProc:
+    """Двойник процесса с контрактом CPython: wait() ждёт закрытия transport.
+
+    Читатель трубы остановлен, EOF не придёт, поэтому wait() возвращается лишь
+    после ``transport.close()``. Расписание и реальные трубы не участвуют:
+    голые ``kill(); await wait()`` зависают по построению.
+    """
+
+    pid = 4242424
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+        self.closed = asyncio.Event()
+        self._transport = self
+
+    def close(self) -> None:
+        self.closed.set()
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def communicate(self):
+        await asyncio.Event().wait()
+
+    async def wait(self) -> int:
+        await self.closed.wait()
+        self.returncode = -9
+        return self.returncode
+
+
+async def test_the_cleanup_contract_closes_the_transport_before_waiting(monkeypatch):
+    """Очистка таймаута submit и _reap_spawned закрывает transport до ожидания.
+
+    Зависание ловится ограниченным сроком, а не расписанием (#2087).
+    """
+    from hub import process_kill
+
+    killed_groups: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        process_kill.os, "killpg", lambda g, s: killed_groups.append((g, s))
+    )
+    monkeypatch.setattr(dispatch_mod, "SUBMIT_TIMEOUT", 0.05)
+    procs: list[ContractProc] = []
+
+    async def fake_exec(*args, **kwargs):
+        procs.append(ContractProc())
+        return procs[-1]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    pending: list[asyncio.Future] = []
+
+    async def bounded(coro, what: str):
+        task = asyncio.ensure_future(coro)
+        pending.append(task)
+        done, _ = await asyncio.wait({task}, timeout=2.0)
+        assert done, (
+            f"{what}: очистка не вернулась: wait() ждёт закрытия transport, "
+            "его никто не закрыл (голые kill+wait)"
+        )
+        return task
+
+    try:
+        # Путь 1: таймаут communicate() в submit_task.
+        task = await bounded(
+            dispatch_mod.DispatchIntegration().submit_task("m", task_id=1),
+            "таймаут submit",
+        )
+        assert isinstance(task.exception(), TimeoutError)
+        assert procs[0].killed and procs[0].closed.is_set()
+        assert killed_groups == [(ContractProc.pid, signal.SIGKILL)]
+
+        # Путь 2: _reap_spawned после отмены во время spawn.
+        spawn = asyncio.ensure_future(fake_exec())
+        task = await bounded(dispatch_mod._reap_spawned(spawn), "_reap_spawned")
+        assert task.exception() is None
+        assert procs[1].killed and procs[1].closed.is_set()
+        assert killed_groups[1:] == [(ContractProc.pid, signal.SIGKILL)]
+    finally:
+        for proc in procs:
+            proc.close()
+        for t in pending:
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(t, timeout=WAIT)
