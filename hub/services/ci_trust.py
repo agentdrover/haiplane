@@ -1001,6 +1001,31 @@ async def refresh(
         return None
     if _in_recheck.get():
         raise RuntimeError("no call to GitHub inside the in-transaction recheck")
+    # #2054: the generation the check starts under travels to the wake, which
+    # proceeds only if the task still stands on it when trust turned verified.
+    task_row = await repo.get_task(db, task_id)
+    generation = (
+        int(dict(task_row).get("submission_generation") or 0) if task_row else 0
+    )
+    before = dict(await repo.get_ci_run_report(db, task_id, head_sha) or {})
+    standing = await _refresh_guarded(db, task_id, head_sha, backoff, offline, deadline)
+    if standing is not None and standing.verified and before.get("trust") != VERIFIED:
+        # The edge: the stored report was not verified when this check began.
+        from hub.services.ci_verified_wake import wake_on_verified
+
+        # Outside the lock and the write transactions: the projection is committed.
+        await wake_on_verified(db, task_id, head_sha, generation)
+    return standing
+
+
+async def _refresh_guarded(
+    db: Any,
+    task_id: int,
+    head_sha: str,
+    backoff: bool,
+    offline: bool,
+    deadline: float | None,
+) -> Standing | None:
     lock = _locks.setdefault((task_id, head_sha), asyncio.Lock())
     limit = REFRESH_DEADLINE_SECONDS if deadline is None else deadline
     reserved: list[int] = []  # the versions the rounds of THIS refresh reserved

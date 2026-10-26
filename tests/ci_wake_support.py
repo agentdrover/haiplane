@@ -18,15 +18,34 @@ WAKE_EVENT = "ci_verified_wake"
 RETRY_EVENT = "steward_apply_retry"
 
 
+async def verified_by_github(monkeypatch) -> None:
+    """GitHub подтверждает отчёт: общий путь проверки (``refresh``) отдаёт verified."""
+
+    async def confirmed(db, task_id, head_sha, *_args, **_kw):
+        await repo.set_ci_run_report_trust(
+            db,
+            task_id,
+            head_sha,
+            trust="verified",
+            trust_reason="",
+            attempt_key="ci:1:1",
+        )
+        await db.commit()
+        return ci_trust.Standing(trust=ci_trust.VERIFIED, reason="")
+
+    monkeypatch.setattr(ci_trust, "_refresh_locked", confirmed)
+
+
 async def ci_report_arrives(
     db: aiosqlite.Connection, monkeypatch, task_id: int, sha: str = SHA
 ) -> dict:
     """Пришёл отчёт CI, и GitHub его подтвердил: тот же вход, что у ручки отчёта."""
 
-    async def confirmed(_db, _task_id, _sha, **_kw):
-        return ci_trust.Standing(trust=ci_trust.VERIFIED, reason="")
-
-    monkeypatch.setattr(ci_trust, "refresh_quietly", confirmed)
+    await repo.set_ci_run_report_trust(
+        db, task_id, sha, trust="unverified", trust_reason="pending", attempt_key=""
+    )  # приём отчёта сбрасывает доверие до подтверждения
+    await db.commit()
+    await verified_by_github(monkeypatch)
     stored = {"head_sha": sha, "ac_ignored": [], "validation_status": VALIDATION_PASS}
     return await settle_ci_run_report(db, task_id, stored)
 

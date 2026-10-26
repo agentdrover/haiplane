@@ -20,7 +20,6 @@ best-effort: приём отчёта не должен падать оттого
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import aiosqlite
 
@@ -35,8 +34,19 @@ EVENT_CI_VERIFIED_WAKE = "ci_verified_wake"
 async def _first_wake(
     db: aiosqlite.Connection, task_id: int, generation: int, head_sha: str
 ) -> bool:
-    """Занять переход «verified» для (поколение, коммит): ``True`` - занят этим вызовом."""
+    """Занять переход «verified» для (поколение, коммит): ``True`` - занят этим вызовом.
+
+    Одна транзакция: задача перечитывается и должна всё ещё стоять на том же
+    поколении и закреплённом коммите, на которых отчёт стал verified, - иначе
+    пересдача между проверкой и пробуждением съела бы чужой повтор.
+    """
     async with write_transaction(db):
+        task = dict(await repo.get_task(db, task_id) or {})
+        if (
+            int(task.get("submission_generation") or 0) != generation
+            or (task.get("submission_sha") or "").strip() != head_sha
+        ):
+            return False
         seen = await fetchall(
             db,
             "SELECT 1 FROM events WHERE kind=? AND task_id=? "
@@ -63,16 +73,27 @@ async def _has_current_report(
     return row is not None and dict(row).get("submission_generation") == generation
 
 
+def _nested() -> bool:
+    """Внутри применения стюарда или автопилота: будить из него нельзя (рекурсия)."""
+    from hub.services import steward_apply
+
+    return steward_apply._EARLY_RISK.get() is not None
+
+
 async def wake_on_verified(
-    db: aiosqlite.Connection, task_id: int, head_sha: str, *, applied: bool
+    db: aiosqlite.Connection, task_id: int, head_sha: str, generation: int
 ) -> bool:
-    """Разбудить автопилота и повторить применение; ``True`` - это первый переход."""
-    if not applied:
+    """Разбудить автопилота и повторить применение; ``True`` - это первый переход.
+
+    ``generation`` - поколение, под которым проверка CI началась: пробуждение
+    идёт только пока задача стоит на нём и на ``head_sha``. Вызов из чужой
+    открытой транзакции или из применения не будит: проекция там не закоммичена
+    либо будить из себя же нельзя.
+    """
+    if generation <= 0 or db.in_transaction or _nested():
         return False
     try:
-        task: dict[str, Any] = dict(await repo.get_task(db, task_id) or {})
-        generation = int(task.get("submission_generation") or 0)
-        if generation <= 0 or not await _first_wake(db, task_id, generation, head_sha):
+        if not await _first_wake(db, task_id, generation, head_sha):
             return False
         await _wake(db, task_id, generation)
     except Exception:  # noqa: BLE001 - degradation is the contract
@@ -90,4 +111,4 @@ async def _wake(db: aiosqlite.Connection, task_id: int, generation: int) -> None
             await maybe_auto_verdict(db, task_id)
         except Exception:  # noqa: BLE001 - the retry below must still run
             log.exception("auto-verdict after CI failed for task #%s", task_id)
-    await retry_transient_apply(db, task_id)
+    await retry_transient_apply(db, task_id, generation)

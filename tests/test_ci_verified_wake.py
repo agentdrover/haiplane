@@ -131,6 +131,80 @@ async def test_the_retry_itself_is_recorded_and_runs_once(
 
     with monkeypatch.context() as scoped:
         scoped.setattr(ci_trust, "pass_gap", still_red)
-        assert await retry_transient_apply(db, case.task_id) is True
-        assert await retry_transient_apply(db, case.task_id) is False
+        assert await retry_transient_apply(db, case.task_id, 1) is True
+        assert await retry_transient_apply(db, case.task_id, 1) is False
     assert len(await wake.events_of(db, wake.RETRY_EVENT, case.task_id)) == 1
+
+
+async def test_a_resubmission_during_the_check_does_not_consume_the_next_retry(
+    db: aiosqlite.Connection, monkeypatch
+):
+    await _resubmitted_during_the_check(db, monkeypatch, "wake-resubmit", 2, wake.SHA)
+
+
+async def test_a_repin_during_the_check_wakes_nobody(
+    db: aiosqlite.Connection, monkeypatch
+):
+    await _resubmitted_during_the_check(db, monkeypatch, "wake-repin", 1, "b" * 40)
+
+
+async def _resubmitted_during_the_check(db, monkeypatch, slug, new_gen, new_sha):
+    """P2-1: пересдача, пока шла проверка CI, - старое поколение не съедает повтор нового."""
+    from hub import repository as repo
+    from hub.services import ci_trust
+
+    case = await _case(db, monkeypatch, slug)
+    await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
+    await repo.set_ci_run_report_trust(
+        db, case.task_id, wake.SHA, trust="unverified", trust_reason="p", attempt_key=""
+    )
+    await db.commit()
+
+    async def resubmitted_meanwhile(_db, task_id, head_sha, *_a, **_k):
+        # Поколение 2 уже стоит, его failed-суждение ждёт своего CI.
+        await db.execute(
+            "UPDATE steward_judgements SET generation=? WHERE task_id=?",
+            (new_gen, task_id),
+        )
+        await repo.update_task(
+            db, task_id, submission_generation=new_gen, submission_sha=new_sha
+        )
+        await db.commit()
+        return ci_trust.Standing(trust=ci_trust.VERIFIED, reason="")
+
+    monkeypatch.setattr(ci_trust, "_refresh_locked", resubmitted_meanwhile)
+    await ci_trust.refresh(db, case.task_id, wake.SHA)
+
+    assert await wake.events_of(db, wake.WAKE_EVENT, case.task_id) == []
+    assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
+    row = dict(await repo.get_steward_judgement(db, case.task_id, new_gen, "verdict"))
+    assert row["advisor_outcome"] == "failed"
+    from hub.services.steward_advisor import retry_transient_apply
+
+    if new_gen != 1:
+        assert await retry_transient_apply(db, case.task_id, 1) is False
+    assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
+
+
+async def test_a_refresh_that_turns_trust_verified_wakes_once(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """P2-2: отчёт принят при недоступном GitHub, проверка позже даёт verified - одно пробуждение."""
+    from hub import repository as repo
+    from hub.services import ci_trust
+
+    case = await _case(db, monkeypatch, "wake-refresh")
+    await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
+    await repo.set_ci_run_report_trust(
+        db, case.task_id, wake.SHA, trust="unverified", trust_reason="p", attempt_key=""
+    )
+    await db.commit()
+    await wake.verified_by_github(monkeypatch)
+
+    await ci_trust.refresh(db, case.task_id, wake.SHA)  # путь поллера (sweep)
+
+    assert len(await wake.events_of(db, wake.WAKE_EVENT, case.task_id)) == 1
+    assert await verdict_of(db, case.task_id) == "approved"
+    before = await wake.count_events(db, case.task_id)
+    await ci_trust.refresh(db, case.task_id, wake.SHA)
+    assert await wake.count_events(db, case.task_id) == before
