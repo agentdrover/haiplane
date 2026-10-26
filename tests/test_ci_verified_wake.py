@@ -365,6 +365,40 @@ async def test_the_wake_claim_is_taken_once(db: aiosqlite.Connection, monkeypatc
     assert await wake.wake_rows(db, case.task_id) == [(1, wake.SHA)]
 
 
+async def test_a_deleted_task_takes_its_wake_rows_with_it(db: aiosqlite.Connection):
+    """Строка пробуждения не переживает задачу и не мешает её удалить (Codex P3:
+    сирота навсегда; ссылка без каскада превратила бы удаление в ошибку FK)."""
+    from hub import repository as repo
+    from hub.services import ci_verified_wake
+
+    task_id = await repo.create_task(
+        db,
+        title="wake-cascade",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.execute(
+        "INSERT INTO ci_verified_wakes (task_id, generation, head_sha) VALUES (?, 1, ?)",
+        (task_id, wake.SHA),
+    )
+    await db.commit()
+    assert await ci_verified_wake._claim_wake(db, task_id, 1, wake.SHA) is False
+    assert await repo.delete_task_subtree(db, task_id) == 1
+    await db.commit()
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM ci_verified_wakes WHERE task_id = ?", (task_id,)
+    )
+    assert rows == []
+
+
 _OURS = ("create_ci_verified_wakes", "add_steward_judgements_transient_retry_at")
 
 

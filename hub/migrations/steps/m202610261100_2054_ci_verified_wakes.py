@@ -15,7 +15,7 @@ MIGRATIONS = [
     (
         "create_ci_verified_wakes",
         """CREATE TABLE IF NOT EXISTS ci_verified_wakes (
-            task_id    INTEGER NOT NULL,
+            task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
             generation INTEGER NOT NULL,
             head_sha   TEXT    NOT NULL,
             created_at TEXT    NOT NULL DEFAULT (datetime('now')),
