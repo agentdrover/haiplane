@@ -560,3 +560,22 @@ async def test_ownership_context_does_not_depend_on_bound_variable_count(
     )
 
     assert {r["id"] for r in rows} == {epic}
+
+
+async def test_nested_owner_write_rolls_back_both_halves_on_feed_failure(
+    db: aiosqlite.Connection,
+):
+    """Внутри чужой транзакции сбой ленты не оставляет ссылку без записи."""
+    epic = await _task(db, "Epic", task_type="epic")
+    child = await _task(db, "Child", parent_id=epic)
+    await db.execute("BEGIN")
+
+    async def broken(*_a: object, **_k: object) -> int:
+        raise RuntimeError("feed down")
+
+    with patch.object(repo, "add_task_update", broken), pytest.raises(RuntimeError):
+        await _delegate(db, child, epic)
+    await db.commit()
+
+    row = await repo.get_task(db, child)
+    assert row is not None and row["outcome_owner_task_id"] is None

@@ -136,6 +136,28 @@ async def set_outcome_owner(
         if owner_task_id is not None:
             await _require_ancestor(db, task, owner_task_id)
         previous = task.get("outcome_owner_task_id")
+        await _write_link(db, task_id, previous, owner_task_id, set_by)
+        view = await ownership_for_task(
+            db, {**task, "outcome_owner_task_id": owner_task_id}
+        )
+    return {
+        "task_id": task_id,
+        "owner_task_id": owner_task_id,
+        "previous": previous,
+        "ownership": view.model_dump() if view else None,
+    }
+
+
+async def _write_link(
+    db: aiosqlite.Connection,
+    task_id: int,
+    previous: int | None,
+    owner_task_id: int | None,
+    set_by: str,
+) -> None:
+    """Column and feed entry under one SAVEPOINT: a nested caller keeps neither half."""
+    await db.execute("SAVEPOINT outcome_owner_write")
+    try:
         await repository.set_outcome_owner_column(db, task_id, owner_task_id)
         if previous != owner_task_id:
             await repository.add_task_update(
@@ -149,15 +171,11 @@ async def set_outcome_owner(
                     else "Outcome promise taken back (independent)"
                 ),
             )
-        view = await ownership_for_task(
-            db, {**task, "outcome_owner_task_id": owner_task_id}
-        )
-    return {
-        "task_id": task_id,
-        "owner_task_id": owner_task_id,
-        "previous": previous,
-        "ownership": view.model_dump() if view else None,
-    }
+    except BaseException:
+        await db.execute("ROLLBACK TO outcome_owner_write")
+        await db.execute("RELEASE outcome_owner_write")
+        raise
+    await db.execute("RELEASE outcome_owner_write")
 
 
 async def _require_ancestor(
