@@ -64,7 +64,8 @@ _SCOPE: ContextVar[_Scope | None] = ContextVar("steward_empty_scope", default=No
 def _own() -> dict[int, EmptyProof] | None:
     """Доказательства ЭТОГО применения; дочерняя Task унаследованную область не видит."""
     scope = _SCOPE.get()
-    if scope is None or scope.owner is not asyncio.current_task():
+    me = asyncio.current_task()
+    if scope is None or me is None or scope.owner is not me:
         return None
     return scope.proofs
 
@@ -129,24 +130,28 @@ def refusal_of(
     )
 
 
-async def _run_is_of_this_report(
+async def _own_run(
     db: aiosqlite.Connection, task_id: int, generation: int, review: dict[str, Any]
-) -> bool:
-    """Завершённый запуск, чей биллинг будет спрошен, породил ИМЕННО этот отчёт.
+) -> dict[str, Any] | None:
+    """Завершённый запуск, ПРИВЯЗАННЫЙ к этому отчёту (``machine_reviews.dispatch_id``).
 
     Предикат автопилота берёт последний завершённый запуск поколения; для
     доказательства стюарда этого мало: биллинг запуска A не доказывает работу,
-    результатом которой стал отчёт B. Нет своего запуска - нет доказательства.
+    результатом которой стал отчёт B. Догадка по принципалу и каналу
+    (``dispatch_for_report`` без привязки) тоже не годится: она принимает
+    последний непривязанный отчёт. Нет привязки - нет доказательства.
     """
-    from hub.services.review_dispatch import dispatch_for_report
+    from hub.services.report_binding import dispatch_of_report
 
-    owner = await dispatch_for_report(db, task_id, generation, review)
-    settled = await repo.get_settled_review_dispatch(db, task_id, generation)
-    return (
-        owner is not None
-        and settled is not None
-        and int(owner["id"]) == int(settled["id"])
-    )
+    owner = await dispatch_of_report(db, review.get("id"))
+    if (
+        owner is None
+        or owner.get("status") != "done"
+        or int(owner.get("submission_generation") or 0) != generation
+        or int(owner.get("task_id") or 0) != task_id
+    ):
+        return None
+    return owner
 
 
 async def _prove(
@@ -169,10 +174,11 @@ async def _prove(
     ):
         return cached
     usage = None
-    if await _run_is_of_this_report(db, task_id, generation, review):
+    run = await _own_run(db, task_id, generation, review)
+    if run is not None:
         try:
             usage = await auto_verdict._proven_empty_usage(
-                db, task_id, generation, review
+                db, task_id, generation, review, run
             )
         except Exception as exc:  # noqa: BLE001 - провайдер недоступен: не доказано
             log.warning("empty-report billing proof failed for #%s: %s", task_id, exc)

@@ -160,7 +160,11 @@ async def _reviewer_model(
 
 
 async def _proven_empty_usage(
-    db: aiosqlite.Connection, task_id: int, generation: int, review: dict
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    review: dict,
+    dispatch: Any = None,
 ) -> int | None:
     """The billed usage proving an empty review worked, or None (#769).
 
@@ -173,7 +177,8 @@ async def _proven_empty_usage(
     floor = config.EMPTY_REVIEW_MIN_USAGE
     if floor <= 0:
         return None
-    dispatch = await repo.get_settled_review_dispatch(db, task_id, generation)
+    if dispatch is None:
+        dispatch = await repo.get_settled_review_dispatch(db, task_id, generation)
     if dispatch is None:
         return None
     from hub.integrations import cursor_cloud

@@ -128,3 +128,52 @@ async def test_a_child_task_does_not_inherit_the_proof_of_the_application(
         await task
     assert caught.value.code == "no_data_report"
     assert await verdict_of(db, case.task_id) == ""
+
+
+async def test_a_run_without_a_binding_to_the_report_proves_nothing(db, monkeypatch):
+    """Догадка по принципалу и каналу не заменяет привязку отчёта к запуску."""
+    case, calls = await empty_case(db, monkeypatch, "unbound-run", usage=PROVEN)
+    await db.execute(
+        "UPDATE machine_reviews SET dispatch_id=NULL WHERE task_id=?", (case.task_id,)
+    )
+    await db.commit()
+
+    result = await apply_self_approval(db, case.task_id, 1)
+
+    assert result is not None and result[0] == ESCALATED_TO_HUMAN, result
+    assert await verdict_of(db, case.task_id) == ""
+    assert calls == []
+
+
+async def test_the_billing_asked_is_the_one_of_the_bound_run(db, monkeypatch):
+    """Биллинг берётся у запуска отчёта, а не у последнего завершённого запуска поколения."""
+    from tests.steward_double_clean_support import judge_and_advise, policy_of
+
+    case = await build_case(
+        db,
+        monkeypatch,
+        "bound-run-billing",
+        risk="R1",
+        policy=policy_of(ordinary=None, clean=None),
+        pair=False,
+        order=False,
+    )
+    report = await add_report(db, case.task_id, raw_count=0, tokens_spent=PROVEN)
+    await settle_dispatch(
+        db, case.task_id, monkeypatch, usage=100, report_id=report, agent_id="bc-own"
+    )
+    await settle_dispatch(
+        db, case.task_id, monkeypatch, usage=PROVEN, agent_id="bc-late"
+    )
+    totals = {"bc-own": 100, "bc-late": PROVEN}
+
+    async def by_agent(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": totals[agent_id]}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", by_agent)
+    await judge_and_advise(db, case.task_id)
+
+    result = await apply_self_approval(db, case.task_id, 1)
+
+    assert result is not None and result[0] == ESCALATED_TO_HUMAN, result
+    assert await verdict_of(db, case.task_id) == ""

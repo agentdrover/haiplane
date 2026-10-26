@@ -75,6 +75,7 @@ async def settle_dispatch(
     usage: int | str | None,
     generation: int = 1,
     report_id: int | None = None,
+    agent_id: str = "bc-proof",
 ) -> list[tuple[Any, ...]]:
     """Завершённый заказ хаба и подставленный ответ биллинга; журнал обращений к нему.
 
@@ -84,7 +85,7 @@ async def settle_dispatch(
         db,
         task_id=task_id,
         submission_generation=generation,
-        agent_id="bc-proof",
+        agent_id=agent_id,
         run_id="run-proof",
         model="grok-4.6",
     )
