@@ -31,6 +31,7 @@ from typing import Any, Awaitable, Iterator
 from hub import commit_scope, config
 from hub.db import fetchall
 from hub import repository as repo
+from hub.services.outcome_ownership import ownership_for_task
 from hub.services.outcomes import outcome_status_for_task
 from hub.integrations.registry import plugins
 from hub.cause_task_view import CauseTaskView
@@ -1125,6 +1126,7 @@ async def _late_reads(
         # #920: the rules this area already paid for, from category_checks.
         rule_rows = await rules_for_areas(db, list(task_view.affected_areas or []))
         outcome_status = await outcome_status_for_task(db, task_row)
+        outcome_ownership = await ownership_for_task(db, task_row)
         ci_evidence = await review_evidence.ci_evidence_state(db, sha_key)
         # #1589: результат ТЕКУЩЕГО поколения; предыдущие не показываются.
         notices = await path_notices.view_for_generation(db, task_id, generation)
@@ -1144,6 +1146,7 @@ async def _late_reads(
             repeated_categories=list(circle.repeated_categories),
         ),
         "outcome_status": outcome_status,
+        "outcome_ownership": outcome_ownership,
         "ci_evidence": ci_evidence,
         "path_notices": notices,
         "review_in_flight": in_flight,

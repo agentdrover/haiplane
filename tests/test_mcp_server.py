@@ -4156,11 +4156,13 @@ def _refusal_probe_arguments(tool: Any) -> dict[str, Any]:
     exist so the call reaches that layer, which is the only thing this probe
     is asking about.
     """
+    import types
     import typing
 
     def sample(annotation: Any) -> Any:
         origin = typing.get_origin(annotation)
-        if origin is typing.Union or type(origin).__name__ == "UnionType":
+        # ``int | None`` has origin ``types.UnionType`` itself, not an instance.
+        if origin is typing.Union or origin is types.UnionType:
             args = [a for a in typing.get_args(annotation) if a is not type(None)]
             return sample(args[0]) if args else "x"
         if annotation is int:

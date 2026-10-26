@@ -4156,6 +4156,21 @@ async def hub_undelivered_completed() -> CallToolResult:
     return structured_echo_result("\n".join(lines), delivery_discrepancies=data)
 
 
+def _ownership_line(item: dict[str, Any]) -> list[str]:
+    """Who holds the promise, for rows of the actionable view (#2090)."""
+    own = item.get("ownership") or {}
+    if own.get("state") == "covered":
+        return [f"    held by #{own.get('owner_task_id')} (not answered)"]
+    if own.get("state") == "invalid_owner":
+        return [
+            f"    owner link to #{own.get('owner_task_id')} does not hold: "
+            f"{own.get('reason')}"
+        ]
+    if own.get("suggested_owner_task_id"):
+        return [f"    hint: #{own['suggested_owner_task_id']} states a metric too"]
+    return []
+
+
 def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
     """One row of the outcome-debt page: an open promise or an answered one."""
     if "latest_answer" in item:
@@ -4165,6 +4180,7 @@ def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
             f" ({item.get('answers', 0)} check(s), last by "
             f"{latest.get('answered_by') or 'unknown'})",
             f"    measured: {latest.get('measured_value') or '—'}",
+            *_ownership_line(item),
         ]
     waited = item.get("days_unanswered")
     waited_text = f"{waited}d unanswered" if waited is not None else "age unknown"
@@ -4181,7 +4197,7 @@ def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
         lines.append(f"    said by: {item['outcome_deadline']}")
     if item.get("outcome_revisit_condition"):
         lines.append(f"    revisit if: {item['outcome_revisit_condition']}")
-    return lines
+    return lines + _ownership_line(item)
 
 
 _OUTCOME_DEBT_HINT = (
@@ -4189,13 +4205,37 @@ _OUTCOME_DEBT_HINT = (
     "offset; полный JSON — REST GET /api/metrics/outcome-debt без параметров "
     "или CLI hp-hub outcome-debt без флагов."
 )
+_ACTIONABLE_HINT = (
+    "Остальное: выберите status=overdue|observing|unknown|answered|covered|"
+    "invalid_owner и листайте offset; полный старый срез — view=all."
+)
+
+
+def _actionable_head(data: dict[str, Any]) -> str:
+    """Head of the actionable view: zero debt here never means "all answered"."""
+    others = (
+        f"{data.get('covered_total', 0)} covered by an owner (not answered), "
+        f"{data.get('invalid_owner_total', 0)} with an invalid owner link, "
+        f"{data.get('answered_total', 0)} answered"
+    )
+    if not data.get("total", 0):
+        return f"No actionable outcome debt; that is not 'all answered': {others}."
+    return (
+        f"{data.get('total', 0)} completed tasks stated an outcome nobody answered "
+        f"and no valid owner holds ({data.get('overdue_total', 0)} overdue, "
+        f"{data.get('observing_total', 0)} observing, "
+        f"{data.get('unknown_total', 0)} unknown); {others}."
+    )
 
 
 def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
     """Text of one outcome-debt page (#1605). "No debt" only when ``total`` is 0:
     an empty page says nothing about the other statuses."""
     answered = data.get("answered_total", 0)
-    if not data.get("total", 0):
+    actionable = data.get("view") == "actionable"
+    if actionable:
+        lines = [_actionable_head(data)]
+    elif not data.get("total", 0):
         lines = [
             "No outcome debt: every completed task with a stated metric has "
             f"an answer ({answered} answered).",
@@ -4225,7 +4265,9 @@ def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
             lines.append(f"{shown}; это последняя страница.")
     else:
         lines.append("Только счётчики, строк нет.")
-    if data.get("total", 0):
+    if actionable:
+        lines.append(_ACTIONABLE_HINT)
+    elif data.get("total", 0):
         lines.append(_OUTCOME_DEBT_HINT)
     lines.append("")
     for item in rows or []:
@@ -4235,10 +4277,13 @@ def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
 
 @mcp.tool()
 async def hub_outcome_debt(
-    status: Literal["overdue", "observing", "unknown", "answered"] = "overdue",
+    status: Literal[
+        "overdue", "observing", "unknown", "answered", "covered", "invalid_owner"
+    ] = "overdue",
     limit: int = 20,
     offset: int = 0,
     only_counts: bool = False,
+    view: Literal["all", "actionable"] = "all",
 ) -> CallToolResult:
     """Outcome promises and the answers to them (#766, #819).
 
@@ -4249,8 +4294,13 @@ async def hub_outcome_debt(
 
     Returns counters plus ONE page (#1605): status overdue by default, limit
     1-200, offset to page on; only_counts drops the rows. Not the full list.
+    view=actionable (#2090): minus promises an explicit valid owner holds
+    (hub_set_outcome_owner); covered/invalid_owner are extra statuses.
+    Coverage is not an answer; zero actionable debt is not "all answered".
     """
     params: dict[str, Any] = {"status": status, "limit": limit, "offset": offset}
+    if view != "all":
+        params["view"] = view
     if only_counts:
         params["only_counts"] = "true"
     try:
@@ -4262,6 +4312,31 @@ async def hub_outcome_debt(
     return structured_echo_result(
         "\n".join(_outcome_debt_lines(data)), outcome_debt=data
     )
+
+
+@mcp.tool()
+async def hub_set_outcome_owner(
+    task_id: int, owner_task_id: int | None
+) -> CallToolResult:
+    """Say which ancestor holds this task's outcome promise (#2090).
+
+    Takes the task out of view=actionable debt while the link holds: the owner
+    must be an ancestor, completed, not archived, and state a metric. It is not
+    an answer. owner_task_id=None takes the promise back.
+    """
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/outcome-owner", {"owner_task_id": owner_task_id}
+        )
+    except HubApiError as exc:
+        return _error_result(exc)
+    held = result.get("owner_task_id")
+    text = (
+        f"Task #{task_id}: promise held by #{held}."
+        if held
+        else f"Task #{task_id}: promise is independent again."
+    )
+    return structured_echo_result(text, outcome_owner=result)
 
 
 @mcp.tool()

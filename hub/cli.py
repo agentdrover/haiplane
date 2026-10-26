@@ -545,6 +545,8 @@ def cmd_outcome_debt(args: argparse.Namespace) -> int:
             params[name] = getattr(args, name)
     if getattr(args, "only_counts", False):
         params["only_counts"] = "true"
+    if getattr(args, "view", None):
+        params["view"] = args.view
     query = f"?{urllib.parse.urlencode(params)}" if params else ""
     result = _api("GET", f"/api/metrics/outcome-debt{query}")
     _print_json(result)
@@ -694,6 +696,14 @@ def _add_defect_metric_parsers(sub: Any) -> None:
     _add_change_failure_rate_parser(sub)
     _add_shift_left_parser(sub)
     _add_practice_metrics_parser(sub)
+
+
+def cmd_outcome_owner(args: argparse.Namespace) -> int:
+    """Say which ancestor holds a task's outcome promise, or take it back (#2090)."""
+    body = {"owner_task_id": None if args.clear else args.owner}
+    result = _api("POST", f"/api/tasks/{args.task_id}/outcome-owner", body)
+    _print_json(result)
+    return 0
 
 
 def cmd_answer_outcome(args: argparse.Namespace) -> int:
@@ -2229,9 +2239,23 @@ def _add_outcome_debt_parser(sub: Any) -> None:
     )
     p_outcomes.add_argument(
         "--status",
-        choices=["overdue", "observing", "unknown", "answered"],
+        choices=[
+            "overdue",
+            "observing",
+            "unknown",
+            "answered",
+            "covered",
+            "invalid_owner",
+        ],
         default=None,
-        help="One status page instead of the full payload (#1605)",
+        help="One status page instead of the full payload (#1605); "
+        "covered and invalid_owner exist in --view actionable only",
+    )
+    p_outcomes.add_argument(
+        "--view",
+        choices=["all", "actionable"],
+        default=None,
+        help="actionable: minus promises an explicit valid owner holds (#2090)",
     )
     p_outcomes.add_argument("--limit", type=int, default=None, help="Page size 1-200")
     p_outcomes.add_argument("--offset", type=int, default=None, help="Page start")
@@ -2242,6 +2266,15 @@ def _add_outcome_debt_parser(sub: Any) -> None:
         help="Counters only, no rows",
     )
     p_outcomes.set_defaults(func=cmd_outcome_debt)
+    p_owner = sub.add_parser(
+        "outcome-owner",
+        help="Delegate a task's outcome promise to an ancestor (#2090)",
+    )
+    p_owner.add_argument("task_id", type=int)
+    group = p_owner.add_mutually_exclusive_group(required=True)
+    group.add_argument("--owner", type=int, help="Ancestor that holds the promise")
+    group.add_argument("--clear", action="store_true", help="Take the promise back")
+    p_owner.set_defaults(func=cmd_outcome_owner)
 
 
 def _add_projects_parser(sub: Any) -> None:

@@ -93,6 +93,7 @@ from hub.services.review_limit import (
     run_allowed_by_review_limit,
     refuse_opening_over_review_limit,
 )
+from hub.services.outcome_ownership import ownership_for_task
 from hub.services.outcomes import outcome_status_for_task
 from hub.services.steward_apply import double_clean_note, double_clean_payload
 from hub.models import (
@@ -914,6 +915,7 @@ async def enrich_task_view(
             task_view.evidence = await evidence_views(db, task_view.id)
         task_view.lifecycle_hint = compute_lifecycle_hint(task_dict)
         task_view.outcome_status = await outcome_status_for_task(db, task_dict)
+        task_view.outcome_ownership = await ownership_for_task(db, task_dict)
         # #917: single-task read only, and only for a defect with a release —
         # lists must not pay for a join most tasks do not need (#485).
         if task_dict.get("release_id") is not None:

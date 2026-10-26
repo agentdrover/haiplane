@@ -177,9 +177,9 @@ async def test_invalid_owner_never_silently_hides_obligation(db: aiosqlite.Conne
 
     invalid = {r["task_id"]: r for r in await _rows(db, "invalid_owner")}
     covered = _ids(await _rows(db, "covered"))
-    in_debt = set().union(
-        *(_ids(await _rows(db, s)) for s in ("overdue", "observing", "unknown"))
-    )
+    in_debt: set[int] = set()
+    for status in ("overdue", "observing", "unknown"):
+        in_debt |= _ids(await _rows(db, status))
 
     expected = {
         child_of["owner_not_completed"]: "owner_not_completed",

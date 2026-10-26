@@ -19,6 +19,7 @@ from hub.services.delivery_state import (
     task_delivery,
     undelivered_completed_tasks,
 )
+from hub.services.outcome_ownership import set_outcome_owner
 from hub.services.outcomes import answer_outcome, outcome_debt
 from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
@@ -335,6 +336,7 @@ __all__ = [
     "prepare_pair_branch",
     "restore_pair_workspace_base",
     "answer_outcome",
+    "set_outcome_owner",
     "outcome_debt",
     "PRACTICE_METRICS_DEFAULT_DAYS",
     "practice_metrics",
