@@ -1902,4 +1902,6 @@ async def test_a_transient_apply_failure_is_retried_when_ci_turns_verified(
     assert (await wake.judgement_of(db, raced.task_id))["advisor_outcome"] == (
         row["advisor_outcome"]
     )
-    assert await wake.count_events(db, raced.task_id) == before + 1  # только метка
+    assert (
+        await wake.count_events(db, raced.task_id) == before
+    )  # ни записей, ни повтора

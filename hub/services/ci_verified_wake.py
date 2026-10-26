@@ -7,12 +7,12 @@
 
 Сюда входят по приёму отчёта CI, когда он применён к закреплённому коммиту и GitHub
 его подтвердил. Переход ловится не сравнением «было / стало» (запись отчёта сама
-сбрасывает доверие до подтверждения), а событием ``ci_verified_wake``: одно на
-(задача, поколение, коммит). Второй отчёт того же коммита событие уже находит и
-ничего не делает - ни звонков, ни записей.
-
-Что делает ОДИН раз: спрашивает автопилота (если по текущей сдаче уже есть машинный
-отчёт) и повторяет применение approve стюарда, упавшее переходящей причиной.
+сбрасывает доверие до подтверждения): вход зовут при КАЖДОМ разборе проверенного
+отчёта закреплённого коммита в review, а дедуп держат события. Автопилот - событие
+``ci_verified_wake`` на (задача, поколение, коммит), и только когда по сдаче уже есть
+машинный отчёт. Повтор стюарда - событие ``steward_apply_retry`` на суждение, и только
+когда есть упавшее переходящей причиной применение. Из чужой транзакции или из
+применения не будят: следующий разбор разбудит.
 Постоянные отказы и гонки 409 не повторяются (см. ``refusal_reason``). Всё
 best-effort: приём отчёта не должен падать оттого, что будить не получилось.
 """
@@ -93,22 +93,35 @@ async def wake_on_verified(
     if generation <= 0 or db.in_transaction or _nested():
         return False
     try:
-        if not await _first_wake(db, task_id, generation, head_sha):
-            return False
-        await _wake(db, task_id, generation)
+        asked = await _ask_autopilot(db, task_id, generation, head_sha)
+        retried = await _retry_steward(db, task_id, generation, head_sha)
     except Exception:  # noqa: BLE001 - degradation is the contract
         log.exception("CI-verified wake failed for task #%s", task_id)
         return False
+    return asked or retried
+
+
+async def _ask_autopilot(
+    db: aiosqlite.Connection, task_id: int, generation: int, head_sha: str
+) -> bool:
+    """Автопилот - один раз на (поколение, коммит), и только когда есть что решать."""
+    from hub.services.auto_verdict import maybe_auto_verdict
+
+    if not await _has_current_report(db, task_id, generation):
+        return False  # отчёта нет: автопилота позовёт сам приход отчёта
+    if not await _first_wake(db, task_id, generation, head_sha):
+        return False
+    try:
+        await maybe_auto_verdict(db, task_id)
+    except Exception:  # noqa: BLE001 - the retry must still run
+        log.exception("auto-verdict after CI failed for task #%s", task_id)
     return True
 
 
-async def _wake(db: aiosqlite.Connection, task_id: int, generation: int) -> None:
-    from hub.services.auto_verdict import maybe_auto_verdict
+async def _retry_steward(
+    db: aiosqlite.Connection, task_id: int, generation: int, head_sha: str
+) -> bool:
+    """Повтор применения стюарда: свой счётчик (одно на суждение), не событие пробуждения."""
     from hub.services.steward_advisor import retry_transient_apply
 
-    if await _has_current_report(db, task_id, generation):
-        try:
-            await maybe_auto_verdict(db, task_id)
-        except Exception:  # noqa: BLE001 - the retry below must still run
-            log.exception("auto-verdict after CI failed for task #%s", task_id)
-    await retry_transient_apply(db, task_id, generation)
+    return await retry_transient_apply(db, task_id, generation, head_sha)

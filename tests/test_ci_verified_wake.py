@@ -131,8 +131,8 @@ async def test_the_retry_itself_is_recorded_and_runs_once(
 
     with monkeypatch.context() as scoped:
         scoped.setattr(ci_trust, "pass_gap", still_red)
-        assert await retry_transient_apply(db, case.task_id, 1) is True
-        assert await retry_transient_apply(db, case.task_id, 1) is False
+        assert await retry_transient_apply(db, case.task_id, 1, wake.SHA) is True
+        assert await retry_transient_apply(db, case.task_id, 1, wake.SHA) is False
     assert len(await wake.events_of(db, wake.RETRY_EVENT, case.task_id)) == 1
 
 
@@ -182,7 +182,7 @@ async def _resubmitted_during_the_check(db, monkeypatch, slug, new_gen, new_sha)
     from hub.services.steward_advisor import retry_transient_apply
 
     if new_gen != 1:
-        assert await retry_transient_apply(db, case.task_id, 1) is False
+        assert await retry_transient_apply(db, case.task_id, 1, wake.SHA) is False
     assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
 
 
@@ -203,8 +203,63 @@ async def test_a_refresh_that_turns_trust_verified_wakes_once(
 
     await ci_trust.refresh(db, case.task_id, wake.SHA)  # путь поллера (sweep)
 
-    assert len(await wake.events_of(db, wake.WAKE_EVENT, case.task_id)) == 1
+    assert len(await wake.events_of(db, wake.RETRY_EVENT, case.task_id)) == 1
     assert await verdict_of(db, case.task_id) == "approved"
     before = await wake.count_events(db, case.task_id)
     await ci_trust.refresh(db, case.task_id, wake.SHA)
     assert await wake.count_events(db, case.task_id) == before
+
+
+async def test_a_wake_skipped_under_a_guard_happens_on_the_next_refresh(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """P2-a: проверка прошла внутри применения - пробуждение не потеряно, а ждёт следующего прохода."""
+    from hub import repository as repo
+    from hub.services import ci_trust
+    from hub.services.steward_apply import ceiling_scope
+
+    case = await _case(db, monkeypatch, "wake-guarded")
+    await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
+    await repo.set_ci_run_report_trust(
+        db, case.task_id, wake.SHA, trust="unverified", trust_reason="p", attempt_key=""
+    )
+    await db.commit()
+    await wake.verified_by_github(monkeypatch)
+
+    async with ceiling_scope():  # проверка внутри применения: будить нельзя
+        await ci_trust.refresh(db, case.task_id, wake.SHA)
+    assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
+
+    await ci_trust.refresh(db, case.task_id, wake.SHA)  # следующий проход
+    assert len(await wake.events_of(db, wake.RETRY_EVENT, case.task_id)) == 1
+    assert await verdict_of(db, case.task_id) == "approved"
+    before = await wake.count_events(db, case.task_id)
+    await ci_trust.refresh(db, case.task_id, wake.SHA)
+    assert await wake.count_events(db, case.task_id) == before
+
+
+async def test_a_repin_during_the_autopilot_call_does_not_consume_the_retry(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """P2-b: ветку перезакрепили, пока шёл вызов автопилота, - повтор нового коммита не тронут."""
+    from hub import repository as repo
+    from hub.services import auto_verdict, ci_verified_wake
+
+    case = await _case(db, monkeypatch, "wake-repin-autopilot")
+    await wake.fail_the_apply(db, monkeypatch, gap="нет отчёта CI")
+
+    async def has_report(*_a, **_k):
+        return True
+
+    async def repins(_db, task_id):
+        await repo.update_task(db, task_id, submission_sha="b" * 40)
+        await db.commit()
+        return False
+
+    monkeypatch.setattr(ci_verified_wake, "_has_current_report", has_report)
+    monkeypatch.setattr(auto_verdict, "maybe_auto_verdict", repins)
+
+    await ci_verified_wake.wake_on_verified(db, case.task_id, wake.SHA, 1)
+
+    assert await wake.events_of(db, wake.RETRY_EVENT, case.task_id) == []
+    assert (await wake.judgement_of(db, case.task_id))["advisor_outcome"] == "failed"

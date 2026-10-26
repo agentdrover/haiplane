@@ -1173,7 +1173,7 @@ EVENT_APPLY_RETRY = "steward_apply_retry"
 
 
 async def _retry_candidate(
-    db: aiosqlite.Connection, task_id: int, expected_generation: int
+    db: aiosqlite.Connection, task_id: int, expected_generation: int, expected_sha: str
 ) -> dict[str, Any] | None:
     """Суждение, у которого применение отказало переходящей причиной, или None.
 
@@ -1182,8 +1182,13 @@ async def _retry_candidate(
     """
     task = dict(await repo.get_task(db, task_id) or {})
     generation = int(task.get("submission_generation") or 0)
-    if task.get("status") != "review" or generation != expected_generation:
-        return None  # пересдача: повтор чужой сдачи не берём
+    pinned = (task.get("submission_sha") or "").strip()
+    if (
+        task.get("status") != "review"
+        or generation != expected_generation
+        or pinned != expected_sha
+    ):
+        return None  # пересдача или перезакрепление: повтор чужой сдачи не берём
     if task.get("review_verdict_generation") == generation:
         return None  # вердикт этой сдачи уже записан
     rows = await fetchall(
@@ -1204,7 +1209,7 @@ async def _retry_candidate(
 
 
 async def retry_transient_apply(
-    db: aiosqlite.Connection, task_id: int, expected_generation: int
+    db: aiosqlite.Connection, task_id: int, expected_generation: int, expected_sha: str
 ) -> bool:
     """Повторить применение, упавшее переходящей причиной: CI стал verified (#2054).
 
@@ -1219,7 +1224,7 @@ async def retry_transient_apply(
     if await effective_mode(db) != "act":
         return False
     async with write_transaction(db):
-        item = await _retry_candidate(db, task_id, expected_generation)
+        item = await _retry_candidate(db, task_id, expected_generation, expected_sha)
         if item is None:
             return False
         retried = await fetchall(
