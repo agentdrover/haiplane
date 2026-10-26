@@ -755,3 +755,20 @@ async def test_a_human_changes_request_that_won_the_race_is_not_a_failure(
     feed = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
     assert not [c for c in feed if "не применён" in c or "Решает человек" in c], feed
     assert await apply_judge_changes_requests(db) == 0  # и не повторяется
+
+
+async def test_an_escalation_that_already_happened_is_not_a_failure(db, monkeypatch):
+    """#2054, B-2: бюджет исчерпан, задачу уже передали человеку - skipped, без тревоги."""
+    task_id = await _scene(db, monkeypatch, "jcr-escalated", review_cycle=3)
+
+    async def not_in_review(*_a, **_k):
+        return False  # переход из review не состоялся: эскалация была раньше
+
+    monkeypatch.setattr(repo, "transition_status_if", not_in_review)
+    await apply_judge_changes_requests(db)
+
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "skipped", row
+    assert row["advisor_outcome_detail"].startswith("already_escalated: ")
+    feed = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert not [c for c in feed if "не применён" in c or "Решает человек" in c], feed
