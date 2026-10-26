@@ -560,3 +560,39 @@ async def test_a_cap_handoff_is_not_called_a_missing_consent(db, db_dsn, monkeyp
     )
     early = await advisor_refusal(db, case.task_id, 1)
     assert early is not None and early[0] == "steward_cap_handoff", early
+
+
+async def test_an_empty_report_appearing_before_the_write_refuses_approve(
+    db, db_dsn, monkeypatch
+):
+    """AC-2: между ранней проверкой и записью актуальным стал пустой отчёт - approve не записан.
+
+    Перепроверка в транзакции чистая: провайдера не спрашивает, а доказательство
+    работы привязано к ИДЕНТИФИКАТОРУ отчёта, поэтому доказанный прежний отчёт
+    нового не покрывает.
+    """
+    from tests.steward_empty_report_support import add_report, empty_case
+
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "r1")
+
+    async def new_empty_report(other, case, _monkeypatch) -> None:
+        await add_report(other, case.task_id, raw_count=0)
+
+    for label, raw_before in (("candidates", 2), ("proven_empty", 0)):
+        case, calls = await empty_case(
+            db, monkeypatch, f"toctou-empty-{label}", raw_count=raw_before
+        )
+        asked_before = len(calls)
+        with pytest.raises(HTTPException) as caught:
+            await _apply_with_a_write_before_record(
+                db, db_dsn, case, monkeypatch, new_empty_report
+            )
+        assert caught.value.status_code == 422, (label, caught.value.detail)
+        assert str(caught.value.detail).startswith("no_data_report:"), (
+            label,
+            caught.value.detail,
+        )
+        assert await verdict_of(db, case.task_id) == "", label
+        assert await verdict_events(db, case.task_id) == [], label
+        # Сети в транзакции нет: за всё применение провайдера спросили не более раза.
+        assert len(calls) - asked_before <= 1, (label, calls)

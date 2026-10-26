@@ -1524,3 +1524,126 @@ async def test_cap_handoff_texts_do_not_claim_missing_consent(
     ]
     assert lines and text in lines[-1]
     assert not any(claim in lines[-1] for claim in false_claims)
+
+
+# ---------------------------------------------------------------------------
+# Пустой машинный отчёт: самостоятельный approve без доказанной работы (#2082)
+# ---------------------------------------------------------------------------
+
+
+async def test_an_empty_report_without_proven_work_is_not_self_approved(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1: raw_count=0 и работа ревьюера не доказана - approve не записан, причина названа.
+
+    Ответы провайдера подставлены: недоступен, usage ниже порога, токены
+    расходятся с отчётом. Живой путь поллера и прямой ``apply_judgement`` дают
+    один отказ; повторный тик строку не дублирует.
+    """
+    from hub.services import verdict_evidence
+    from hub.services.steward_advisor import apply_advisor_outcomes
+    from tests.steward_double_clean_support import feed
+    from tests.steward_empty_report_support import DOWN, PROVEN, empty_case
+
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "EMPTY_REVIEW_MIN_USAGE", 200_000)
+    scenes = {
+        "down": (DOWN, PROVEN),
+        "below_floor": (100, 100),
+        "mismatch": (PROVEN, 10),
+    }
+    for label, (usage, tokens) in scenes.items():
+        case, _calls = await empty_case(
+            db, monkeypatch, f"empty-{label}", usage=usage, tokens_spent=tokens
+        )
+        assert await apply_advisor_outcomes(db) == 1, label
+
+        task = dict(await repo.get_task(db, case.task_id))
+        assert task["status"] == "review", label
+        assert not (task.get("review_verdict") or ""), label
+        assert task["verdict_owner"] == "human", label
+        assert task["verdict_owner_reason"].startswith("no_data_report"), label
+
+        def lines(text: str) -> list[str]:
+            return [ln for ln in text.splitlines() if "пустой отчёт — нет данных" in ln]
+
+        assert len(lines(await feed(db, case.task_id))) == 1, label
+        shown = verdict_evidence.format_block(
+            await verdict_evidence.build(db, case.task_id, 1)
+        )
+        assert "пустой отчёт — нет данных" in shown, label
+
+        assert await apply_advisor_outcomes(db) == 0, label
+        assert len(lines(await feed(db, case.task_id))) == 1, label
+
+        with pytest.raises(HTTPException) as direct:
+            await apply_judgement(db, case.task_id, 1)
+        assert getattr(direct.value, "code", "") == "no_data_report", label
+        assert not (
+            dict(await repo.get_task(db, case.task_id)).get("review_verdict") or ""
+        ), label
+
+    # Контроль: работа доказана, класс в пределах - approve применён, провайдер
+    # спрошен один раз за всё применение.
+    case, calls = await empty_case(db, monkeypatch, "empty-proven")
+    assert await apply_advisor_outcomes(db) == 1
+    task = dict(await repo.get_task(db, case.task_id))
+    assert task["review_verdict"] == ReviewVerdict.approved.value
+    assert len(calls) == 1, calls
+
+
+async def test_empty_report_rule_is_shared_with_the_autopilot(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3: класс сдачи и потолок решает общий с автопилотом предикат, без копии условия."""
+    from hub.services import auto_verdict
+    from hub.services.steward_advisor import apply_advisor_outcomes
+    from tests.steward_empty_report_support import PROVEN, empty_case
+
+    decide = auto_verdict.empty_report_decision
+    review = {"raw_count": 0, "tokens_spent": PROVEN, "id": 1}
+    for ceiling, risk, usage, code in (
+        ("r1", "R1", PROVEN, ""),
+        ("r1", "R2", PROVEN, "above_proven_empty_ceiling"),
+        ("r1", "", PROVEN, "above_proven_empty_ceiling"),
+        ("", "R0", PROVEN, "above_proven_empty_ceiling"),
+        ("r9", "R0", PROVEN, "above_proven_empty_ceiling"),
+        ("r1", "R1", None, "no_data_report"),
+    ):
+        monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", ceiling)
+        got = decide({"risk_class": risk}, review, usage, checked=True)
+        assert got.code == code, (ceiling, risk, usage, got)
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "r1")
+    assert not decide({"risk_class": "R3"}, {"raw_count": 2}, None, checked=True).code
+
+    # Стюард: те же классы приводят к тому же применению или отказу.
+    for risk, applied in (("R1", True), ("R2", False)):
+        case, _calls = await empty_case(db, monkeypatch, f"shared-{risk}", risk=risk)
+        assert await apply_advisor_outcomes(db) == 1
+        task = dict(await repo.get_task(db, case.task_id))
+        if applied:
+            assert task["review_verdict"] == ReviewVerdict.approved.value
+        else:
+            assert not (task.get("review_verdict") or "")
+            assert "above_proven_empty_ceiling" in task["verdict_owner_reason"]
+
+    # Одно правило: подмена предиката меняет исход и у автопилота, и у стюарда.
+    calls: list[str] = []
+
+    def sentinel(task, report, usage, *, checked):
+        calls.append("asked")
+        return auto_verdict.EmptyReportDecision(code="sentinel_code", reason="подмена")
+
+    monkeypatch.setattr(auto_verdict, "empty_report_decision", sentinel)
+    case, _calls = await empty_case(db, monkeypatch, "shared-sentinel")
+    assert await apply_advisor_outcomes(db) == 1
+    owner = dict(await repo.get_task(db, case.task_id))["verdict_owner_reason"]
+    assert "sentinel_code" in owner, owner
+    report = dict(await repo.get_latest_machine_review(db, case.task_id))
+    task = dict(await repo.get_task(db, case.task_id))
+    ctx = auto_verdict._Ctx(
+        task=task, project=None, generation=1, observe=False, review=report
+    )
+    stance = await auto_verdict._empty_report_stage(db, case.task_id, ctx)
+    assert stance is not None and stance.code == "sentinel_code"
+    assert len(calls) >= 2

@@ -1745,3 +1745,72 @@ async def test_the_steward_daily_cap_is_visible(
     ):
         assert cli.main() in (0, None)
     assert capsys.readouterr().out.strip() == mcp_text.strip()
+
+
+async def test_an_empty_report_blocks_candidate_readiness(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#2082): кандидат с пустым отчётом не ready - blocked с кодом, если
+    # класс выше потолка пустого ревью, и unknown, пока биллинг не проверен;
+    # без сетевого запроса и без записи в базу. Маршрут вердикта называет то же.
+    from hub.integrations import cursor_cloud
+    from hub.services.verdict_route import verdict_route
+    from tests.steward_empty_report_support import empty_case
+
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    proofless, _ = await empty_case(db, monkeypatch, "ready-empty-r1", risk="R1")
+    above, _ = await empty_case(db, monkeypatch, "ready-empty-r2", risk="R2")
+    seen, _ = await empty_case(db, monkeypatch, "ready-seen", risk="R1", raw_count=2)
+
+    network: list[str] = []
+
+    async def _no_network(*_args, **_kwargs):
+        network.append("get_usage")
+        raise AssertionError("readiness must not reach the provider")
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _no_network)
+    before = await _everything(db)
+    writes: list[str] = []
+    real_execute = aiosqlite.Connection.execute
+
+    def _watch(self, sql, *args, **kwargs):
+        if sql.lstrip().split(" ", 1)[0].upper() in (
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "REPLACE",
+        ):
+            writes.append(sql[:80])
+        return real_execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", _watch)
+    for slug in ("ready-empty-r1", "ready-empty-r2", "ready-seen"):
+        resp = await client.get(f"/api/projects/{slug}/effective-policy")
+        assert resp.status_code == 200
+    monkeypatch.setattr(aiosqlite.Connection, "execute", real_execute)
+    assert network == [] and writes == []
+    assert await _everything(db) == before
+
+    got: dict[int, dict] = {}
+    for slug in ("ready-empty-r1", "ready-empty-r2", "ready-seen"):
+        body = (await client.get(f"/api/projects/{slug}/effective-policy")).json()
+        for item in body["steward"]["readiness"]["candidates"]:
+            got[item["task_id"]] = item
+    assert got[proofless.task_id]["state"] == "unknown"
+    assert got[proofless.task_id]["reasons"][0]["code"] == "no_data_report"
+    assert got[above.task_id]["state"] == "blocked"
+    assert got[above.task_id]["reasons"][0]["code"] == "above_proven_empty_ceiling"
+    assert got[seen.task_id]["state"] == "ready"
+
+    # Маршрут вердикта (общий для REST, MCP и CLI) называет условие и запрет.
+    from tests.steward_double_clean_support import grant_act
+
+    await grant_act(monkeypatch)
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    waiting = await verdict_route(db, proofless.task_id)
+    assert waiting.decider == "steward" and "биллинг" in waiting.condition
+    forbidden = await verdict_route(db, above.task_id)
+    assert forbidden.final == "human"
+    assert forbidden.code == "above_proven_empty_ceiling"
+    assert network == []
