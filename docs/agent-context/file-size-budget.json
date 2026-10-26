@@ -95,7 +95,7 @@
     },
     {
       "path": "hub/services/review_dispatch.py",
-      "measured": 7900,
+      "measured": 8017,
       "max": 8295,
       "removed_by": "unclaimed"
     },
