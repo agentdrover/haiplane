@@ -406,7 +406,7 @@ async def test_steward_escalation_after_the_review_budget_is_announced(
     await repo.update_task(db, task_id, status="review")
     await db.commit()
 
-    await steward_applied._hand_to_the_human(db, task_id, 99)
+    await steward_applied._hand_to_the_human(db, task_id, 99, 0)
 
     assert (await repo.get_task(db, task_id))["status"] == "needs_decision"
     events = [
