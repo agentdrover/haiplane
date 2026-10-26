@@ -629,3 +629,49 @@ def test_a_long_folded_finding_does_not_hide_the_short_ones_after_it():
     assert len(head + got) <= 2000
     assert "hub/a.py:1" in got and "hub/b.py:2" in got and "hub/c.py:3 хвост" in got
     assert "не показано" not in got or got.endswith("не показано")
+
+
+def test_the_folded_text_never_exceeds_the_limit_whatever_the_lengths():
+    import random
+
+    from hub.services.steward_applied import _fit_folded
+
+    head = "h" * 50
+    reproduced = ["a" * 1770] + ["b" * 2000] * 10 + ["c" * 157]
+    got = _fit_folded(head, reproduced)
+    assert len(head + got) <= 2000 and "не показано" in got
+    rng = random.Random(2053)
+    for _ in range(500):
+        parts = [
+            "x" * rng.choice([5, 80, 400, 1700, 2000, 2400])
+            for _ in range(rng.randint(2, 60))
+        ]
+        out = _fit_folded(head, parts)
+        assert len(head + out) <= 2000, [len(p) for p in parts]
+        omitted = (
+            out.rsplit("ещё ", 1)[-1].split(" ")[0] if "не показано" in out else "0"
+        )
+        assert int(omitted) <= len(parts)
+
+
+async def test_a_human_changes_request_over_a_stale_claim_is_not_ours(db, monkeypatch):
+    """Человек записал CR, пока метка висела: закрываем без returned, тревоги и повтора."""
+    from hub.services import steward_advisor
+
+    task_id = await _scene(db, monkeypatch, "jcr-human")
+    await _online(db, task_id)
+    await _stick(db, task_id)
+    await repo.update_task(
+        db,
+        task_id,
+        status="running",
+        review_verdict="changes_requested",
+        review_verdict_generation=1,
+    )
+    await db.commit()
+
+    await steward_advisor._escalate_interrupted(db)
+
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["advisor_outcome"] == "skipped"
+    assert await _alerts_of(db, task_id) == []

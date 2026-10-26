@@ -830,10 +830,13 @@ async def _recover_interrupted_changes(
         and task.get("review_verdict_generation") == generation
         and task.get("status") != "review"
     ):
+        # Вердикт мог лечь от человека, пока метка висела: тогда это не наш
+        # возврат, и «returned» было бы ложью - закрываем без тревоги и повтора.
+        ours = await _steward_verdict_recorded(db, item, "changes_requested")
         closed = await db.execute(
-            "UPDATE steward_judgements SET advisor_outcome='returned' "
+            "UPDATE steward_judgements SET advisor_outcome=? "
             "WHERE id=? AND advisor_outcome=?",
-            (item["id"], _OUTCOME_CLAIMED),
+            ("returned" if ours else "skipped", item["id"], _OUTCOME_CLAIMED),
         )
         return int(closed.rowcount == 1)
     retried = await fetchall(
@@ -929,7 +932,13 @@ failure_reason = reason_line  # #2040: закрытый словарь, hub/serv
 
 
 async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
-    """Записал ли approve ЭТОГО применения (стюард): сбой мог быть после записи вердикта.
+    return await _steward_verdict_recorded(db, item, "approved")
+
+
+async def _steward_verdict_recorded(
+    db: aiosqlite.Connection, item: dict[str, Any], verdict: str
+) -> bool:
+    """Записал ли вердикт ЭТОГО применения (стюард): сбой мог быть после записи вердикта.
 
     Признак - событие вердикта задачи с источником стюарда
     (``steward_applied``), approved, то же поколение; последующий вердикт
@@ -951,7 +960,7 @@ async def _approve_recorded(db: aiosqlite.Connection, item: dict[str, Any]) -> b
         if (
             isinstance(payload, dict)
             and payload.get("source") == "steward_applied"
-            and payload.get("verdict") == "approved"
+            and payload.get("verdict") == verdict
             and payload.get("submission_generation") == int(item["generation"])
         ):
             return True

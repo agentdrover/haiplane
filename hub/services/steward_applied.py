@@ -298,21 +298,24 @@ def _fit_folded(head: str, parts: list[str]) -> str:
     whole = sep.join(parts)
     if len(whole) <= limit:
         return whole
-    shown: list[str] = []
-    used = 0
-    for index, part in enumerate(parts):
-        left = len(parts) - index
-        # пометка считается по худшему случаю: все оставшиеся не показаны
-        room = limit - used - len(f" … ещё {left} не показано")
-        cost = len(sep) if shown else 0
-        piece = part if len(part) <= room - cost else part[:_SHORT_HEAD] + "…"
-        if len(piece) <= room - cost:
-            shown.append(piece)
-            used += cost + len(piece)
-    omitted = len(parts) - len(shown)
-    if not omitted and len(sep.join(shown)) <= limit:
-        return sep.join(shown)
-    return sep.join(shown) + f" … ещё {omitted} не показано"
+    kept: list[str | None] = list(parts)
+
+    def render() -> str:
+        shown = [x for x in kept if x is not None]
+        omitted = len(parts) - len(shown)
+        return sep.join(shown) + f" … ещё {omitted} не показано"
+
+    # Корректно по построению: пока с пометкой не помещается - сначала
+    # обрезаем самую длинную находку до начала (file:line впереди), потом
+    # выбрасываем последнюю; пометка пересчитывается с новым счётом.
+    while len(render()) > limit:
+        live = [i for i, x in enumerate(kept) if x is not None]
+        longest = max(live, key=lambda i: len(kept[i] or ""))
+        if len(kept[longest] or "") > _SHORT_HEAD + 1:
+            kept[longest] = (kept[longest] or "")[:_SHORT_HEAD] + "…"
+        else:
+            kept[live[-1]] = None
+    return render()
 
 
 #: Начало слишком длинной находки (file:line впереди), когда целиком не влезает.
