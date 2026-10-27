@@ -203,12 +203,16 @@ def test_a_changed_file_that_no_test_mentions_is_named(
     """A selection that covers nothing for a change must not look like a full one."""
     root = make_repo(tmp_path)
     write(root, "docs/other.md", "unmentioned\n")
+    (root / "docs/note.md").unlink()  # a deleted file nobody names is reported too
     (root / "hub").mkdir()
     write(root, "hub/code.py", "x = 1\n")
     rc = changed_tests.main(["--root", str(root), "--dry-run"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "no test mentions 1 changed file(s): docs/other.md" in out
+    assert (
+        "no test mentions 2 changed file(s): docs/note.md (deleted), docs/other.md"
+        in out
+    )
     assert "changed hub code is not followed" in out
 
 

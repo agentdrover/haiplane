@@ -136,13 +136,17 @@ def select(root: Path, changed: list[str]) -> dict[str, list[str]]:
 
 
 def unmapped(root: Path, changed: list[str]) -> list[str]:
-    """Changed non-Python paths that no test mentions: the selection does not cover them."""
+    """Changed non-Python paths that no test mentions: the selection does not cover them.
+
+    A deleted path counts too (shown with ``(deleted)``): removing a file that a
+    test reads without spelling out its path breaks that test just the same.
+    """
     targets = [p for p in changed if not p.endswith(".py")]
     mentioned = {t for hits in readers_of(root, targets).values() for t in hits}
     return [
-        p
-        for p in changed
-        if not p.endswith(".py") and p not in mentioned and (root / p).exists()
+        p if (root / p).exists() else f"{p} (deleted)"
+        for p in targets
+        if p not in mentioned
     ]
 
 
