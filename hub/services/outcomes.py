@@ -312,7 +312,7 @@ async def _debt_entries(
     owners = (
         await classify_ownerships(db, [dict(r) for r in rows]) if with_ownership else {}
     )
-    retirements = await retirement_states(db, rows, answers)
+    retirements = await retirement_states(db, [dict(r) for r in rows], answers)
     items: list[dict[str, Any]] = []
     answered_items: list[dict[str, Any]] = []
     ordered: list[dict[str, Any]] = []

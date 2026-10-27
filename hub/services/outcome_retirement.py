@@ -285,7 +285,8 @@ async def apply_retirement(
     if len(text) > REASON_MAX:
         raise ValueError(f"reason is longer than {REASON_MAX} characters")
     async with write_transaction(db):
-        preview = await repository.get_retirement_preview(db, token)
+        stored = await repository.get_retirement_preview(db, token)
+        preview = dict(stored) if stored is not None else None
         if preview is None:
             raise LookupError(
                 "preview not found or expired: run the preview again and apply its token"
@@ -293,7 +294,8 @@ async def apply_retirement(
         entries = json.loads(preview["entries"])
         delivery = await project_policy.merge_is_delivery_projects(db)
         active = {
-            int(r["task_id"]): r for r in await repository.list_active_retirements(db)
+            int(r["task_id"]): dict(r)
+            for r in await repository.list_active_retirements(db)
         }
         retired: list[int] = []
         skipped: list[dict[str, Any]] = []
