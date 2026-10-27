@@ -46,6 +46,13 @@ async def card_hosts(db: aiosqlite.Connection, task: dict[str, Any]) -> list[str
     return await executor_orders.enabled_host_names(db)
 
 
+async def card_capacity(db: Any) -> dict[str, str]:
+    """#2107: «N/slots» хоста для кнопки запуска — из того же счёта незакрытых заказов, что /api/executor-slots."""
+    from hub.services.executor_slots import host_capacity
+
+    return {h["name"]: f"{h['open']}/{h['slots']}" for h in await host_capacity(db)}
+
+
 @router.post("/tasks/{task_id}/web-executor-slot", response_class=HTMLResponse)
 async def web_executor_slot(
     task_id: int,

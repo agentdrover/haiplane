@@ -12,8 +12,11 @@ import asyncio
 import aiosqlite
 import pytest
 
+from hub import config
+from hub.services import admin as admin_svc
 from hub.services import executor_orders as orders
 from tests.test_executor_orders import (  # noqa: F401 - фикстуры и помощники того же мира
+    _claim_and_start,
     _clean_limiter,
     _code_of,
     _launch,
@@ -132,6 +135,9 @@ async def test_two_orders_live_independently(world):
         redeemed = await _redeem(world, _code_of(world, got[task_id]))
         assert redeemed.status_code == 200, redeemed.text
         sessions[task_id] = {"Authorization": f"Bearer {redeemed.json()['token']}"}
+        await _claim_and_start(
+            world, task_id, sessions[task_id]
+        )  # оба исполнителя работают
     await _submit(world, a)
     await orders.settle(world.db, host="k8")
     await world.db.commit()
@@ -140,6 +146,14 @@ async def test_two_orders_live_independently(world):
     assert (
         await world.client.get("/api/whoami", headers=sessions[b])
     ).status_code == 200
+    task_b = await world.client.get(f"/api/tasks/{b}", headers=sessions[b])
+    assert task_b.status_code == 200 and task_b.json()["status"] == "running"
+    live = await _rows(
+        world.db,
+        "SELECT 1 FROM executor_slots WHERE task_id = ? AND released_at IS NULL",
+        (b,),
+    )
+    assert live, "захват B не должен сниматься сдачей A"
     assert len(await _open(world)) == 1
     off = await world.client.post(
         "/api/admin/executor-hosts/k8/disable", headers=world.human_auth
@@ -174,7 +188,18 @@ async def test_set_slots_and_capacity_view(world):
     assert refused.status_code == 409 and "2/1" in refused.text
     from hub.services.executor_slots import format_occupancy
 
-    assert any(
-        line.startswith("хост k8: 2/1")
-        for line in format_occupancy(view | {"hosts": [k8 | {"open": 2, "slots": 1}]})
+    full = (
+        await world.client.get("/api/executor-slots", headers=world.human_auth)
+    ).json()
+    text = format_occupancy(full)
+    assert any(line.startswith(f"хост k8: 2/1 — #{a}, #{b}") for line in text), text
+    assert (
+        "Слоты свободны, задач в работе нет." not in text
+    )  # брони без захвата — не «свободно»
+    # карточка: кнопка называет занятость хоста
+    session = await admin_svc.create_browser_session(world.db, world.human_id)
+    await world.db.commit()
+    page = await world.client.get(
+        f"/tasks/{c}", headers={"Cookie": f"{config.HUB_COOKIE_NAME}={session}"}
     )
+    assert page.status_code == 200 and "Запустить на k8 · 2/1" in page.text

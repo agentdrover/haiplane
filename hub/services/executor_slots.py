@@ -95,7 +95,10 @@ def format_occupancy(result: dict[str, Any]) -> list[str]:
             f"брошена: #{row.get('task_id')} {row.get('title', '')} — "
             f"{row.get('reason', '')}"
         )
-    return head + (lines or ["Слоты свободны, задач в работе нет."])
+    if lines:
+        return head + lines
+    busy = any(int(h.get("open") or 0) for h in result.get("hosts") or [])
+    return head + ([] if busy else ["Слоты свободны, задач в работе нет."])
 
 
 async def _capture_session(
