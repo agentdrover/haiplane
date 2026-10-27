@@ -429,3 +429,46 @@ async def test_order_project_null_for_legacy_and_present_in_waiting_memory(world
         assert [o["id"] for o in orders] == [waiting_id]
         assert orders[0]["state"] == "waiting_memory"
         assert orders[0]["project"] == world.slug
+
+
+async def test_migration_keeps_legacy_orders_with_null_project(monkeypatch):
+    """Миграция #2122: заказ до шага сохранён, project_slug NULL, отдача даёт null, повтор пуст."""
+    import aiosqlite
+
+    import hub.db as db_module
+    from hub.migrations import FROZEN_MIGRATIONS
+    from hub.migrations.steps import load_steps
+    from hub.services import executor_orders
+    from tests.test_db_migrations import _SCHEMA
+
+    steps = load_steps()
+    name = "add_executor_orders_project_slug_2122"
+    assert any(n == name for n, _ in steps), "нет шага миграции #2122"
+    before = [(n, q) for n, q in steps if n != name]
+    monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *before])
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        await db_module._migrate(conn)
+        await conn.execute("PRAGMA foreign_keys = OFF")
+        await conn.execute(
+            "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
+            "state, expires_at, order_text) VALUES ('k8', 7, 1, 9, 'delivered', "
+            "'2030-01-01 00:00:00', 'text')"
+        )
+        await conn.commit()
+        cols = [
+            r[1]
+            for r in await conn.execute_fetchall("PRAGMA table_info(executor_orders)")
+        ]
+        assert "project_slug" not in cols
+
+        monkeypatch.setattr(db_module, "_MIGRATIONS", [*FROZEN_MIGRATIONS, *steps])
+        await db_module._migrate(conn)
+        await db_module._migrate(conn)  # повторный старт: без ошибок и дублей
+        rows = await conn.execute_fetchall("SELECT * FROM executor_orders")
+        assert len(rows) == 1 and rows[0]["project_slug"] is None
+        assert executor_orders._order_view(dict(rows[0]))["project"] is None
+    finally:
+        await conn.close()
