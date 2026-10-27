@@ -46,22 +46,33 @@ _ROLLUP_TYPES = frozenset({"epic", "feature"})
 
 async def _fix_at(
     db: aiosqlite.Connection, row: Row, delivery_projects: frozenset[int]
-) -> str:
+) -> tuple[str, list[str]]:
+    """The delivery part of a promise's context: first-deploy moment + delivered shas.
+
+    The moment alone cannot see a second delivery (a later sha leaves the first
+    deploy where it was), so the set of delivered shas is part of the identity.
+    A repeated deploy of a known sha changes neither.
+    """
+    descendants = str(row.get("task_type") or "") in _ROLLUP_TYPES
     fix = await repository.first_fix_deploy_at(
         db,
         int(row["id"]),
-        with_descendants=str(row.get("task_type") or "") in _ROLLUP_TYPES,
+        with_descendants=descendants,
         delivery_projects=delivery_projects,
     )
-    return fix.at or ""
+    shas = await repository.delivered_fix_shas(
+        db, int(row["id"]), with_descendants=descendants
+    )
+    return fix.at or "", shas
 
 
-def context_of(row: Row, fix_released_at: str) -> tuple[dict[str, str], str]:
+def context_of(row: Row, delivery: tuple[str, list[str]]) -> tuple[dict[str, Any], str]:
     """The promise's context and its hash: what a decision is bound to."""
     context = {
         "outcome_metric": str(row.get("outcome_metric") or "").strip(),
         "completed_at": str(row.get("completed_at") or ""),
-        "fix_released_at": fix_released_at,
+        "fix_released_at": delivery[0],
+        "delivered_shas": delivery[1],
     }
     digest = hashlib.sha256(
         json.dumps(context, sort_keys=True, ensure_ascii=False).encode()

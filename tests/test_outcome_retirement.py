@@ -409,3 +409,74 @@ async def test_apply_skips_tasks_that_left_the_previewed_project(
 
     assert result["retired"] == []
     assert result["skipped"] == [{"task_id": child, "reason": "left_project_scope"}]
+
+
+_SAME_MOMENT = "2026-09-01 00:00:00"
+
+
+async def _delivered(db: aiosqlite.Connection, sha_a: str = "a" * 40) -> int:
+    task_id = await _old(db, "Delivered", released_days_ago=40)
+    await db.execute("UPDATE releases SET deployed_at=?", (_SAME_MOMENT,))
+    await db.commit()
+    assert sha_a  # the first delivery is whatever _task stamped
+    return task_id
+
+
+async def _second_delivery(db: aiosqlite.Connection, task_id: int, sha: str) -> None:
+    """A new merge of the same task released under a NEW sha, same first-deploy moment."""
+    from tests.test_outcome_status import _fix_release
+
+    await _fix_release(db, task_id, days_ago=40, sha=sha)
+    await db.execute("UPDATE releases SET deployed_at=?", (_SAME_MOMENT,))
+    await db.commit()
+
+
+async def test_second_delivery_after_apply_is_new_context(db: aiosqlite.Connection):
+    """AC-4 (Codex P2): поставка под новым SHA не наследует снятие."""
+    task_id = await _delivered(db)
+    await _apply(db, (await _preview(db))["token"])
+    assert (await _counts(db))["retired_total"] == 1
+
+    await _second_delivery(db, task_id, "b" * 40)
+
+    assert (await _counts(db))["retired_total"] == 0
+    states = {r["task_id"]: r["state"] for r in await _history(db)}
+    assert states[task_id] == "context_changed"
+
+
+async def test_delivery_between_preview_and_apply_is_skipped(
+    db: aiosqlite.Connection,
+):
+    """AC-2/AC-4: поставка между предпросмотром и применением не снимается молча."""
+    task_id = await _delivered(db)
+    prev = await _preview(db)
+    await _second_delivery(db, task_id, "c" * 40)
+
+    result = await _apply(db, prev["token"])
+
+    assert result["retired"] == []
+    assert result["skipped"] == [
+        {"task_id": task_id, "reason": "changed_since_preview"}
+    ]
+
+
+async def test_redeploy_of_the_same_sha_keeps_the_context(db: aiosqlite.Connection):
+    """Повторный выкат известного SHA контекст не меняет."""
+    task_id = await _delivered(db)
+    await _apply(db, (await _preview(db))["token"])
+    sha = (
+        await db.execute_fetchall(
+            "SELECT deployed_sha FROM releases ORDER BY id LIMIT 1"
+        )
+    )[0][0]
+
+    await db.execute(
+        "INSERT INTO releases (project_id, deployed_sha, ref, status, source, "
+        "deployed_at) VALUES (NULL, ?, 'main', 'success', 'ci', '2026-10-20 00:00:00')",
+        (sha,),
+    )
+    await db.commit()
+
+    assert (await _counts(db))["retired_total"] == 1
+    states = {r["task_id"]: r["state"] for r in await _history(db)}
+    assert states[task_id] == "retired"

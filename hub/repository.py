@@ -6790,3 +6790,26 @@ async def mark_retirement_preview_applied(
         "applied_result=? WHERE token=? AND applied_at IS NULL",
         (result, token),
     )
+
+
+async def delivered_fix_shas(
+    db: aiosqlite.Connection, task_id: int, *, with_descendants: bool = False
+) -> list[str]:
+    """Identity of the task's deliveries: every stamped fix sha that really deployed.
+
+    Distinct, trimmed, lower-cased, sorted. A new merge released under a new sha
+    adds one; a re-deploy of a sha already here adds nothing. With
+    ``with_descendants`` the whole subtree counts, as in ``first_fix_deploy_at``.
+    """
+    tree = _FIX_TREE_SQL if with_descendants else "SELECT ? AS id"
+    rows = await fetchall(
+        db,
+        "SELECT DISTINCT LOWER(TRIM(pm.released_sha)) AS sha "  # nosec B608
+        f"FROM ({tree}) AS tr JOIN pipeline_merges pm ON pm.task_id = tr.id "
+        "WHERE TRIM(COALESCE(pm.released_sha, '')) != '' AND EXISTS ("
+        "SELECT 1 FROM releases r WHERE r.status = 'success' "
+        "AND LOWER(TRIM(r.deployed_sha)) = LOWER(TRIM(pm.released_sha))) "
+        "ORDER BY sha",
+        (task_id,),
+    )
+    return [str(r["sha"]) for r in rows]
