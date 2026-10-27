@@ -118,6 +118,7 @@ async def set_outcome_owner(
     task_id: int,
     owner_task_id: int | None,
     set_by: str = "",
+    principal_id: int | None = None,
 ) -> dict[str, Any]:
     """Delegate the task's promise to an ancestor, or take it back with None.
 
@@ -136,7 +137,7 @@ async def set_outcome_owner(
         if owner_task_id is not None:
             await _require_ancestor(db, task, owner_task_id)
         previous = task.get("outcome_owner_task_id")
-        await _write_link(db, task_id, previous, owner_task_id, set_by)
+        await _write_link(db, task_id, previous, owner_task_id, set_by, principal_id)
         view = await ownership_for_task(
             db, {**task, "outcome_owner_task_id": owner_task_id}
         )
@@ -154,6 +155,7 @@ async def _write_link(
     previous: int | None,
     owner_task_id: int | None,
     set_by: str,
+    principal_id: int | None,
 ) -> None:
     """Column and feed entry under one SAVEPOINT: a nested caller keeps neither half."""
     await db.execute("SAVEPOINT outcome_owner_write")
@@ -170,6 +172,8 @@ async def _write_link(
                     if owner_task_id is not None
                     else "Outcome promise taken back (independent)"
                 ),
+                principal_id=principal_id,
+                author_kind="principal" if principal_id is not None else "anonymous",
             )
     except BaseException:
         await db.execute("ROLLBACK TO outcome_owner_write")

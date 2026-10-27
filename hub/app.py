@@ -1976,7 +1976,7 @@ async def api_set_outcome_owner(
     task_id: int,
     body: OutcomeOwnerSet,
     request: Request,
-    identity=Depends(current_identity),
+    identity=Depends(require_human_or_admin),
 ):
     """Say which ancestor holds this task's outcome promise, or take it back (#2090).
 
@@ -1991,6 +1991,7 @@ async def api_set_outcome_owner(
             task_id=task_id,
             owner_task_id=body.owner_task_id,
             set_by=identity.username,
+            principal_id=identity.principal_id,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

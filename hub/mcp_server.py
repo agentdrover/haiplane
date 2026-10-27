@@ -4302,7 +4302,7 @@ async def hub_outcome_debt(
 
     ONE page plus counters (#1605): status overdue by default, limit 1-200,
     offset; only_counts drops rows. view=actionable (#2090): minus promises a
-    valid owner holds (hub_set_outcome_owner); adds statuses covered,
+    valid owner holds (a human sets it); adds statuses covered,
     invalid_owner. Coverage is no answer.
     """
     params: dict[str, Any] = {"status": status, "limit": limit, "offset": offset}
@@ -4319,34 +4319,6 @@ async def hub_outcome_debt(
     return structured_echo_result(
         "\n".join(_outcome_debt_lines(data)), outcome_debt=data
     )
-
-
-@mcp.tool()
-async def hub_set_outcome_owner(
-    task_id: int, owner_task_id: int | None
-) -> CallToolResult:
-    """Name the ancestor holding this task's outcome promise (#2090).
-
-    While valid, the task leaves view=actionable debt. Not an answer; None
-    takes it back.
-    """
-    try:
-        result = await _api_post(
-            f"/api/tasks/{task_id}/outcome-owner", {"owner_task_id": owner_task_id}
-        )
-    except HubApiError as exc:
-        return _error_result(exc)
-    own = result.get("ownership") or {}
-    if own.get("state") == "covered":
-        text = f"Task #{task_id}: promise held by #{own.get('owner_task_id')}."
-    elif own.get("state") == "invalid_owner":
-        text = (
-            f"Task #{task_id}: link to #{own.get('owner_task_id')} saved, but it "
-            f"does not hold now ({own.get('reason')}); the promise is not freed."
-        )
-    else:
-        text = f"Task #{task_id}: promise is independent."
-    return structured_echo_result(text, outcome_owner=result)
 
 
 @mcp.tool()

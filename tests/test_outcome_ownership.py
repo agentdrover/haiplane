@@ -526,8 +526,6 @@ async def test_set_owner_answer_carries_the_verdict_and_the_journal_survives(
     db: aiosqlite.Connection, client: AsyncClient
 ):
     """Ответ записи называет действие ссылки; запись в ленте переживает запрос."""
-    from hub import mcp_server
-
     epic = await _task(db, "Open epic", task_type="epic", status="running")
     child = await _task(db, "Child", parent_id=epic)
 
@@ -542,10 +540,6 @@ async def test_set_owner_answer_carries_the_verdict_and_the_journal_survives(
         "SELECT content FROM task_updates WHERE task_id=?", (child,)
     )
     assert [r[0] for r in feed] == [f"Outcome promise delegated to #{epic}"]
-    with patch.object(mcp_server, "_api_post", AsyncMock(return_value=body)):
-        result = await mcp_server.hub_set_outcome_owner(child, epic)
-    assert "does not hold" in result.content[0].text
-    assert "held by" not in result.content[0].text
 
 
 async def test_ownership_context_does_not_depend_on_bound_variable_count(
@@ -579,3 +573,83 @@ async def test_nested_owner_write_rolls_back_both_halves_on_feed_failure(
 
     row = await repo.get_task(db, child)
     assert row is not None and row["outcome_owner_task_id"] is None
+
+
+async def test_agent_cannot_clear_its_own_debt(
+    db: aiosqlite.Connection, client: AsyncClient, monkeypatch
+):
+    """Назначение владельца — только человек: исполнитель не снимает свой долг."""
+    from hub import config, mcp_server
+    from hub.config import TokenIdentity
+    from hub.services.outcomes import outcome_debt
+
+    epic = await _task(db, "Epic", task_type="epic")
+    child = await _task(db, "Child", parent_id=epic)
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-token": TokenIdentity("impl-bot", "agent"),
+            "human-token": TokenIdentity("denis", "human", 1),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    url = f"/api/tasks/{child}/outcome-owner"
+    before = (await outcome_debt(db, view="actionable", only_counts=True))["total"]
+
+    denied = await client.post(
+        url,
+        json={"owner_task_id": epic},
+        headers={"Authorization": "Bearer agent-token"},
+    )
+
+    assert denied.status_code == 403
+    row = await repo.get_task(db, child)
+    assert row is not None and row["outcome_owner_task_id"] is None
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM task_updates WHERE task_id=?", (child,)
+    )
+    after = (await outcome_debt(db, view="actionable", only_counts=True))["total"]
+    assert after == before, "the debt did not move"
+    allowed = await client.post(
+        url,
+        json={"owner_task_id": epic},
+        headers={"Authorization": "Bearer human-token"},
+    )
+    assert allowed.status_code == 200
+    feed = await db.execute_fetchall(
+        "SELECT agent, principal_id, author_kind FROM task_updates WHERE task_id=?",
+        (child,),
+    )
+    assert [tuple(r) for r in feed] == [("denis", 1, "principal")], (
+        "REST passes the authenticated principal through"
+    )
+    assert mcp_server.mcp._tool_manager.get_tool("hub_set_outcome_owner") is None, (
+        "no agent-visible tool may write the link"
+    )
+
+
+async def test_owner_feed_entries_keep_the_principal(db: aiosqlite.Connection):
+    """Назначение, переназначение и снятие пишут principal_id и author_kind."""
+    root = await _task(db, "Epic", task_type="epic")
+    feature = await _task(db, "Feature", task_type="feature", parent_id=root)
+    child = await _task(db, "Child", parent_id=feature)
+    from hub.services.outcome_ownership import set_outcome_owner
+
+    for owner in (feature, root, None):
+        await set_outcome_owner(
+            db, task_id=child, owner_task_id=owner, set_by="denis", principal_id=1
+        )
+    await set_outcome_owner(db, task_id=child, owner_task_id=root, set_by="anon")
+
+    rows = await db.execute_fetchall(
+        "SELECT agent, principal_id, author_kind FROM task_updates "
+        "WHERE task_id=? ORDER BY id",
+        (child,),
+    )
+    assert [tuple(r) for r in rows] == [
+        ("denis", 1, "principal"),
+        ("denis", 1, "principal"),
+        ("denis", 1, "principal"),
+        ("anon", None, "anonymous"),
+    ]
