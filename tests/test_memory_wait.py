@@ -396,13 +396,13 @@ async def test_migration_rebuilds_the_check_and_keeps_orders(monkeypatch):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        # Занятый слот держит индекс и в ожидании.
+        # Занятый слот держит база и в ожидании (триггер слотов #2107, до него индекс).
         try:
             await conn.execute(
                 "INSERT INTO executor_orders (host, task_id, generation, "
                 "executor_run_id, expires_at) VALUES ('k8', 8, 1, 10, '2030-01-01')"
             )
-            raise AssertionError("слот k8 занят: UNIQUE обязан отказать")
+            raise AssertionError("слот k8 занят: база обязана отказать")
         except aiosqlite.IntegrityError:
             await conn.rollback()
         await db_module._migrate(conn)  # повторный старт ничего не меняет
