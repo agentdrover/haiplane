@@ -98,6 +98,7 @@ from hub.models import (
     CloneBranchState,
     FindingDispositionsSubmit,
     OutcomeAnswerSubmit,
+    OutcomeOwnerSet,
     ProjectCreate,
     PolicyScheduleCreate,
     ProjectPatch,
@@ -1868,12 +1869,14 @@ async def api_record_category_check(
 @app.get("/api/metrics/outcome-debt")
 async def api_outcome_debt(
     request: Request,
-    status: Literal["overdue", "observing", "unknown", "answered"] | None = Query(
-        default=None
-    ),
+    status: Literal[
+        "overdue", "observing", "unknown", "answered", "covered", "invalid_owner"
+    ]
+    | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=200),
     offset: int | None = Query(default=None, ge=0),
     only_counts: bool = Query(default=False),
+    view: Literal["all", "actionable"] = Query(default="all"),
 ):
     """Outcome promises and the answers to them (#766, #819).
 
@@ -1885,14 +1888,22 @@ async def api_outcome_debt(
     Without parameters the full payload (#1605); with ``status``/``limit``/
     ``offset`` one page of one status plus the counters, with ``only_counts``
     the counters alone.
+
+    ``view=actionable`` (#2090) is the same promises minus those an explicit,
+    valid owner link hands to an ancestor, always paged, with ``covered`` and
+    ``invalid_owner`` as extra statuses. The default view is the contract above.
     """
-    return await services.outcome_debt(
-        _db(request),
-        status=status,
-        limit=limit,
-        offset=offset,
-        only_counts=only_counts,
-    )
+    try:
+        return await services.outcome_debt(
+            _db(request),
+            status=status,
+            limit=limit,
+            offset=offset,
+            only_counts=only_counts,
+            view=view,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/tasks/{task_id}/finding-dispositions")
@@ -1953,6 +1964,34 @@ async def api_answer_outcome(
             measured_value=body.measured_value,
             note=body.note,
             answered_by=identity.username,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/tasks/{task_id}/outcome-owner")
+async def api_set_outcome_owner(
+    task_id: int,
+    body: OutcomeOwnerSet,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Say which ancestor holds this task's outcome promise, or take it back (#2090).
+
+    Only the chain of ancestors is checked on write; whether the owner finished
+    and states a metric is judged on every read. The link is not an answer and
+    touches neither ``outcome_answers`` nor the task's metric. ``set_by`` comes
+    from the authenticated principal.
+    """
+    try:
+        return await services.set_outcome_owner(
+            _db(request),
+            task_id=task_id,
+            owner_task_id=body.owner_task_id,
+            set_by=identity.username,
+            principal_id=identity.principal_id,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

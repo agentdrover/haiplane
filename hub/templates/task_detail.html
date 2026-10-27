@@ -266,6 +266,11 @@
                     <dt>Состояние гипотезы</dt>
                     <dd data-outcome-status="{{ outcome_status_value }}">{{ outcome_status_labels.get(outcome_status_value, outcome_status_value) }}</dd>
                     {% endif %}
+                    {%- if task.outcome_ownership and task.outcome_ownership.state != 'independent' %}
+                    {% set own = task.outcome_ownership %}
+                    <dt>Владелец обещания</dt>
+                    <dd data-outcome-ownership="{{ own.state }}">{% if own.state == 'covered' %}Держит <a href="/tasks/{{ own.owner_task_id }}">#{{ own.owner_task_id }}</a> (это не ответ){% else %}Связь с <a href="/tasks/{{ own.owner_task_id }}">#{{ own.owner_task_id }}</a> не действует: {{ own.reason }}; она не освобождает обещание{% endif %}</dd>
+                    {% endif %}
                     {% if task.outcome_metric %}
                     <dt>Outcome Metric</dt>
                     <dd class="u-pre-wrap">{{ task.outcome_metric }}</dd>

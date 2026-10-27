@@ -8,7 +8,7 @@ No Pydantic models, no business logic.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any, NamedTuple
 from urllib.parse import urlencode
 
@@ -2655,10 +2655,54 @@ async def list_outcome_debt(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     return await fetchall(
         db,
         "SELECT id, title, task_type, outcome_metric, outcome_indicator, "
-        "outcome_deadline, outcome_revisit_condition, completed_at, updated_at "
+        "outcome_deadline, outcome_revisit_condition, completed_at, updated_at, "
+        "parent_id, outcome_owner_task_id "
         "FROM tasks "
         "WHERE archived=0 AND status='completed' AND TRIM(outcome_metric) != '' "
         "ORDER BY COALESCE(completed_at, updated_at) ASC",
+    )
+
+
+async def list_ownership_context(
+    db: aiosqlite.Connection, task_ids: Collection[int], owner_ids: Collection[int]
+) -> list[aiosqlite.Row]:
+    """Every ancestor of ``task_ids`` plus the named owners, in ONE query (#2090).
+
+    The rows a promise's owner link is judged against. Ancestors are walked with
+    a recursive CTE, so the cost does not grow with the number of tasks judged;
+    the ids travel as two JSON arrays, so the bound-variable count stays two
+    however many tasks are judged.
+    """
+    ids, owners = sorted(set(task_ids)), sorted(set(owner_ids))
+    if not ids and not owners:
+        return []
+    return await fetchall(
+        db,
+        "WITH RECURSIVE chain(id) AS ("
+        "SELECT parent_id FROM tasks WHERE id IN (SELECT value FROM json_each(?)) "
+        "AND parent_id IS NOT NULL "
+        "UNION SELECT t.parent_id FROM tasks t JOIN chain c ON t.id = c.id "
+        "WHERE t.parent_id IS NOT NULL) "
+        "SELECT id, parent_id, status, archived, outcome_metric, "
+        "outcome_owner_task_id FROM tasks "
+        "WHERE id IN (SELECT id FROM chain) "
+        "OR id IN (SELECT value FROM json_each(?))",
+        (json.dumps(ids), json.dumps(owners)),
+    )
+
+
+async def set_outcome_owner_column(
+    db: aiosqlite.Connection, task_id: int, owner_task_id: int | None
+) -> None:
+    """Write the owner link and nothing else (#2090); the caller commits.
+
+    Not ``update_task``: that bumps ``updated_at``, which stands in for the
+    completion time of rows without ``completed_at``, so a delegation would move
+    the age of the promise it does not answer.
+    """
+    await db.execute(
+        "UPDATE tasks SET outcome_owner_task_id=? WHERE id=?",
+        (owner_task_id, task_id),
     )
 
 

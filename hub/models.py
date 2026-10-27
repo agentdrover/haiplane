@@ -2012,6 +2012,8 @@ class ReviewBrief(BaseModel):
     outcome_revisit_condition: str = ""
     # Computed (#576). None = this path did not assemble it, not "no hypothesis".
     outcome_status: OutcomeHypothesisStatus | None = None
+    # Who holds this promise (#2090). None = not assembled on this path.
+    outcome_ownership: OutcomeOwnershipView | None = None
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
@@ -3270,6 +3272,8 @@ class TaskView(PlainSummaryView):
     outcome_revisit_condition: str = ""
     # Computed (#576). None = this path did not assemble it, not "no hypothesis".
     outcome_status: OutcomeHypothesisStatus | None = None
+    # Who holds this promise (#2090). None = not assembled on this path.
+    outcome_ownership: OutcomeOwnershipView | None = None
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
@@ -3916,6 +3920,28 @@ class OutcomeHypothesisStatus(str, Enum):
     refuted = "refuted"
     unmeasurable = "unmeasurable"
     revised = "revised"
+
+
+class OutcomeOwnershipView(BaseModel):
+    """Who holds a task's outcome promise (#2090): a dimension apart from the answer.
+
+    ``covered``: an explicit, currently valid link to an ancestor that holds the
+    promise. ``invalid_owner``: a link exists and does not hold (``reason`` names
+    why); the obligation stays in debt. ``independent``: no link.
+    ``suggested_owner_task_id`` is the nearest ancestor with a metric - a hint
+    for triage, never coverage. Coverage is not an answer.
+    """
+
+    state: Literal["independent", "covered", "invalid_owner"]
+    owner_task_id: int | None = None
+    reason: str = ""
+    suggested_owner_task_id: int | None = None
+
+
+class OutcomeOwnerSet(BaseModel):
+    """Delegate a task's outcome promise to an ancestor; null takes it back (#2090)."""
+
+    owner_task_id: int | None = Field(default=None, ge=1)
 
 
 class OutcomeAnswerSubmit(BaseModel):

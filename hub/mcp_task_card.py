@@ -50,6 +50,7 @@ CARD_FIELDS: tuple[str, ...] = (
     "delivery_rerun",
     "role_orders",
     "critic_order",
+    "outcome_ownership",
     "created_at",
     "updated_at",
 )
