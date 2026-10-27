@@ -903,3 +903,42 @@ async def test_the_autopilot_ceiling_is_rechecked_in_the_verdict_transaction(
         )
     assert "class_above_policy_ceiling" in str(refused.value.detail)
     assert not ((await repo.get_task(db, task_id))["review_verdict"] or "")
+
+
+async def test_the_autopilot_is_asked_again_when_ci_turns_verified(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # #2054: чистый отчёт пришёл раньше подтверждения CI - автопилот отказал
+    # (ci_not_green), и ничто его больше не звало. Отчёт CI закреплённого
+    # коммита стал verified - автопилота спрашивают ОДИН раз, он решает;
+    # повторный отчёт того же коммита не зовёт и не пишет событий.
+    from hub.services import auto_verdict
+    from tests import ci_wake_support as wake
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(
+        client, db, "spike-ci-late", {"verdict": "auto"}, with_ci=False
+    )
+    await _post_review(client, task_id)
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["review_verdict"] in (None, ""), "CI не подтверждён: вердикта нет"
+
+    asked: list[int] = []
+    real = auto_verdict.maybe_auto_verdict
+
+    async def spy(db_, task_id_):
+        asked.append(task_id_)
+        return await real(db_, task_id_)
+
+    monkeypatch.setattr(auto_verdict, "maybe_auto_verdict", spy)
+    await wake.seed_verified_ci(db, task_id, _TIP)
+    await wake.ci_report_arrives(db, monkeypatch, task_id, _TIP)
+
+    assert asked == [task_id], "автопилота спросили ровно один раз"
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["review_verdict"] == "approved"
+
+    before = await wake.count_events(db, task_id)
+    await wake.ci_report_arrives(db, monkeypatch, task_id, _TIP)
+    assert asked == [task_id], "тот же отчёт не зовёт автопилота снова"
+    assert await wake.count_events(db, task_id) == before
