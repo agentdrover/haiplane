@@ -3944,6 +3944,26 @@ class OutcomeOwnerSet(BaseModel):
     owner_task_id: int | None = Field(default=None, ge=1)
 
 
+class OutcomeRetirementPreview(BaseModel):
+    """Which old promises a retirement would cover (#2091); writes nothing but the preview."""
+
+    cutoff: str = Field(min_length=1, max_length=64)
+    projects: list[str] = Field(min_length=1, max_length=50)
+
+
+class OutcomeRetirementApply(BaseModel):
+    """Apply a saved preview: its token and the reason on the record (#2091)."""
+
+    token: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class OutcomeRetirementCancel(BaseModel):
+    """Take a retirement back; the promise returns to the debt (#2091)."""
+
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class OutcomeAnswerSubmit(BaseModel):
     """One check of a completed task's stated outcome (#819).
 

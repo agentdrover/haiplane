@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from hub import config
+from hub import cli_outcome_retire as outcome_retire_cli
 from hub import cli_owner_minutes as om_cli
 from hub import cli_review_verdict as rv_cli
 from hub import cli_worktree_prune as wt_prune
@@ -2244,6 +2245,7 @@ def _add_outcome_debt_parser(sub: Any) -> None:
             "observing",
             "unknown",
             "answered",
+            "retired",
             "covered",
             "invalid_owner",
         ],
@@ -2275,6 +2277,7 @@ def _add_outcome_debt_parser(sub: Any) -> None:
     group.add_argument("--owner", type=int, help="Ancestor that holds the promise")
     group.add_argument("--clear", action="store_true", help="Take the promise back")
     p_owner.set_defaults(func=cmd_outcome_owner)
+    outcome_retire_cli.add_parsers(sub)
 
 
 def _add_projects_parser(sub: Any) -> None:

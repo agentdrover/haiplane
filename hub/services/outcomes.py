@@ -28,6 +28,7 @@ from hub import repository
 from hub.models import OutcomeHypothesisStatus, OutcomeVerdict
 from hub.services import project_policy
 from hub.services.outcome_ownership import classify_ownerships
+from hub.services.outcome_retirement import retirement_states
 
 
 def _days_since(stamp: str | None) -> int | None:
@@ -176,7 +177,7 @@ async def outcome_status_for_task(
     return status
 
 
-DEBT_STATUSES = ("overdue", "observing", "unknown", "answered")
+DEBT_STATUSES = ("overdue", "observing", "unknown", "answered", "retired")
 DEBT_DEFAULT_LIMIT = 20
 DEBT_MAX_LIMIT = 200
 _DEBT_COUNT_KEYS = (
@@ -185,6 +186,7 @@ _DEBT_COUNT_KEYS = (
     "overdue_total",
     "observing_total",
     "unknown_total",
+    "retired_total",
     "window_days",
 )
 
@@ -203,6 +205,7 @@ _ACTIONABLE_COUNT_KEYS = (
     "covered_total",
     "invalid_owner_total",
     "answered_total",
+    "retired_total",
     "population_total",
     "window_days",
 )
@@ -289,8 +292,17 @@ async def outcome_debt(
 
 async def _debt_entries(
     db: aiosqlite.Connection, *, with_ownership: bool = False
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Unanswered entries, answered entries, and both in age order.
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Unanswered entries, answered entries, all in age order, and retired ones.
+
+    ``retired`` (#2091): unanswered promises whose checking the owner retired and
+    whose context still holds. They are not in the unanswered list; a late
+    answer, a cancel or a new context puts them back or moves them to answered.
 
     ``with_ownership`` adds ``ownership`` to each entry (#2090); without it the
     entries are the pre-#2090 rows, key for key.
@@ -300,9 +312,11 @@ async def _debt_entries(
     owners = (
         await classify_ownerships(db, [dict(r) for r in rows]) if with_ownership else {}
     )
+    retirements = await retirement_states(db, [dict(r) for r in rows], answers)
     items: list[dict[str, Any]] = []
     answered_items: list[dict[str, Any]] = []
     ordered: list[dict[str, Any]] = []
+    retired_items: list[dict[str, Any]] = []
     for row in rows:
         finished = row["completed_at"] or row["updated_at"]
         task_answers = answers.get(row["id"], [])
@@ -327,6 +341,10 @@ async def _debt_entries(
         ordered.append(entry)
         if with_ownership:
             entry["ownership"] = owners[row["id"]]
+        decision = retirements.get(row["id"])
+        if decision is not None and decision["state"] == "retired":
+            retired_items.append({**entry, "retirement": decision})
+            continue
         if not task_answers:
             items.append(entry)
             continue
@@ -336,11 +354,11 @@ async def _debt_entries(
         entry["answers"] = len(task_answers)
         entry["latest_answer"] = task_answers[-1]
         answered_items.append(entry)
-    return items, answered_items, ordered
+    return items, answered_items, ordered, retired_items
 
 
 async def _full_outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
-    items, answered_items, _ = await _debt_entries(db)
+    items, answered_items, _, retired = await _debt_entries(db)
 
     def _with(status: OutcomeHypothesisStatus) -> list[dict[str, Any]]:
         return [i for i in items if i["outcome_status"] == status.value]
@@ -353,6 +371,8 @@ async def _full_outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
         "answered_total": len(answered_items),
         "items": items,
         "answered": answered_items,
+        "retired": retired,
+        "retired_total": len(retired),
         "overdue": overdue,
         "overdue_total": len(overdue),
         "observing": observing,
@@ -374,7 +394,9 @@ async def _full_outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
             "filtering, so nothing is hidden behind a value that cannot be parsed. "
             "`due_assumed`: the date counts from the merge, because the project "
             "declared merge = delivery (gate_policy `merge_is_delivery`), not from "
-            "a recorded deploy."
+            "a recorded deploy. `retired` (#2091): the owner retired the check, "
+            "result unknown - not an answer and not in `items`; a late answer, a "
+            "cancel or a changed promise puts it back."
         ),
     }
 
@@ -386,7 +408,7 @@ async def _actionable_debt(db: aiosqlite.Connection) -> dict[str, Any]:
     listed under their own status, with their answers intact: coverage is a
     dimension next to the answer, never a replacement for it.
     """
-    items, answered, ordered = await _debt_entries(db, with_ownership=True)
+    items, answered, ordered, retired = await _debt_entries(db, with_ownership=True)
     debt = [e for e in items if e["ownership"]["state"] != "covered"]
 
     def due(status: OutcomeHypothesisStatus) -> list[dict[str, Any]]:
@@ -410,6 +432,8 @@ async def _actionable_debt(db: aiosqlite.Connection) -> dict[str, Any]:
         "unknown_total": len(unknown),
         "answered": answered,
         "answered_total": len(answered),
+        "retired": retired,
+        "retired_total": len(retired),
         "covered": covered,
         "covered_total": len(covered),
         "invalid_owner": invalid,
@@ -425,7 +449,9 @@ async def _actionable_debt(db: aiosqlite.Connection) -> dict[str, Any]:
             "does not hold (`ownership.reason`) and never frees the promise. "
             "`independent_total`, `covered_total` and `invalid_owner_total` "
             "split ONE population (`population_total`); answered and due are "
-            "other dimensions and are not additive with them. A metric on an "
+            "other dimensions and are not additive with them. `retired` (#2091): "
+            "the owner retired the check, result unknown - not an answer; a late "
+            "answer, a cancel or a changed promise puts it back. A metric on an "
             "ancestor is only `ownership.suggested_owner_task_id`, a hint."
         ),
     }

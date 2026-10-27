@@ -99,6 +99,9 @@ from hub.models import (
     FindingDispositionsSubmit,
     OutcomeAnswerSubmit,
     OutcomeOwnerSet,
+    OutcomeRetirementApply,
+    OutcomeRetirementCancel,
+    OutcomeRetirementPreview,
     ProjectCreate,
     PolicyScheduleCreate,
     ProjectPatch,
@@ -1870,7 +1873,13 @@ async def api_record_category_check(
 async def api_outcome_debt(
     request: Request,
     status: Literal[
-        "overdue", "observing", "unknown", "answered", "covered", "invalid_owner"
+        "overdue",
+        "observing",
+        "unknown",
+        "answered",
+        "retired",
+        "covered",
+        "invalid_owner",
     ]
     | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=200),
@@ -1997,6 +2006,82 @@ async def api_set_outcome_owner(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/outcome-retirements/preview")
+async def api_preview_outcome_retirement(
+    body: OutcomeRetirementPreview,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Show the cohort of old promises a retirement would cover (#2091).
+
+    HUMAN-ONLY: giving up a check is the owner's decision, and an agent allowed
+    to retire promises would be clearing its own debt. Writes only the saved
+    preview; ``created_by`` is the authenticated principal.
+    """
+    try:
+        return await services.preview_retirement(
+            _db(request),
+            cutoff=body.cutoff,
+            projects=body.projects,
+            created_by=identity.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/outcome-retirements/apply")
+async def api_apply_outcome_retirement(
+    body: OutcomeRetirementApply,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Retire the previewed cohort: result unknown, not an answer (#2091).
+
+    Records that changed since the preview are skipped and named, never
+    retired quietly. Repeating a token is harmless.
+    """
+    try:
+        return await services.apply_retirement(
+            _db(request),
+            token=body.token,
+            reason=body.reason,
+            retired_by=identity.username,
+            principal_id=identity.principal_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/tasks/{task_id}/outcome-retirement/cancel")
+async def api_cancel_outcome_retirement(
+    task_id: int,
+    body: OutcomeRetirementCancel,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Take a retirement back; the promise is in the debt again (#2091)."""
+    try:
+        return await services.cancel_retirement(
+            _db(request),
+            task_id=task_id,
+            reason=body.reason,
+            cancelled_by=identity.username,
+            principal_id=identity.principal_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/outcome-retirements")
+async def api_list_outcome_retirements(
+    request: Request, task_id: int | None = Query(default=None, ge=1)
+):
+    """The history of retirement decisions, cancelled ones included (#2091)."""
+    return await services.list_retirements(_db(request), task_id)
 
 
 @app.post("/api/telemetry/deprecated-tool")
