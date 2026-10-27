@@ -587,8 +587,8 @@ async def test_one_task_per_slot_across_both_doors(world):
     loser = second if winner == first else first
     assert "слот занят" in next(r for r in both if r.status_code == 409).text
     assert len(await _rows(world.db, "SELECT 1 FROM executor_orders")) == 1
-    # Бронь держит САМ индекс, не только проверка: второй открытый заказ хоста
-    # база не примет, закрытый — примет.
+    # Бронь держит сама база (триггер слотов #2107), не только проверка: второй
+    # открытый заказ хоста с одним слотом база не примет, закрытый — примет.
     import aiosqlite
 
     open_order = (await _rows(world.db, "SELECT * FROM executor_orders"))[0]
