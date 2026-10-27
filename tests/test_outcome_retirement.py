@@ -148,7 +148,9 @@ async def test_owner_applies_only_reviewed_cohort(
     )
     undated = await _task(db, "No date")
     await _at(db, undated, None)
-    await db.execute("UPDATE tasks SET updated_at='2026-01-01 00:00:00' WHERE id=?", (undated,))
+    await db.execute(
+        "UPDATE tasks SET updated_at='2026-01-01 00:00:00' WHERE id=?", (undated,)
+    )
     foreign = await _old(db, "Other project", parent_id=other_epic)
     drifting = await _old(db, "Changes after preview")
     plain = await _old(db, "Plain old")
@@ -166,7 +168,9 @@ async def test_owner_applies_only_reviewed_cohort(
 
     prev = await _preview(db)
     assert {c["task_id"] for c in prev["cohort"]} == {before_edge, drifting, plain}
-    assert [u["task_id"] for u in prev["undated"]] == [undated], "no guess by updated_at"
+    assert [u["task_id"] for u in prev["undated"]] == [undated], (
+        "no guess by updated_at"
+    )
     assert prev["cohort_total"] == 3
     for absent in (on_edge, after_edge, answered, foreign, undated):
         assert absent not in {c["task_id"] for c in prev["cohort"]}
@@ -179,7 +183,9 @@ async def test_owner_applies_only_reviewed_cohort(
     result = await _apply(db, prev["token"])
 
     assert sorted(result["retired"]) == sorted([before_edge, plain])
-    assert result["skipped"] == [{"task_id": drifting, "reason": "changed_since_preview"}]
+    assert result["skipped"] == [
+        {"task_id": drifting, "reason": "changed_since_preview"}
+    ]
     rows = await _retired_rows(db)
     assert sorted(r["task_id"] for r in rows) == sorted([before_edge, plain])
     for row in rows:
@@ -314,17 +320,18 @@ async def test_later_answer_and_new_context_are_handled_explicitly(
     after = await _counts(db)
     assert after["retired_total"] == 3
     assert after["answered_total"] == base["answered_total"] + 1
-    states = {
-        r["task_id"]: r["state"]
-        for r in (await _history(db))
-    }
+    states = {r["task_id"]: r["state"] for r in (await _history(db))}
     assert states[late] == "superseded_by_answer"
     assert any(r["task_id"] == late for r in await _retired_rows(db)), "history kept"
 
     # 2. Cancel returns the promise to debt and keeps the old decision.
     debt_before = (await _counts(db))["total"]
     await cancel_retirement(
-        db, task_id=cancelled, reason="still needed", cancelled_by="denis", principal_id=1
+        db,
+        task_id=cancelled,
+        reason="still needed",
+        cancelled_by="denis",
+        principal_id=1,
     )
     assert (await _counts(db))["total"] == debt_before + 1
     assert (await _counts(db))["retired_total"] == 2

@@ -20,6 +20,12 @@ from hub.services.delivery_state import (
     undelivered_completed_tasks,
 )
 from hub.services.outcome_ownership import set_outcome_owner
+from hub.services.outcome_retirement import (
+    apply_retirement,
+    cancel_retirement,
+    list_retirements,
+    preview_retirement,
+)
 from hub.services.outcomes import answer_outcome, outcome_debt
 from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
@@ -337,6 +343,10 @@ __all__ = [
     "restore_pair_workspace_base",
     "answer_outcome",
     "set_outcome_owner",
+    "apply_retirement",
+    "cancel_retirement",
+    "list_retirements",
+    "preview_retirement",
     "outcome_debt",
     "PRACTICE_METRICS_DEFAULT_DAYS",
     "practice_metrics",

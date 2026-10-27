@@ -157,6 +157,7 @@ _COUNT_KEYS = {
     "overdue_total",
     "observing_total",
     "unknown_total",
+    "retired_total",
     "window_days",
 }
 
@@ -210,7 +211,9 @@ _FULL_NOTE = (
     "filtering, so nothing is hidden behind a value that cannot be parsed. "
     "`due_assumed`: the date counts from the merge, because the project "
     "declared merge = delivery (gate_policy `merge_is_delivery`), not from "
-    "a recorded deploy."
+    "a recorded deploy. `retired` (#2091): the owner retired the check, "
+    "result unknown - not an answer and not in `items`; a late answer, a "
+    "cancel or a changed promise puts it back."
 )
 
 
@@ -280,6 +283,8 @@ async def _frozen_debt_base(db: aiosqlite.Connection) -> dict:
         "answered_total": 1,
         "items": [overdue, observing, unknown],
         "answered": [answered],
+        "retired": [],
+        "retired_total": 0,
         "overdue": [overdue],
         "overdue_total": 1,
         "observing": [observing],

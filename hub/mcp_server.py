@@ -4225,7 +4225,8 @@ def _actionable_head(data: dict[str, Any]) -> str:
     others = (
         f"{data.get('covered_total', 0)} covered by an owner (coverage is not an answer), "
         f"{data.get('invalid_owner_total', 0)} with an invalid owner link, "
-        f"{data.get('answered_total', 0)} answered"
+        f"{data.get('answered_total', 0)} answered, "
+        f"{data.get('retired_total', 0)} retired by the owner (result unknown, not answers)"
     )
     if not data.get("total", 0):
         return f"No actionable outcome debt; that is not 'all answered': {others}."
@@ -4245,16 +4246,25 @@ def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
     if actionable:
         lines = [_actionable_head(data)]
     elif not data.get("total", 0):
+        retired = data.get("retired_total", 0)
         lines = [
             "No outcome debt: every completed task with a stated metric has "
-            f"an answer ({answered} answered).",
+            f"an answer ({answered} answered)"
+            + (
+                f" or a check retired by the owner ({retired}; result unknown, "
+                "not an answer)."
+                if retired
+                else "."
+            ),
         ]
     else:
         lines = [
             f"{data.get('total', 0)} completed tasks stated an outcome nobody "
             f"answered ({data.get('overdue_total', 0)} overdue, "
             f"{data.get('observing_total', 0)} observing, "
-            f"{data.get('unknown_total', 0)} unknown); {answered} answered.",
+            f"{data.get('unknown_total', 0)} unknown); {answered} answered, "
+            f"{data.get('retired_total', 0)} retired by the owner "
+            "(result unknown, not answers).",
         ]
     rows = data.get("rows")
     if rows is not None:

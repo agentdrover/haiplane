@@ -6681,3 +6681,101 @@ async def wait_for_executor_cost(
         (row_id, f"-{minutes} minutes"),
     )
     return bool(rows)
+
+
+# --- outcome retirements (#2091) ---------------------------------------------
+
+
+async def list_active_retirements(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Decisions not cancelled: at most one per task (partial unique index)."""
+    return await fetchall(
+        db,
+        "SELECT * FROM outcome_retirements WHERE cancelled_at IS NULL ORDER BY id",
+    )
+
+
+async def list_outcome_retirements(
+    db: aiosqlite.Connection, task_id: int | None = None
+) -> list[aiosqlite.Row]:
+    """The whole history, cancelled rows included, oldest first."""
+    if task_id is None:
+        return await fetchall(db, "SELECT * FROM outcome_retirements ORDER BY id")
+    return await fetchall(
+        db,
+        "SELECT * FROM outcome_retirements WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+
+
+async def insert_outcome_retirement(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    batch_id: str,
+    reason: str,
+    retired_by: str,
+    principal_id: int | None,
+    cutoff: str,
+    context_snapshot: str,
+    context_hash: str,
+) -> int:
+    cur = await db.execute(
+        "INSERT INTO outcome_retirements (task_id, batch_id, reason, retired_by, "
+        "principal_id, cutoff, context_snapshot, context_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            batch_id,
+            reason,
+            retired_by,
+            principal_id,
+            cutoff,
+            context_snapshot,
+            context_hash,
+        ),
+    )
+    return int(cur.lastrowid or 0)
+
+
+async def cancel_outcome_retirement(
+    db: aiosqlite.Connection, retirement_id: int, *, cancelled_by: str, reason: str
+) -> None:
+    """Close the decision; the row stays in the history."""
+    await db.execute(
+        "UPDATE outcome_retirements SET cancelled_at=datetime('now'), "
+        "cancelled_by=?, cancel_reason=? WHERE id=? AND cancelled_at IS NULL",
+        (cancelled_by, reason, retirement_id),
+    )
+
+
+async def save_retirement_preview(
+    db: aiosqlite.Connection,
+    *,
+    token: str,
+    cutoff: str,
+    projects: str,
+    entries: str,
+    created_by: str,
+    ttl_hours: int,
+) -> None:
+    await db.execute(
+        "DELETE FROM outcome_retirement_previews WHERE expires_at < datetime('now')"
+    )
+    await db.execute(
+        "INSERT INTO outcome_retirement_previews (token, cutoff, projects, entries, "
+        "created_by, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', ?))",
+        (token, cutoff, projects, entries, created_by, f"+{int(ttl_hours)} hours"),
+    )
+
+
+async def get_retirement_preview(
+    db: aiosqlite.Connection, token: str
+) -> aiosqlite.Row | None:
+    """A saved preview that has not expired, or None."""
+    rows = await fetchall(
+        db,
+        "SELECT * FROM outcome_retirement_previews "
+        "WHERE token=? AND expires_at >= datetime('now')",
+        (token,),
+    )
+    return rows[0] if rows else None
