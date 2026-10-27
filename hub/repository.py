@@ -815,6 +815,9 @@ class FixDeploy(NamedTuple):
 
     at: str | None
     assumed: bool = False
+    # Which delivery ``at`` belongs to: the released sha of the chosen merge, or
+    # ``merge:<sha>`` on the merge-is-delivery path. Never used to compute ``at``.
+    ident: str = ""
 
 
 _FIX_TREE_SQL = (
@@ -838,7 +841,8 @@ async def _merge_is_delivery_fix(
     """
     merges = await fetchall(
         db,
-        "SELECT project_id, merged_at, TRIM(COALESCE(released_sha, '')) AS sha "
+        "SELECT project_id, merged_at, TRIM(COALESCE(released_sha, '')) AS sha, "
+        "TRIM(COALESCE(merge_sha, '')) AS merge_sha "
         "FROM pipeline_merges WHERE task_id = ? ORDER BY id DESC",
         (task_id,),
     )
@@ -855,10 +859,13 @@ async def _merge_is_delivery_fix(
         "WHERE status = 'success' AND project_id = ?",
         (last["merged_at"], int(project_id)),
     )
+    ident = f"merge:{last['merge_sha'].lower()}"
     if not deploys[0]["n"]:
-        return FixDeploy(str(last["merged_at"]) if last["merged_at"] else None, True)
+        return FixDeploy(
+            str(last["merged_at"]) if last["merged_at"] else None, True, ident
+        )
     after = deploys[0]["first_after"]
-    return FixDeploy(str(after) if after else None)
+    return FixDeploy(str(after) if after else None, False, ident)
 
 
 async def first_fix_deploy_at(
@@ -888,26 +895,31 @@ async def first_fix_deploy_at(
     tree = _FIX_TREE_SQL if with_descendants else "SELECT ? AS id"
     rows = await fetchall(
         db,
-        f"SELECT MAX(d) AS at FROM (SELECT (SELECT MIN(r.deployed_at) FROM releases r "  # nosec B608
+        "SELECT (SELECT MIN(r.deployed_at) FROM releases r "  # nosec B608
         "WHERE r.status = 'success' "
-        "AND LOWER(TRIM(r.deployed_sha)) = LOWER(TRIM(pm.released_sha))) AS d "
+        "AND LOWER(TRIM(r.deployed_sha)) = LOWER(TRIM(pm.released_sha))) AS d, "
+        "LOWER(TRIM(pm.released_sha)) AS sha "
         f"FROM ({tree}) AS tr "
         "JOIN pipeline_merges pm ON pm.id = (SELECT MAX(p2.id) FROM pipeline_merges p2 "
-        "WHERE p2.task_id = tr.id AND TRIM(COALESCE(p2.released_sha, '')) != ''))",
+        "WHERE p2.task_id = tr.id AND TRIM(COALESCE(p2.released_sha, '')) != '')",
         (task_id,),
     )
-    strict = str(rows[0]["at"]) if rows and rows[0]["at"] else None
+    # The latest moment wins (an epic is out when its last child is); on a tie
+    # the larger sha, so the choice is stable.
+    best = max(((str(r["d"]), str(r["sha"])) for r in rows if r["d"]), default=None)
+    strict = FixDeploy(best[0], False, best[1]) if best else FixDeploy(None)
     if not delivery_projects:
-        return FixDeploy(strict)
+        return strict
     projects = frozenset(delivery_projects)
     ids = await fetchall(db, tree if with_descendants else "SELECT ?", (task_id,))
-    moments = [FixDeploy(strict)]
+    moments = [strict]
     for row in ids:
         moments.append(await _merge_is_delivery_fix(db, int(row[0]), projects))
     dated = [m for m in moments if m.at]
     if not dated:
         return FixDeploy(None)
-    return FixDeploy(max(m.at for m in dated if m.at), any(m.assumed for m in dated))
+    top = max(dated, key=lambda m: (m.at or "", m.ident))
+    return FixDeploy(top.at, any(m.assumed for m in dated), top.ident)
 
 
 async def pipeline_merge_recorded(
@@ -6790,43 +6802,3 @@ async def mark_retirement_preview_applied(
         "applied_result=? WHERE token=? AND applied_at IS NULL",
         (result, token),
     )
-
-
-async def delivered_fix_shas(
-    db: aiosqlite.Connection,
-    task_id: int,
-    *,
-    with_descendants: bool = False,
-    delivery_projects: frozenset[int] | set[int] = frozenset(),
-) -> list[str]:
-    """Identity of the task's deliveries: every stamped fix sha that really deployed.
-
-    Distinct, trimmed, lower-cased, sorted. A new merge released under a new sha
-    adds one; a re-deploy of a sha already here adds nothing. With
-    ``with_descendants`` the whole subtree counts, as in ``first_fix_deploy_at``.
-    """
-    tree = _FIX_TREE_SQL if with_descendants else "SELECT ? AS id"
-    rows = await fetchall(
-        db,
-        "SELECT DISTINCT LOWER(TRIM(pm.released_sha)) AS sha "  # nosec B608
-        f"FROM ({tree}) AS tr JOIN pipeline_merges pm ON pm.task_id = tr.id "
-        "WHERE TRIM(COALESCE(pm.released_sha, '')) != '' AND EXISTS ("
-        "SELECT 1 FROM releases r WHERE r.status = 'success' "
-        "AND LOWER(TRIM(r.deployed_sha)) = LOWER(TRIM(pm.released_sha))) "
-        "ORDER BY sha",
-        (task_id,),
-    )
-    shas = [str(r["sha"]) for r in rows]
-    if delivery_projects:
-        marks = ",".join("?" for _ in delivery_projects)
-        merges = await fetchall(
-            db,
-            "SELECT DISTINCT LOWER(TRIM(pm.merge_sha)) AS sha "  # nosec B608
-            f"FROM ({tree}) AS tr JOIN pipeline_merges pm ON pm.task_id = tr.id "
-            "WHERE TRIM(COALESCE(pm.released_sha, '')) = '' "
-            "AND TRIM(COALESCE(pm.merge_sha, '')) != '' "
-            f"AND pm.project_id IN ({marks})",
-            (task_id, *sorted(delivery_projects)),
-        )
-        shas += [f"merge:{r['sha']}" for r in merges]
-    return sorted(shas)

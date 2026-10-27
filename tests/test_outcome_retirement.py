@@ -501,3 +501,55 @@ async def test_merge_is_delivery_second_merge_is_new_context(
     assert (await _counts(db))["retired_total"] == 0
     states = {r["task_id"]: r["state"] for r in await _history(db)}
     assert states[task_id] == "context_changed"
+
+
+async def test_merge_is_delivery_enrichment_changes_the_canonical_fact(
+    db: aiosqlite.Connection,
+):
+    """Канон хаба: assumed -> проштампованный merge меняет факт поставки, а с ним контекст.
+
+    Это честное изменение факта (дата и sha теперь из выката), не дубль: снятие
+    такой задачи уходит в context_changed, и новый предпросмотр предложит её снова.
+    """
+    from tests.test_outcome_status import _delivery_project, _merge
+
+    pid = await _delivery_project(db, "local-app", {"merge_is_delivery": True})
+    task_id = await _old(db, "Local fix")
+    await _merge(db, task_id, pid, days_ago=60)
+    await _apply(db, (await _preview(db))["token"])
+    assert (await _counts(db))["retired_total"] == 1
+
+    sha = "e" * 40
+    await db.execute(
+        "UPDATE pipeline_merges SET released_pr=1, released_sha=? WHERE task_id=?",
+        (sha, task_id),
+    )
+    await repo.record_release(
+        db, deployed_sha=sha, project_id=None, ref="main", source="ci"
+    )
+    await db.commit()
+
+    assert (await _counts(db))["retired_total"] == 0
+    states = {r["task_id"]: r["state"] for r in await _history(db)}
+    assert states[task_id] == "context_changed"
+
+
+async def test_unreleased_new_merge_does_not_change_the_context(
+    db: aiosqlite.Connection,
+):
+    """Новый merge без штампа и без выката - не поставка: канонический факт прежний."""
+    from tests.test_outcome_status import _delivery_project
+
+    pid = await _delivery_project(db, "local-app", {"merge_is_delivery": True})
+    task_id = await _delivered(db)
+    await _apply(db, (await _preview(db))["token"])
+    assert (await _counts(db))["retired_total"] == 1
+
+    await repo.record_pipeline_merge(
+        db, pr_number=9001, merge_sha="f" * 40, task_id=task_id, project_id=pid
+    )
+    await db.commit()
+
+    assert (await _counts(db))["retired_total"] == 1
+    states = {r["task_id"]: r["state"] for r in await _history(db)}
+    assert states[task_id] == "retired"

@@ -46,36 +46,31 @@ _ROLLUP_TYPES = frozenset({"epic", "feature"})
 
 async def _fix_at(
     db: aiosqlite.Connection, row: Row, delivery_projects: frozenset[int]
-) -> tuple[str, list[str]]:
-    """The delivery part of a promise's context: first-deploy moment + delivered shas.
+) -> tuple[str, str]:
+    """The delivery part of a promise's context: the hub's canonical fix fact.
 
-    The moment alone cannot see a second delivery (a later sha leaves the first
-    deploy where it was), so the set of delivered shas is part of the identity.
-    A repeated deploy of a known sha changes neither.
+    Exactly what ``first_fix_deploy_at`` chose, nothing recomputed here: the
+    moment and the identity (sha) of the delivery it belongs to. The context
+    moves when that fact moves, and not otherwise (a repeated deploy of the
+    same sha, an unreleased merge). Enrichment of a merge-is-delivery merge
+    (assumed -> stamped) changes the fact, and so the context.
     """
-    descendants = str(row.get("task_type") or "") in _ROLLUP_TYPES
     fix = await repository.first_fix_deploy_at(
         db,
         int(row["id"]),
-        with_descendants=descendants,
+        with_descendants=str(row.get("task_type") or "") in _ROLLUP_TYPES,
         delivery_projects=delivery_projects,
     )
-    shas = await repository.delivered_fix_shas(
-        db,
-        int(row["id"]),
-        with_descendants=descendants,
-        delivery_projects=delivery_projects,
-    )
-    return fix.at or "", shas
+    return fix.at or "", fix.ident
 
 
-def context_of(row: Row, delivery: tuple[str, list[str]]) -> tuple[dict[str, Any], str]:
+def context_of(row: Row, delivery: tuple[str, str]) -> tuple[dict[str, Any], str]:
     """The promise's context and its hash: what a decision is bound to."""
     context = {
         "outcome_metric": str(row.get("outcome_metric") or "").strip(),
         "completed_at": str(row.get("completed_at") or ""),
         "fix_released_at": delivery[0],
-        "delivered_shas": delivery[1],
+        "fix_ident": delivery[1],
     }
     digest = hashlib.sha256(
         json.dumps(context, sort_keys=True, ensure_ascii=False).encode()
@@ -244,19 +239,20 @@ async def _current_view(
     db: aiosqlite.Connection,
     task_id: int,
     delivery: frozenset[int],
-) -> tuple[dict[str, Any] | None, str]:
-    """The task if it is still a candidate (completed, live, has a metric)."""
+) -> tuple[dict[str, Any] | None, tuple[dict[str, Any], str]]:
+    """The task if it is still a candidate, with its context snapshot (computed once)."""
+    none: tuple[dict[str, Any], str] = ({}, "")
     row = await repository.get_task(db, task_id)
     if row is None:
-        return None, ""
+        return None, none
     task = dict(row)
     if (
         task.get("status") != "completed"
         or task.get("archived")
         or not str(task.get("outcome_metric") or "").strip()
     ):
-        return None, ""
-    return task, context_of(task, await _fix_at(db, task, delivery))[1]
+        return None, none
+    return task, context_of(task, await _fix_at(db, task, delivery))
 
 
 async def _skip_reason(
@@ -265,24 +261,25 @@ async def _skip_reason(
     delivery: frozenset[int],
     active: Mapping[int, Row],
     scope: set[int],
-) -> tuple[str, dict[str, Any] | None, str]:
-    """Why an entry is not applied, or "" when it is. Plus the task and its hash."""
+) -> tuple[str, dict[str, Any] | None, tuple[dict[str, Any], str]]:
+    """Why an entry is not applied, or "" when it is; the task and its snapshot."""
     task_id = int(entry["task_id"])
-    task, current = await _current_view(db, task_id, delivery)
+    task, snapshot = await _current_view(db, task_id, delivery)
     if task is None:
-        return "no_longer_debt", None, ""
+        return "no_longer_debt", None, snapshot
+    current = snapshot[1]
     if task_id not in scope:
-        return "left_project_scope", task, current
+        return "left_project_scope", task, snapshot
     if await repository.list_outcome_answers_for_task(db, task_id):
-        return "answered", task, current
+        return "answered", task, snapshot
     decision = active.get(task_id)
     if decision is not None and decision["context_hash"] == current:
-        return "already_retired", task, current
+        return "already_retired", task, snapshot
     if current != entry["fingerprint"]:
-        return "changed_since_preview", task, current
+        return "changed_since_preview", task, snapshot
     if (await classify_ownerships(db, [task]))[task_id]["state"] == "covered":
-        return "covered_by_owner", task, current
-    return "", task, current
+        return "covered_by_owner", task, snapshot
+    return "", task, snapshot
 
 
 async def apply_retirement(
@@ -328,7 +325,7 @@ async def apply_retirement(
         try:
             for entry in entries:
                 task_id = int(entry["task_id"])
-                why, task, current = await _skip_reason(
+                why, task, snapshot = await _skip_reason(
                     db, entry, delivery, active, scope
                 )
                 if why:
@@ -342,8 +339,7 @@ async def apply_retirement(
                     text,
                     retired_by,
                     principal_id,
-                    current,
-                    delivery,
+                    snapshot,
                 )
                 retired.append(task_id)
         except BaseException:
@@ -371,8 +367,7 @@ async def _retire_one(
     reason: str,
     retired_by: str,
     principal_id: int | None,
-    context_hash: str,
-    delivery: frozenset[int],
+    snapshot: tuple[dict[str, Any], str],
 ) -> None:
     task_id = int(task["id"])
     if stale is not None:
@@ -383,7 +378,7 @@ async def _retire_one(
             cancelled_by=f"batch:{preview['token']}",
             reason="context changed: replaced by a new decision",
         )
-    context, _ = context_of(task, await _fix_at(db, dict(task), delivery))
+    context, context_hash = snapshot
     await repository.insert_outcome_retirement(
         db,
         task_id=task_id,
