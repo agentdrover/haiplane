@@ -553,3 +553,22 @@ async def test_unreleased_new_merge_does_not_change_the_context(
     assert (await _counts(db))["retired_total"] == 1
     states = {r["task_id"]: r["state"] for r in await _history(db)}
     assert states[task_id] == "retired"
+
+
+async def test_moved_first_deploy_of_the_same_sha_is_a_changed_fact(
+    db: aiosqlite.Connection,
+):
+    """Контекст = (at, sha) канонического факта: тот же sha, но другой момент - другой факт."""
+    task_id = await _delivered(db)
+    await _apply(db, (await _preview(db))["token"])
+    sha = (await db.execute_fetchall("SELECT deployed_sha FROM releases LIMIT 1"))[0][0]
+
+    await db.execute(
+        "INSERT INTO releases (project_id, deployed_sha, ref, status, source, "
+        "deployed_at) VALUES (NULL, ?, 'main', 'success', 'ci', '2026-08-01 00:00:00')",
+        (sha,),
+    )
+    await db.commit()
+
+    states = {r["task_id"]: r["state"] for r in await _history(db)}
+    assert states[task_id] == "context_changed"
