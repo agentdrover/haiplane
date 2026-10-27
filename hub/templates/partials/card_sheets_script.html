@@ -1,0 +1,188 @@
+{# #1813: листы действий карточки. Разметка работает и без скрипта: кнопка
+   панели - якорь на лист (:target в card_actions.css), форма листа отправляется
+   обычным POST с 303. Скрипт лишь улучшает это:
+   - открывает лист классом is-open, возвращает фокус на кнопку при закрытии
+     (Escape, кнопка «Закрыть»), держит Tab внутри листа;
+   - отправляет форму через fetch с заголовками HX-Request и X-Hub-Sheet: ответ
+     (успех «Отправлено», 409/422 с причиной) идёт в .c2-sheet-result листа, ввод
+     не трогается, повтор после сбоя делает человек;
+   - листы лежат ВНЕ #c2-live, поэтому автообновление фрагмента их не заменяет;
+     после замены сверяется метка #c2-live (статус и поколения) с меткой, на
+     которой лист построен: расходится - показывается .c2-sheet-stale, кнопка
+     отправки остаётся доступной (сервер откажет со своим текстом, ввод цел);
+   - панель скрывается, пока на экране кнопка «К действию» блока «Рекомендую»
+     (она ведёт к тому же действию); без неё панель видна всегда.
+   Хранилища скрипт не использует. Обработчики ставятся один раз (window.hubSheets). #}
+<script>
+(function () {
+    var KEYS = ["status", "submission-generation", "statement-generation", "review-verdict-revision"];
+    function byId(id) { return id ? document.getElementById(id) : null; }
+    function openSheet() { return document.querySelector(".c2-sheet.is-open"); }
+    function navHeight() {
+        var nav = document.querySelector(".sidebar");
+        if (!nav || !window.getComputedStyle) { return; }
+        var root = document.documentElement.style;
+        var fixed = window.getComputedStyle(nav).position === "fixed";
+        // Телефон: навигация снизу, панель над ней. Широкий экран: меню слева.
+        root.setProperty("--c2-nav-h", fixed ? nav.offsetHeight + "px" : "0px");
+        root.setProperty("--c2-side-w", fixed ? "0px" : nav.offsetWidth + "px");
+    }
+    // Панель обновилась, а листы остались от первой загрузки (сменился статус,
+    // поколение, набор действий): листы пересобирает только перезагрузка страницы.
+    // Она не идёт, пока лист открыт или в полях есть ввод; после закрытия листа
+    // сверка повторяется.
+    function outdated() {
+        var live = byId("c2-live");
+        var holder = byId("c2-sheets");
+        if (!live || !holder) { return false; }
+        for (var k = 0; k < KEYS.length; k++) {
+            if (holder.getAttribute("data-built-" + KEYS[k]) !== live.getAttribute("data-" + KEYS[k])) { return true; }
+        }
+        var openers = live.querySelectorAll("[data-sheet]");
+        for (var i = 0; i < openers.length; i++) {
+            if (!byId(openers[i].getAttribute("data-sheet"))) { return true; }
+        }
+        return false;
+    }
+    function reloadIfIdle() {
+        var typing = window.hubHasUnsavedInput && window.hubHasUnsavedInput();
+        if (outdated() && !openSheet() && !typing) { window.location.reload(); }
+    }
+    function sync() {
+        navHeight();
+        var live = byId("c2-live");
+        var all = document.querySelectorAll(".c2-sheet");
+        for (var i = 0; i < all.length; i++) {
+            var sheet = all[i];
+            var stale = false;
+            for (var k = 0; live && k < KEYS.length; k++) {
+                var built = sheet.getAttribute("data-built-" + KEYS[k]);
+                if (built !== null && built !== live.getAttribute("data-" + KEYS[k])) { stale = true; }
+            }
+            var note = sheet.querySelector(".c2-sheet-stale");
+            if (note) { note.hidden = !stale; }
+        }
+        watchRecommend();
+        reloadIfIdle();
+    }
+    var watcher = null;
+    function watchRecommend() {
+        var bar = document.querySelector(".c2-bar");
+        var rec = document.querySelector(".c2-recommend .c2-act") || document.querySelector(".c2-recommend");
+        if (!bar || !rec || !window.IntersectionObserver) { return; }
+        if (watcher) { watcher.disconnect(); }
+        watcher = new IntersectionObserver(function (entries) {
+            var now = document.querySelector(".c2-bar");
+            if (now) { now.classList.toggle("c2-bar--covered", entries[entries.length - 1].isIntersecting); }
+        });
+        watcher.observe(rec);
+    }
+    function open(id) {
+        var sheet = byId(id);
+        if (!sheet) { window.location.reload(); return; }
+        var prev = openSheet();
+        if (prev && prev !== sheet) { prev.classList.remove("is-open"); }
+        sheet.classList.add("is-open");
+        // Кнопка отправки следует за сравнением со снимком и при открытии листа.
+        var sheetForm = sheet.querySelector("form");
+        if (sheetForm && window.hubRefreshSent) { window.hubRefreshSent(sheetForm); }
+        var first = sheet.querySelector("textarea, input:not([type=hidden]), select, button");
+        if (first && first.focus) { first.focus(); }
+    }
+    function close() {
+        var sheet = openSheet();
+        if (!sheet) { return; }
+        sheet.classList.remove("is-open");
+        if (window.location.hash === "#" + sheet.id && window.history && window.history.replaceState) {
+            window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        }
+        var opener = document.querySelector('[data-sheet="' + sheet.id + '"]');
+        if (opener && opener.focus) { opener.focus(); }
+        reloadIfIdle();
+    }
+    function trap(e) {
+        var sheet = openSheet();
+        if (!sheet) { return; }
+        var items = sheet.querySelectorAll("a[href], button:not([disabled]), textarea, input:not([type=hidden]), select");
+        if (!items.length) { return; }
+        var first = items[0], last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+    function pick(box) {
+        var form = box.closest("form");
+        var area = form ? form.querySelector('textarea[name="findings_text"]') : null;
+        if (!area) { return; }
+        var line = box.getAttribute("data-pick-line");
+        var rows = area.value.split("\n").filter(function (r) { return r.trim() && r.trim() !== line; });
+        if (box.checked) { rows.push(line); }
+        area.value = rows.join("\n");
+    }
+    function csrf() {
+        var meta = document.querySelector('meta[name="csrf-token"]');
+        return meta ? meta.getAttribute("content") : "";
+    }
+    // #2035: «отправлено» - подтверждённый ответом снимок значений (hubConfirmForm в
+    // base.html); сохранность ввода решает сравнение с ним, а не флаг или события.
+    function send(form, submitter) {
+        var sentValues = window.hubFormValues(form);
+        var sheet = form.closest(".c2-sheet");
+        var result = sheet.querySelector(".c2-sheet-result");
+        var body = new URLSearchParams(new FormData(form));
+        if (submitter && submitter.name) { body.append(submitter.name, submitter.value); }
+        var headers = {"HX-Request": "true", "X-Hub-Sheet": sheet.id, "Content-Type": "application/x-www-form-urlencoded"};
+        if (csrf()) { headers["X-CSRF-Token"] = csrf(); }
+        form.setAttribute("aria-busy", "true");
+        window.fetch(form.action, {method: "POST", body: body.toString(), headers: headers, credentials: "same-origin"})
+            .then(function (res) {
+                if (res.redirected && /\/login/.test(res.url)) {
+                    return {ok: false, text: '<div class="c2-sheet-note" role="alert">Сессия истекла: войдите заново и повторите. Запрос не отправлялся повторно, ввод сохранён.</div>'};
+                }
+                return res.text().then(function (text) { return {ok: res.ok, text: text}; });
+            })
+            .catch(function () {
+                return {ok: false, text: '<div class="c2-sheet-note" role="alert">Ответ не получен: хаб не подтвердил запись. Проверьте статус задачи перед повтором.</div>'};
+            })
+            .then(function (out) {
+                form.removeAttribute("aria-busy");
+                result.innerHTML = out.text;
+                if (out.ok && out.text.indexOf("data-c2-done") !== -1) {
+                    window.hubConfirmForm(form, sentValues);
+                    var live = byId("c2-live");
+                    if (live && window.htmx) { window.htmx.trigger(live, "c2-refresh"); }
+                }
+            });
+    }
+    if (!window.hubSheets) {
+        window.hubSheets = {sync: sync, open: open, close: close};
+        document.addEventListener("click", function (e) {
+            var opener = e.target.closest ? e.target.closest("[data-sheet]") : null;
+            if (opener) { e.preventDefault(); open(opener.getAttribute("data-sheet")); return; }
+            if (e.target.matches && e.target.matches("input[data-pick-line]")) { pick(e.target); return; }
+            var closer = e.target.closest ? e.target.closest("[data-sheet-close]") : null;
+            if (closer) { e.preventDefault(); close(); }
+        });
+        document.addEventListener("keydown", function (e) {
+            if (e.key === "Escape") { close(); }
+            else if (e.key === "Tab") { trap(e); }
+        });
+        document.addEventListener("submit", function (e) {
+            var form = e.target;
+            if (!form.closest || !form.closest(".c2-sheet") || !window.fetch) { return; }
+            if (window.hubFormConfirmed(form)) { e.preventDefault(); return; }
+            if (form.getAttribute("aria-busy") === "true") { e.preventDefault(); return; }
+            e.preventDefault();
+            send(form, e.submitter);
+        });
+        function hint(e) {
+            var form = e.target && e.target.form;
+            if (form && form.closest && form.closest(".c2-sheet")) { window.hubRefreshSent(form); }
+        }
+        document.addEventListener("input", hint);
+        document.addEventListener("change", hint);
+        document.addEventListener("htmx:afterSwap", sync);
+        window.addEventListener("resize", navHeight);
+    }
+    window.hubSheets.sync();
+})();
+</script>

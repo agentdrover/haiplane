@@ -48,7 +48,7 @@ from hub import config
 from hub import repository as repo
 from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict, text_origin_of
 from hub.services import gate_grounds as grounds
-from hub.services import ci_integrity, ci_trust
+from hub.services import ci_integrity, ci_trust, verdict_owner
 from hub.services.ci_report import VALIDATION_PASS
 from hub.services.result_kind import task_automation_not_applicable
 
@@ -57,7 +57,9 @@ log = logging.getLogger(__name__)
 _POLICY_ACTOR = "policy"
 
 
-async def _escalate(db: aiosqlite.Connection, task_id: int, reason: str) -> None:
+async def _escalate(
+    db: aiosqlite.Connection, task_id: int, reason: str, generation: int
+) -> None:
     """A trigger fired: the verdict stays with the human, visibly."""
     await repo.add_task_update(
         db,
@@ -74,6 +76,13 @@ async def _escalate(db: aiosqlite.Connection, task_id: int, reason: str) -> None
         task_id=task_id,
         actor=_POLICY_ACTOR,
         payload={"reason": reason},
+    )
+    # #2052: автопилот сложил решение - владелец записан, а не выведен позже.
+    await verdict_owner.hand_to_human(
+        db,
+        task_id,
+        verdict_owner.reason_of("autopilot_escalated", reason),
+        generation=generation,
     )
     await db.commit()
 
@@ -151,7 +160,11 @@ async def _reviewer_model(
 
 
 async def _proven_empty_usage(
-    db: aiosqlite.Connection, task_id: int, generation: int, review: dict
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    review: dict,
+    dispatch: Any = None,
 ) -> int | None:
     """The billed usage proving an empty review worked, or None (#769).
 
@@ -164,7 +177,8 @@ async def _proven_empty_usage(
     floor = config.EMPTY_REVIEW_MIN_USAGE
     if floor <= 0:
         return None
-    dispatch = await repo.get_settled_review_dispatch(db, task_id, generation)
+    if dispatch is None:
+        dispatch = await repo.get_settled_review_dispatch(db, task_id, generation)
     if dispatch is None:
         return None
     from hub.integrations import cursor_cloud
@@ -272,6 +286,8 @@ class AutoStance:
     #: ответ верен «если они пройдут». Пусто там, где решатель.
     pending: tuple[str, ...] = ()
     facts: dict[str, Any] = field(default_factory=dict)
+    #: Поколение сдачи, о котором судила эта стойка (0 - до чтения сдачи).
+    generation: int = 0
 
 
 @dataclass
@@ -302,6 +318,7 @@ def _refuse_with(
         feed_note=note,
         audit_alerts=tuple(ctx.audit) if ctx else (),
         pending=tuple(ctx.pending) if ctx else (),
+        generation=ctx.generation if ctx else 0,
     )
 
 
@@ -312,6 +329,7 @@ def _escalate_with(code: str, reason: str, ctx: _Ctx) -> AutoStance:
         reason,
         audit_alerts=tuple(ctx.audit),
         pending=tuple(ctx.pending),
+        generation=ctx.generation,
     )
 
 
@@ -396,46 +414,77 @@ async def _loud_grounds(
     return None
 
 
+@dataclass(frozen=True)
+class EmptyReportDecision:
+    """Решение по отчёту без кандидатов: общее для автопилота и стюарда (#2082).
+
+    ``code`` пуст - отчёт не мешает. ``pending`` - биллинг не спрашивали, ответ
+    верен «если докажется».
+    """
+
+    code: str = ""
+    reason: str = ""
+    note: str = ""
+    pending: bool = False
+
+
+def empty_report_decision(
+    task: dict, review: dict, usage: int | None, *, checked: bool
+) -> EmptyReportDecision:
+    """Чистое правило пустого отчёта (#769, #835): без сети и без записи.
+
+    ``usage`` - доказанный биллингом объём работы ревьюера или ``None``;
+    ``checked`` - спрашивали ли провайдера вообще. Добыть доказательство -
+    дело вызывающего, до транзакции; здесь только решение.
+    """
+    if (review.get("raw_count") or 0) >= 1:
+        return EmptyReportDecision()
+    if checked and usage is None:
+        return EmptyReportDecision(
+            CODE_NO_DATA, "отчёт без единого кандидата — это «нет данных»"
+        )
+    pending = not checked
+    # Proven work is not proven capability (#835): an empty report may stand in
+    # for a review only where a miss costs no more than this reviewer is worth.
+    if _within_proven_empty_ceiling(task):
+        return EmptyReportDecision(pending=pending)
+    ceiling = _proven_empty_ceiling()
+    note = (
+        "Автовердикт НЕ вынесен: пустое ревью выше потолка "
+        f"класса. Класс задачи: {task.get('risk_class') or 'не вычислен'}, "
+        f"потолок для пустого ревью: {ceiling.value if ceiling else 'путь закрыт'} "
+        f"(HAIPLANE_PROVEN_EMPTY_MAX_CLASS="
+        f"{config.PROVEN_EMPTY_MAX_CLASS!r}). "
+        f"Работа ревьюера доказана (usage={usage}), способность — нет. "
+        "Вердикт остаётся человеку."
+    )
+    return EmptyReportDecision(
+        CODE_ABOVE_CEILING,
+        "пустое ревью выше потолка класса: способность ревьюера не доказана",
+        note,
+        pending,
+    )
+
+
 async def _empty_report_stage(
     db: aiosqlite.Connection, task_id: int, ctx: _Ctx
 ) -> AutoStance | None:
     """``raw_count`` 0 is "no data" unless the provider's billing proves work (#769)."""
-    # "No candidates at all" is no data, not no findings (harness v7) —
-    # unless the provider's billing proves the reviewer worked (#769).
-    if not ctx.observe:
-        # Биллинг провайдера — сеть; без неё ответ «если докажется».
-        ctx.pending.append(PENDING_PROVIDER_USAGE)
-    else:
+    # Биллинг провайдера - сеть; без неё ответ «если докажется».
+    if ctx.observe:
         ctx.proven_usage = await _proven_empty_usage(
             db, task_id, ctx.generation, ctx.review
         )
-        if ctx.proven_usage is None:
-            return _refuse_with(
-                CODE_NO_DATA, "отчёт без единого кандидата — это «нет данных»", ctx
-            )
-    # Proven work is not proven capability (#835): an empty report may
-    # stand in for a review only where a miss costs no more than this
-    # reviewer is worth. Refused quietly — no trigger fired, the human
-    # gate simply stands — but the reason goes to the feed so the
+    decision = empty_report_decision(
+        ctx.task, ctx.review, ctx.proven_usage, checked=ctx.observe
+    )
+    if decision.pending:
+        ctx.pending.append(PENDING_PROVIDER_USAGE)
+    if not decision.code:
+        return None
+    # Quiet refusal: the human gate stands, the reason goes to the feed so the
     # digest (#739) can show what the ceiling actually held back.
-    if not _within_proven_empty_ceiling(ctx.task):
-        ceiling = _proven_empty_ceiling()
-        note = (
-            "Автовердикт НЕ вынесен: пустое ревью выше потолка "
-            f"класса. Класс задачи: {ctx.task.get('risk_class') or 'не вычислен'}, "
-            f"потолок для пустого ревью: {ceiling.value if ceiling else 'путь закрыт'} "
-            f"(HAIPLANE_PROVEN_EMPTY_MAX_CLASS="
-            f"{config.PROVEN_EMPTY_MAX_CLASS!r}). "
-            f"Работа ревьюера доказана (usage={ctx.proven_usage}), способность — нет. "
-            "Вердикт остаётся человеку."
-        )
-        return _refuse_with(
-            CODE_ABOVE_CEILING,
-            "пустое ревью выше потолка класса: способность ревьюера не доказана",
-            ctx,
-            note=note,
-        )
-    return None
+    return _refuse_with(decision.code, decision.reason, ctx, note=decision.note)
 
 
 def text_origin_refusal(review: dict) -> tuple[str, str] | None:
@@ -544,11 +593,11 @@ async def _stored_ceiling_stage(
     диффу ещё не виден, и это условие ответа, а не «чисто».
     """
     from hub.services.steward_act_readiness import BLOCKED, ceiling_reason
-    from hub.services.steward_apply import current_ceiling
+    from hub.services.steward_apply import read_ceiling
 
     key = "auto_approve_max_class"
     found = ceiling_reason(
-        await current_ceiling(db, task_id, key),
+        await read_ceiling(db, task_id, key),
         ctx.task.get("risk_class"),
         key=key,
     )
@@ -648,13 +697,13 @@ async def _ceiling_stage(
     """
     from hub.services.steward_apply import (
         class_ceiling_refusal,
-        current_ceiling,
+        read_ceiling,
         remember_risk_fact,
     )
     from hub.services.steward_evidence import present
 
     key = "auto_approve_max_class"
-    ceiling = await current_ceiling(db, task_id, key)
+    ceiling = await read_ceiling(db, task_id, key)
     fact = present(
         "risk_class",
         "класс автовердикта",
@@ -749,6 +798,7 @@ async def autopilot_stance(
             "proven_usage": ctx.proven_usage,
             "self_reviewed": bool(ctx.review.get("self_reviewed")),
         },
+        generation=ctx.generation,
     )
 
 
@@ -781,7 +831,8 @@ async def _decide(db: aiosqlite.Connection, task_id: int) -> bool:
         )
         await db.commit()
     if stance.outcome == OUTCOME_ESCALATE:
-        await _escalate(db, task_id, stance.reason)
+        # Поколение берётся из самой оценки: запись - ровно о том, что судили.
+        await _escalate(db, task_id, stance.reason, stance.generation)
         return False
     if stance.outcome != OUTCOME_APPROVE:
         if stance.feed_note:

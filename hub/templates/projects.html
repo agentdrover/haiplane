@@ -47,6 +47,15 @@
         {% if c.project.provision_status == 'error' %}
         <p class="task-action-note task-action-note--warning">{{ c.project.provision_detail or 'причина не записана' }}</p>
         {% endif %}
+        {# #2027: CI проекта не подтверждается (или отчётов нет) - своя фраза каждому. #}
+        {% set ci_block = ci_trust_blocks.get(c.project.id) if ci_trust_blocks else None %}
+        {% if ci_block and ci_block.state == 'unverified' %}
+        <p class="task-action-note task-action-note--warning">{{ ci_block.message }}</p>
+        {% elif ci_block and ci_block.state == 'unknown' %}
+        <p class="task-action-note task-action-note--warning">{{ ci_block.message }}</p>
+        {% elif ci_block and ci_block.state == 'no_reports' %}
+        <p class="task-action-note">{{ ci_block.message }}</p>
+        {% endif %}
         <div class="topbar-stats project-card-numbers">
             {# The dashboard's own chip pattern, not a new one for the same
                meaning: outline pill, caps label, bold value, .is-zero dims a

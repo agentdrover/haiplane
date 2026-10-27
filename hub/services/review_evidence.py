@@ -47,6 +47,7 @@ from hub import config
 from hub import repository as repo_module
 from hub.services.author_answers import undisposed_findings
 from hub.integrations.registry import plugins
+from hub.services.brief_failure import failure_from, public_reason
 from hub.models import ReviewInFlight
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -113,7 +114,7 @@ async def resolve_diff_base(
         ctx = await project_git_context(db, task_id)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("diff base for #%s: no project context: %s", task_id, exc)
-        out["reason"] = f"project git context failed: {exc}"
+        out["reason"] = f"project git context failed: {failure_from(exc).reason}"
         return out
 
     if (pr_base or "").strip():
@@ -145,7 +146,7 @@ async def resolve_diff_base(
         state, detail = await plugins.git_ops.resolve_ref(out["base"], workspace)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("diff base for #%s: resolve failed: %s", task_id, exc)
-        out["reason"] = f"could not resolve {out['base']}: {exc}"
+        out["reason"] = f"could not resolve {out['base']}: {failure_from(exc).reason}"
         return out
 
     if state == "resolved":
@@ -165,7 +166,8 @@ async def resolve_diff_base(
             )
         except Exception as exc:  # noqa: BLE001 - degradation is the contract
             log.warning("diff base for #%s: freshness failed: %s", task_id, exc)
-            out["reason"] = f"свежесть базы {out['base']} не проверена: {exc}"
+            why = failure_from(exc).reason
+            out["reason"] = f"свежесть базы {out['base']} не проверена: {why}"
             return out
         if freshness == "stale":
             out["state"] = BASE_STALE
@@ -177,20 +179,20 @@ async def resolve_diff_base(
             )
             return out
         if freshness != "current":
-            out["reason"] = (
-                f"база {out['base']} разрешена, но не сверена с remote: {why}"
-            )
+            log.warning("diff base for #%s: unverified: %s", task_id, why)
+            out["reason"] = f"база {out['base']} не сверена с remote (см. лог хаба)"
         return out
     if state == "missing":
         out["state"] = BASE_UNRESOLVED
         out["reason"] = (
             f"the base ref '{out['base']}' ({out['source']}) does not exist in "
-            f"the project workspace: {detail}. The diff cannot be taken, so "
+            "the project workspace. The diff cannot be taken, so "
             "every check that reads it is disabled below — this is one failure, "
             "not several independent unknowns"
         )
         return out
-    out["reason"] = f"the base ref '{out['base']}' could not be verified: {detail}"
+    log.warning("diff base for #%s: %s: %s", task_id, state, detail)
+    out["reason"] = f"the base ref '{out['base']}' is {state}; see the hub log"
     return out
 
 
@@ -241,7 +243,7 @@ def sha_check_of(
     if not submission_sha or not branch:
         return "unknown", "branch tip was not pinned at submission"
     if not current_tip:
-        return "unknown", tip_reason
+        return "unknown", public_reason(tip_reason)
     if current_tip == submission_sha:
         return "match", sha_check_statement(
             "match", submission_sha, current_tip, branch
@@ -545,90 +547,38 @@ _CHECK_MEANING: dict[str, str] = {
 }
 
 
-# The states the CI step scripts write (mutation_changed.py, red_test_baseline.py).
-_EVIDENCE_STATES = {
-    "мутации": frozenset(
-        {"ran", "baseline_red", "no_changed_functions", "no_tests", "error"}
-    ),
-    "baseline": frozenset({"ran", "no_tests", "error"}),
-}
-
-
-def _evidence_block(label: str, raw: str | None, pinned: str):
-    """One stored evidence block as the brief reads it (#1606)."""
-    from hub.models import CIEvidenceBlock
-
-    try:
-        data = json.loads(raw or "{}")
-    except ValueError:
-        data = {}
-    if not isinstance(data, dict) or not data:
-        return CIEvidenceBlock(
-            reason=(
-                f"не получено: {label} для коммита {pinned[:12]} CI не присылал "
-                "(шаг не запускался на обновлении ветки — это не результат)"
-            )
-        )
-    if data.get("state") not in _EVIDENCE_STATES[label]:
-        # Provenance alone does not make an object the step's report.
-        return CIEvidenceBlock(
-            reason=(
-                f"не получено: {label} для коммита {pinned[:12]} пришли в "
-                "нераспознанном виде (нет известного state) — результатом не считаются"
-            )
-        )
-    prov = data.get("provenance")
-    prov = prov if isinstance(prov, dict) and prov else {}
-    if prov:
-        run = (
-            f"прогон {prov.get('run_id') or '?'} "
-            f"({prov.get('event') or 'событие неизвестно'}), "
-            f"{prov.get('at') or 'время неизвестно'}"
-        )
-        if prov.get("run_url"):
-            run += f", {prov['run_url']}"
-    else:
-        run = "прогон неизвестен"
-    adopted = data.get("adopted_from_run")
-    if adopted:
-        # #1919: the provenance above is the run that REPORTED; the numbers were
-        # counted by the dispatch run on the same head. The file says so itself,
-        # so this is the run's own word, not something the hub verified.
-        run += f"; усыновлено из dispatch-прогона {adopted} (со слов прогона)"
-    return CIEvidenceBlock(
-        state="received",
-        result=str(data.get("state") or ""),
-        run=run,
-        provenance=prov,
-        reason=str(data.get("reason") or ""),
-    )
-
-
 async def ci_evidence_state(db, task: dict):
     """Mutation and baseline evidence stored for the pinned commit (#1606)."""
-    from hub.models import CIEvidenceBlock, CIEvidenceState
+    from hub.models import CIEvidenceState
+    from hub.services.evidence_states import HUB_PROJECT, origin_of, unconfirmed_block
 
     pinned = (task.get("submission_sha") or "").strip()
     if not pinned:
         why = "не получено: коммит сдачи не закреплён"
         return CIEvidenceState(
-            mutations=CIEvidenceBlock(reason=why), baseline=CIEvidenceBlock(reason=why)
+            mutations=unconfirmed_block(why), baseline=unconfirmed_block(why)
         )
-    from hub.services.ci_trust import trusted_report, unconfirmed_reason
+    from hub.services.ci_trust import report_row, trusted_report, unconfirmed_reason
 
+    task_id = int(task.get("id") or 0)
+    project = await repo_module.resolve_project_for_task(db, task_id)
+    # No project row at all is the legacy single-project hub: the hub's own.
+    slug = str(project["slug"]) if project is not None else HUB_PROJECT
     # #1687: mutations and baseline are evidence only from a confirmed report.
-    row = await trusted_report(db, int(task.get("id") or 0), pinned)
+    row = await trusted_report(db, task_id, pinned)
     if row is None and (why := await unconfirmed_reason(db, int(task["id"]), pinned)):
         text = f"не получено: {why}"
+        # The report is not confirmed, but the event and run it names stay visible.
+        origin = origin_of(dict(await report_row(db, task_id, pinned) or {}), slug)
         return CIEvidenceState(
-            mutations=CIEvidenceBlock(reason=text),
-            baseline=CIEvidenceBlock(reason=text),
+            mutations=unconfirmed_block(text, origin),
+            baseline=unconfirmed_block(text, origin),
         )
     stored = dict(row) if row is not None else {}
     from hub.services.ci_evidence_other import blocks_of_the_commit
 
     mutations, baseline = await blocks_of_the_commit(
-        db, int(task.get("id") or 0), pinned, stored
+        db, task_id, pinned, stored, origin_of(stored, slug)
     )
     return CIEvidenceState(mutations=mutations, baseline=baseline)
 
@@ -1478,7 +1428,8 @@ async def _measure_diff(
         diff = await read(workspace, base, branch)
     except Exception as exc:  # noqa: BLE001 - advisory block, never fatal
         log.warning("review report diff failed for task #%s: %s", task_row["id"], exc)
-        report.diff_note = f"объём диффа прочитать не удалось: {exc}"
+        why = failure_from(exc).reason
+        report.diff_note = f"объём диффа прочитать не удалось: {why}"
         return report
 
     if diff is None:

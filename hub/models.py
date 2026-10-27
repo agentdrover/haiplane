@@ -410,8 +410,7 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # существование. Не гейт, не делегирует. Читатель:
     # project_policy.statement_paths_of.
     "statement_paths",
-    # #1434: минут тишины, после которых поллер освобождает слот исполнителя.
-    # Не гейт и ничего не делегирует. Читатель: executor_slots.dead_minutes_of.
+    # #1434: минут тишины до освобождения слота; не гейт. Читатель: executor_slots.dead_minutes_of.
     "slot_dead_minutes",
     # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт.
     # Читатель: project_policy.deep_reviewer_of.
@@ -420,8 +419,8 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # дверь): off (по умолчанию) | on. Не гейт. Читатель: local_review_fallback_of.
     "local_review_fallback",
     "delivery_fresh_base_rerun",  # #1956, читатель project_policy.*_of
-    # #1953: хост критика облачной сдачи; читатель project_policy.critic_host_of.
-    "critic_host",
+    "base_fetch_wait_hours",  # #1992, читатель project_policy.*_of
+    "critic_host",  # #1953: хост критика облачной сдачи; project_policy.critic_host_of
     # #1572: владелец объявляет «мерж = доставка» (нет релиз-PR и отдельного
     # выката): срок исхода от даты мержа. Не гейт. Читатель: merge_is_delivery_of.
     "merge_is_delivery",
@@ -443,6 +442,8 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     "ci_contract",  # #1848: workflow и проверки CI спутника; читатель project_policy.ci_contract_from
     "steward_approve_max_class",
     "auto_approve_max_class",  # #1855: потолки, project_policy.*_max_class_of
+    "steward_approve_max_class_double_clean",  # #1986: читатели project_policy.*_of
+    "double_clean_reviewers",
 )
 # Поводы наблюдения стюарда (#1679, #1826): ровно шесть значений steward_watch.
 STEWARD_WATCH_REASONS: tuple[str, ...] = (
@@ -1575,10 +1576,14 @@ class CIEvidenceBlock(BaseModel):
     must see "not received", not an empty field that looks like a clean result.
     ``result`` is the step's own state (ran, error, ...), ``run`` names the run
     and event it came from, or says the run is unknown for a block stored
-    before provenance existed.
+    before provenance existed. ``expectation`` (#2026) says exactly why a block
+    is missing: ``not_expected`` / ``missing_unexpectedly`` / ``other_attempt``
+    / ``origin_unconfirmed`` (``received`` for a block that came); it is for the
+    reader of the brief, no gate reads it (``hub.services.evidence_states``).
     """
 
     state: str = "not_received"
+    expectation: str = "origin_unconfirmed"
     result: str = ""
     run: str = ""
     provenance: dict[str, Any] = Field(default_factory=dict)
@@ -1894,6 +1899,8 @@ class ProfileDowngradeView(BaseModel):
     state: str = "заказан"
     channel: str = ""
     dispatch_id: int | None = None
+    #: The rules the downgrade comes from (#1414 daily cap, #1432 circle), #2026.
+    rules: list[str] = Field(default_factory=list)
     headline: str = ""
 
 
@@ -2005,6 +2012,8 @@ class ReviewBrief(BaseModel):
     outcome_revisit_condition: str = ""
     # Computed (#576). None = this path did not assemble it, not "no hypothesis".
     outcome_status: OutcomeHypothesisStatus | None = None
+    # Who holds this promise (#2090). None = not assembled on this path.
+    outcome_ownership: OutcomeOwnershipView | None = None
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
@@ -2284,6 +2293,10 @@ class TaskDecide(BaseModel):
         False, description="Устарел: решение всегда пишется в ленту задачи."
     )
     pr_disposition: str = Field("", pattern=PR_DISPOSITION_PATTERN)
+    confirm_no_job: bool = Field(
+        False,
+        description="rework после оборванного заказа: подтверждаю, что задания в очереди диспетчера нет.",
+    )
 
 
 class TaskReturnToWork(BaseModel):
@@ -3259,6 +3272,8 @@ class TaskView(PlainSummaryView):
     outcome_revisit_condition: str = ""
     # Computed (#576). None = this path did not assemble it, not "no hypothesis".
     outcome_status: OutcomeHypothesisStatus | None = None
+    # Who holds this promise (#2090). None = not assembled on this path.
+    outcome_ownership: OutcomeOwnershipView | None = None
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
@@ -3541,16 +3556,15 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)
     _validate_local_review_fallback(v)
-    _policy.validate_delivery_fresh_base_rerun(v)
+    _policy.validate_delivery_policy(v)
     from hub.services.project_policy import validate_critic_host
 
     validate_critic_host(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)
-    _validate_count(v, "deep_daily_cap")
-    _validate_count(v, "small_delta_lines")
-    _validate_count(v, "circle_deep_stop")
+    for count_key in ("deep_daily_cap", "small_delta_lines", "circle_deep_stop"):
+        _validate_count(v, count_key)
     _validate_merge_is_delivery(v)
     _validate_path_notices(v)
     _validate_release_artifacts(v)
@@ -3906,6 +3920,48 @@ class OutcomeHypothesisStatus(str, Enum):
     refuted = "refuted"
     unmeasurable = "unmeasurable"
     revised = "revised"
+
+
+class OutcomeOwnershipView(BaseModel):
+    """Who holds a task's outcome promise (#2090): a dimension apart from the answer.
+
+    ``covered``: an explicit, currently valid link to an ancestor that holds the
+    promise. ``invalid_owner``: a link exists and does not hold (``reason`` names
+    why); the obligation stays in debt. ``independent``: no link.
+    ``suggested_owner_task_id`` is the nearest ancestor with a metric - a hint
+    for triage, never coverage. Coverage is not an answer.
+    """
+
+    state: Literal["independent", "covered", "invalid_owner"]
+    owner_task_id: int | None = None
+    reason: str = ""
+    suggested_owner_task_id: int | None = None
+
+
+class OutcomeOwnerSet(BaseModel):
+    """Delegate a task's outcome promise to an ancestor; null takes it back (#2090)."""
+
+    owner_task_id: int | None = Field(default=None, ge=1)
+
+
+class OutcomeRetirementPreview(BaseModel):
+    """Which old promises a retirement would cover (#2091); writes nothing but the preview."""
+
+    cutoff: str = Field(min_length=1, max_length=64)
+    projects: list[str] = Field(min_length=1, max_length=50)
+
+
+class OutcomeRetirementApply(BaseModel):
+    """Apply a saved preview: its token and the reason on the record (#2091)."""
+
+    token: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class OutcomeRetirementCancel(BaseModel):
+    """Take a retirement back; the promise returns to the debt (#2091)."""
+
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class OutcomeAnswerSubmit(BaseModel):
@@ -5129,6 +5185,15 @@ STEWARD_ESCALATE_REASONS: tuple[str, ...] = (
     "no_grounds",
     "no_confidence",
 )
+#: Вид основания возражения советника (#2025): противоречие факта пакета с
+#: AC/постановкой / недостаток данных / политика / процедурное. Только
+#: аналитика контура: на применение вид не влияет.
+STEWARD_OBJECTION_KINDS: tuple[str, ...] = (
+    "fact_contradiction",
+    "data_gap",
+    "policy",
+    "procedural",
+)
 STEWARD_CLOSURE_TYPES: tuple[str, ...] = (
     "fixed",
     "human_disposition",
@@ -5149,6 +5214,23 @@ class StewardGround(BaseModel):
 
     source: str = Field(..., min_length=1, max_length=80)
     detail: str = Field("", max_length=2000)
+    #: Вид основания возражения советника (#2025), из STEWARD_OBJECTION_KINDS.
+    #: Неизвестное значение хранится пустым («не классифицировано»): вид —
+    #: аналитика, он не открывает применение и не ломает приём ответа.
+    kind: str = Field("", max_length=40)
+
+    @field_validator("kind", mode="after")
+    @classmethod
+    def _known_kind(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        return v if v in STEWARD_OBJECTION_KINDS else ""
+
+    def stored(self) -> dict[str, str]:
+        """Как основание ложится в JSON: пустой вид не пишется (#2025)."""
+        data = self.model_dump()
+        if not data["kind"]:
+            del data["kind"]
+        return data
 
 
 class StewardClosure(BaseModel):

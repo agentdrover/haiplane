@@ -25,6 +25,7 @@ from hub import config, models
 from hub import repository as repo
 from hub.services import (
     auto_approve,
+    ci_trust_warning,
     executor_dispatch,
     executor_launch,
     executor_slots,
@@ -192,6 +193,11 @@ REGISTRY: dict[str, PolicyEntry] = {
         project_policy.delivery_fresh_base_rerun_of,
         "project_policy.delivery_fresh_base_rerun_of",
     ),
+    "base_fetch_wait_hours": PolicyEntry(
+        project_policy.base_fetch_wait_hours_of,
+        "project_policy.base_fetch_wait_hours_of",
+        "BASE_FETCH_WAIT_HOURS",
+    ),
     "critic_host": PolicyEntry(
         project_policy.critic_host_of, "project_policy.critic_host_of"
     ),
@@ -220,6 +226,14 @@ REGISTRY: dict[str, PolicyEntry] = {
     "auto_approve_max_class": PolicyEntry(
         project_policy.auto_approve_max_class_of,
         "project_policy.auto_approve_max_class_of",
+    ),
+    "steward_approve_max_class_double_clean": PolicyEntry(
+        project_policy.steward_double_clean_ceiling_of,
+        "project_policy.steward_double_clean_ceiling_of",
+    ),
+    "double_clean_reviewers": PolicyEntry(
+        project_policy.double_clean_reviewers_of,
+        "project_policy.double_clean_reviewers_of",
     ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
@@ -477,6 +491,7 @@ async def effective_policy(db: aiosqlite.Connection, project: Any) -> dict[str, 
         "scheduled": pending,
         "scheduled_refused": [policy_change.view_row(r) for r in refused[-3:]],
         "keys": keys,
+        "ci_trust": await ci_trust_warning.ci_trust_block(db, project),
         "unknown_keys": {k: v for k, v in policy.items() if k not in REGISTRY},
         "steward": await _steward_block(db, int(project["id"])),
         "server": _server_block(),
@@ -533,9 +548,12 @@ def _readiness_lines(report: dict[str, Any] | None) -> list[str]:
         lines.append(f"    criterion unmet: {refusal['code']} — {refusal['detail']}")
     for project in report["projects"]:
         ceiling = project["steward_approve_max_class"] or "none"
+        clean = project.get("steward_approve_max_class_double_clean")
         lines.append(
             f"    act scope: {project['slug']} (verdict=steward, steward_shadow "
-            f"{_show(project['steward_shadow'])}, ceiling {ceiling})"
+            f"{_show(project['steward_shadow'])}, ceiling {ceiling}"
+            + (f", double-clean up to {clean}" if clean else "")
+            + ")"
         )
     if not report["projects"]:
         lines.append("    act scope: no project delegates the verdict to the steward")
@@ -584,6 +602,11 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
             )
     for key, value in (data.get("unknown_keys") or {}).items():
         lines.append(f"  {key} = {_show(value)} [unknown key]")
+    trust = data.get("ci_trust") or {}
+    if trust.get("message"):
+        lines.append(
+            ("WARNING: " if trust["warning"] else "CI trust: ") + trust["message"]
+        )
     steward = data["steward"]
     lines.append(
         f"Steward: requested {steward['requested']}, effective {steward['effective']}"
@@ -602,6 +625,12 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
                 for item in contour["false_approve_tasks"]
             )
             + f", procedural escalations {contour['procedural_escalations']}"
+        )
+        # #2025: object по видам основания; сумма равна object.
+        kinds = contour.get("object_by_kind") or {}
+        lines.append(
+            "  object by kind: "
+            + (", ".join(f"{k} {v}" for k, v in kinds.items()) or "none")
         )
         # #1865: случаи за 14 дней по источникам, включая снятые человеком.
         events = contour.get("false_approve_events_14d") or {}

@@ -23,7 +23,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.models import to_iso_utc
-from hub.services import ci_contract, ci_trust
+from hub.services import ci_contract, ci_trust, verdict_owner
 from hub.services.result_kind import automation_not_applicable
 
 PERMISSION = "verdict.evidence.read"
@@ -95,8 +95,21 @@ def _steward_part(row: Any) -> dict[str, Any] | None:
         "truncated": truncated or cut,
         "model": data.get("model") or "",
         "advisor_outcome": data.get("advisor_outcome") or "",
+        "advisor_outcome_detail": _clean(
+            data.get("advisor_outcome_detail"), REASON_LIMIT
+        )[0],
         "judged_at": to_iso_utc(data.get("created_at")),
     }
+
+
+def _owner_part(task: dict[str, Any], generation: int) -> dict[str, str] | None:
+    """Записанный владелец ЭТОЙ сдачи, если вердикт передан человеку: причина видна и при ранней эскалации."""
+    if generation != int(task.get("submission_generation") or 0):
+        return None
+    owner, reason = verdict_owner.written_owner(task)
+    if owner != verdict_owner.OWNER_HUMAN:
+        return None
+    return {"owner": owner, "reason": _clean(reason, REASON_LIMIT)[0]}
 
 
 def _count(raw: Any) -> int | None:
@@ -224,6 +237,7 @@ async def build(
         "machine_review": machine,
         "ci": ci,
         "ci_after_judgement": ci_confirmed_after(steward, ci),
+        "verdict_owner": _owner_part(task, asked),
     }
 
 
@@ -245,6 +259,10 @@ def _steward_lines(steward: dict[str, Any] | None) -> list[str]:
     if steward["advisor_outcome"]:
         head += f", исход применения: {steward['advisor_outcome']}"
     lines = [head]
+    if steward["advisor_outcome_detail"]:
+        lines.append(
+            f"    причина отказа применения: {steward['advisor_outcome_detail']}"
+        )
     if steward["escalate_reason"]:
         lines.append(f"    причина эскалации: {steward['escalate_reason']}")
     shown = len(steward["grounds"])
@@ -312,6 +330,9 @@ def format_block(evidence: Any) -> str:
 def _format(evidence: dict[str, Any]) -> str:
     lines = [f"Для вердикта (поколение {evidence['generation']}):"]
     lines.extend(_steward_lines(evidence["steward"]))
+    owner = evidence.get("verdict_owner")
+    if owner:
+        lines.append(f"  Вердикт передан человеку: {owner['reason']}")
     lines.append(_machine_line(evidence["machine_review"]))
     lines.append(_ci_line(evidence["ci"]))
     if evidence["ci_after_judgement"]:

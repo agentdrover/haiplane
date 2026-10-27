@@ -29,6 +29,8 @@ from typing import Any
 import aiosqlite
 
 from hub.mcp_envelope import route_line
+from hub.services import verdict_owner
+from hub.services.steward_apply import CeilingUnavailable
 from hub.services.result_kind import (
     AUTOMATION_REFUSAL,
     AUTOMATION_REFUSAL_CODE,
@@ -45,7 +47,10 @@ CODE_STEWARD_OFF = "steward_off"
 CODE_REVIEWER_PENDING = "reviewer_pending"
 CODE_STEWARD_SHADOW = "steward_shadow"
 CODE_STEWARD_ACT = "steward_act"
+CODE_ADVISOR_SKIPPED = "steward_advisor_skipped"
+CODE_APPLY_FAILED = "steward_apply_failed"
 CODE_NOT_IN_REVIEW = "not_in_review"
+CODE_OWNER_WRITTEN = "verdict_owner_human"
 
 # Коды стойки, после которых стюарда спрашивать не о чем: сдачи, отчёта или
 # политики нет, и судить нечего и некому.
@@ -148,6 +153,43 @@ async def _ci_integrity_refusal(
     return auto_verdict.CODE_CI_INTEGRITY, standing.reason
 
 
+async def _failed_application(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> str:
+    """Причина, если применение approve этой сдачи кончилось ``failed``, иначе пусто."""
+    from hub import repository as repo
+    from hub.services.steward_advisor import OUTCOME_FAILED
+
+    row = await repo.get_steward_judgement(db, task_id, generation, "verdict")
+    judgement = dict(row) if row is not None else {}
+    if judgement.get("advisor_outcome") != OUTCOME_FAILED:
+        return ""
+    return str(judgement.get("advisor_outcome_detail") or "причина не записана")
+
+
+async def _empty_report_route(
+    db: aiosqlite.Connection, task: dict[str, Any], mode: str
+) -> tuple[VerdictRoute | None, str]:
+    """(запрет, условие) по отчёту без кандидатов: тот же предикат, без сети (#2082)."""
+    from hub.services import steward_empty_report
+
+    reading = await steward_empty_report.stored_reading(
+        db, int(task["id"]), int(task.get("submission_generation") or 0)
+    )
+    if reading is None:
+        return None, ""
+    decision, row = reading
+    if decision.code:
+        refusal = steward_empty_report.refusal_of(decision, row)
+        return _human(decision.code, refusal[1] if refusal else "", mode), ""
+    if decision.pending:
+        return None, (
+            "; отчёт без кандидатов применится, только если биллинг "
+            "провайдера докажет работу ревьюера (сеть, при показе не проверялся)"
+        )
+    return None, ""
+
+
 async def _steward_route(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -201,26 +243,55 @@ async def _steward_route(
             CODE_STEWARD_SHADOW,
             "стюард в тени: суждение записывается, вердикт выносит человек",
         )
+    failed = await _failed_application(db, int(task["id"]), generation)
+    if failed:
+        # Применение approve этой сдачи не удалось: поллер его не повторит,
+        # вердикт остаётся человеку, и причина названа тут, а не молчанием.
+        return _human(
+            CODE_APPLY_FAILED, f"одобрение стюарда не применено: {failed}", mode
+        )
     from hub.services.steward_act_readiness import BLOCKED, ceiling_reason
 
     key = "steward_approve_max_class"
     found = ceiling_reason(
-        await steward_apply.current_ceiling(db, int(task["id"]), key),
+        await steward_apply.read_ceiling(db, int(task["id"]), key),
         task.get("risk_class"),
         key=key,
     )
     ceiling_condition = ""
     if found is not None and found[0] == BLOCKED:
-        return _human(found[1]["code"], found[1]["detail"], mode)
-    if found is not None:
+        from hub.services.steward_double_clean import may_apply_to_class
+
+        if not await may_apply_to_class(db, int(task["id"]), task.get("risk_class")):
+            return _human(found[1]["code"], found[1]["detail"], mode)
+        # #1986: выше потолка, но в пределах класса двойной чистоты: судит стюард,
+        # а применится ли, решат пара отчётов, CI и советник (чтением не проверить).
+        ceiling_condition = (
+            "; класс выше потолка проекта допустим только при двойной чистоте "
+            "(steward_approve_max_class_double_clean: два чистых отчёта с пином, "
+            "CI без разрыва, согласие советника; пара фиксируется при заказе)"
+        )
+    elif found is not None:
         ceiling_condition = (
             "; класс по диффу не выше потолка проекта (steward_approve_max_class; "
             "дифф при показе не читался)"
         )
+    # #2082: пустой отчёт - запрет или условие, в каждом режиме.
+    empty_route, empty_condition = await _empty_report_route(db, task, mode)
+    if empty_route is not None:
+        return empty_route
     handoff = await steward_cap.cap_handoff(db, int(task["id"]), generation)
     if handoff is not None:
         # #1915: одно условие с диспетчером, заказом советника и применением.
         return _human(steward_cap.CODE_DAILY_CAP, handoff.reason, mode)
+    from hub.services.steward_advisor import advisor_state
+
+    advisor = await advisor_state(db, int(task["id"]), generation)
+    if advisor.skipped:
+        # #2024: заказ советника пропущен по причине вне советника (например,
+        # у double-clean нет замороженной пары): стюард не применит approve,
+        # вердикт за человеком. Заказ вернётся, если причина снимется.
+        return _human(CODE_ADVISOR_SKIPPED, advisor.reason, mode)
     return VerdictRoute(
         DECIDER_STEWARD,
         DECIDER_STEWARD,
@@ -228,7 +299,10 @@ async def _steward_route(
         CODE_STEWARD_ACT,
         f"автопилот не вынесет ({stance.reason}); судит стюард",
         "если суждение — approve, советник-критик согласен на том же пакете и "
-        "привратник применения не возражает" + ceiling_condition + "; иначе "
+        "привратник применения не возражает"
+        + ceiling_condition
+        + empty_condition
+        + "; иначе "
         "вердикт остаётся человеку",
     )
 
@@ -246,7 +320,12 @@ async def verdict_route(
     from hub import repository as repo
     from hub.services import ci_integrity
 
-    route = await _decide_route(db, task_id, observe=observe)
+    try:
+        route = await _decide_route(db, task_id, observe=observe)
+    except CeilingUnavailable as exc:
+        # Потолок не прочитать (автопилот, стюард, советник читают его одним
+        # читателем): маршрут не падает, вердикт за человеком с названной причиной.
+        route = _human(exc.code, exc.reason)
     if route.decider == DECIDER_NONE:
         return route
     task = dict(await repo.get_task(db, task_id) or {})
@@ -260,6 +339,20 @@ async def verdict_route(
     return dataclasses.replace(
         route, reason=f"{route.reason}. Справка по CI: {standing.reason}"
     )
+
+
+async def _cap_handoff_ended(
+    db: aiosqlite.Connection, task: dict[str, Any], owner_reason: str
+) -> bool:
+    """Запись о суточном потолке кончилась вместе с сутками: потолок временный."""
+    from hub.services import steward_cap
+
+    if not owner_reason.startswith(steward_cap.CODE_DAILY_CAP):
+        return False
+    handoff = await steward_cap.cap_handoff(
+        db, int(task["id"]), int(task.get("submission_generation") or 0)
+    )
+    return handoff is None
 
 
 async def _decide_route(
@@ -287,6 +380,17 @@ async def _decide_route(
         # автопилота не доходим: она ищет машинный отчёт, которого у такой
         # задачи нет, и отвечала бы «нет отчёта» вместо настоящей причины.
         return _human(AUTOMATION_REFUSAL_CODE, AUTOMATION_REFUSAL)
+    # #2052: записанный владелец раньше любого прогноза. Актор, сложивший
+    # решение, сказал это вслух; стойка автопилота «одобрил бы» не отменяет
+    # того, что стюард уже передал сдачу человеку.
+    owner, owner_reason = verdict_owner.written_owner(task)
+    if owner == verdict_owner.OWNER_HUMAN and not await _cap_handoff_ended(
+        db, task, owner_reason
+    ):
+        code, _, detail = owner_reason.partition(": ")
+        if not code.replace("_", "").isalnum() or not code.islower():
+            code, detail = CODE_OWNER_WRITTEN, owner_reason
+        return _human(code, detail or owner_reason)
     stance = await auto_verdict.autopilot_stance(db, task_id, observe=observe)
     if stance.outcome == auto_verdict.OUTCOME_APPROVE:
         return VerdictRoute(

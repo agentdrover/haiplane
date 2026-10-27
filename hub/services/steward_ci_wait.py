@@ -14,7 +14,9 @@ kind) одно (#1022) и не пересчитывается: эскалаци�
 НЕ ждать:
   * ``trust=verified`` (зелёный или красный — судья прочтёт и то и другое);
   * ``trust=unverified`` и у строки ТЕКУЩЕЙ попытки (``attempt_key`` проекции)
-    ``trust_final=1``. Окончательность прошлой попытки не в счёт.
+    ``trust_final=1``. Окончательность прошлой попытки не в счёт;
+  * окончательный ``no_provenance`` (#2027): ключа попытки нет, строка учёта без
+    идентификаторов (``ci_final_unprovenanced``); состояние в ленте называет причину.
 
 Ждать (в пределах окна STEWARD_REVIEW_WAIT_MAX, общего с ожиданием ревью):
   * отчёта по коммиту нет (неизвестность: первый прогон, missing_run, проект
@@ -34,7 +36,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
-from hub.services import ci_contract, ci_trust
+from hub.services import ci_contract, ci_final_unprovenanced, ci_trust
 
 EVENT_JUDGED_WITHOUT_CI = "steward_judges_without_verified_ci"
 
@@ -81,6 +83,12 @@ async def ci_wait_view(db: aiosqlite.Connection, task: dict[str, Any]) -> CiWait
     if trust == ci_trust.VERIFIED:
         return NOT_WAITING
     if row["attempt_id"] is None:
+        # #2027: отчёт без provenance не имеет ключа попытки, JOIN его не
+        # находит, а подтверждения не будет никогда.
+        if await ci_final_unprovenanced.is_final_no_provenance(
+            db, task_id, sha, row, fp
+        ):
+            return CiWait(False, ci_final_unprovenanced.STATE)
         key = str(row.get("attempt_key") or "")
         return CiWait(
             True,

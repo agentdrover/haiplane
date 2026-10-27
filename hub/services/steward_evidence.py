@@ -46,7 +46,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.models import STEWARD_GROUND_SOURCES, ReviewBrief, RiskClass
-from hub.services import ci_contract, ci_trust
+from hub.services import ci_contract, ci_trust, evidence_states
 from hub.services.ci_report import (
     VALIDATION_FAIL,
     VALIDATION_PASS,
@@ -156,6 +156,10 @@ class EvidencePacket:
     #: она ровно так и потерялась.
     diff_base: str = ""
     diff_base_source: str = ""
+    #: Пара отчётов «двойной чистоты», зафиксированная на заказе суждения
+    #: (#1986): id основного и дополнительного. Пусто - пары нет. Входит в
+    #: хеш пакета, чтобы судья и советник согласились о ТОЙ ЖЕ паре.
+    double_clean: tuple[int, ...] = ()
 
     def fact(self, source: str) -> EvidenceFact:
         _check_source(source)
@@ -414,11 +418,21 @@ def _locator_fact(brief: ReviewBrief | None) -> EvidenceFact:
     """How each test-bound AC's locator resolved (#505/#506)."""
     source = "ac_locator"
     resolutions = list(brief.locator_resolution) if brief else []
+    # #2026: for an AC that no test verifies a locator does not apply — said so,
+    # and nothing about whether the AC is met.
+    notes = evidence_states.manual_ac_notes(brief.acceptance_criteria if brief else [])
+    named = ", ".join(f"{n['ac_id']} ({n['verifiable_by']})" for n in notes)
+    not_applicable = (
+        f"тестовый локатор неприменим к {named}; это не отметка о выполнении этих AC"
+        if notes
+        else ""
+    )
     if not resolutions:
         return absent(
             source,
             NO_TEST_LOCATORS,
-            "у задачи нет критериев с verifiable_by=test — локаторов не о чем сообщать",
+            "у задачи нет критериев с verifiable_by=test — локаторов не о чем сообщать"
+            + (f"; {not_applicable}" if not_applicable else ""),
         )
     items = [r.model_dump() for r in resolutions]
     # ``resolvable`` is the only status that says the named test exists; the
@@ -427,9 +441,11 @@ def _locator_fact(brief: ReviewBrief | None) -> EvidenceFact:
     unresolved = [i for i in items if (i.get("status") or "") != "resolvable"]
     return present(
         source,
-        f"локаторов {len(items)}, не разрешилось {len(unresolved)}",
+        f"локаторов {len(items)}, не разрешилось {len(unresolved)}"
+        + (f"; {not_applicable}" if not_applicable else ""),
         locators=items,
         unresolved=len(unresolved),
+        not_applicable=notes,
     )
 
 
@@ -669,12 +685,15 @@ async def build_evidence_packet(
             await dependency_fact(db, task_id),
         ]
     }
+    from hub.services.steward_double_clean import frozen_pair
+
     return EvidencePacket(
         task_id=task_id,
         generation=generation,
         brief=brief,
         facts=facts,
         quotes=_quotes(task, brief, facts["machine_review_report"]),
+        double_clean=tuple(await frozen_pair(db, task_id, generation) or ()),
     )
 
 
@@ -1001,7 +1020,7 @@ def packet_hash(packet: EvidencePacket) -> str:
             },
         }
     brief = packet.brief.model_dump(mode="json") if packet.brief else None
-    body = {
+    body: dict[str, Any] = {
         "generation": packet.generation,
         "brief": (
             {k: brief.get(k) for k in PACKET_HASH_BRIEF_FIELDS}
@@ -1011,6 +1030,8 @@ def packet_hash(packet: EvidencePacket) -> str:
         "facts": facts,
         "quotes": [[q.source, q.author, q.text] for q in packet.quotes],
     }
+    if packet.double_clean:  # без пары хеш прежний байт в байт (#1986)
+        body["double_clean"] = list(packet.double_clean)
     blob = json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -1082,6 +1103,11 @@ def packet_payload(packet: EvidencePacket) -> dict[str, Any]:
         ],
         "injection_suspected": packet.injection_suspected,
         "injection_signals": packet.injection_signals,
+        **(
+            {"double_clean_pair": list(packet.double_clean)}
+            if packet.double_clean
+            else {}
+        ),
     }
 
 

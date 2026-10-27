@@ -860,6 +860,37 @@ def delivery_fresh_base_rerun_of(policy: dict) -> str:
     return DELIVERY_FRESH_BASE_RERUN_OFF
 
 
+# Срок ожидания свежей базы при доставке (#1992): сколько часов одобренная
+# задача может ждать base_fetch_pending, прежде чем уйти к человеку. Нет ключа
+# и нечитаемое значение - умолчание сервера, а не «без срока»: опечатка не
+# должна снимать предохранитель.
+BASE_FETCH_WAIT_HOURS_KEY = "base_fetch_wait_hours"
+
+
+def validate_base_fetch_wait_hours(policy: dict) -> None:
+    """Refuse a wait deadline the reader would silently replace (#1992)."""
+    key = BASE_FETCH_WAIT_HOURS_KEY
+    if key not in policy:
+        return
+    value = policy[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"gate_policy {key} must be an integer >= 1, got: {value!r}")
+
+
+def validate_delivery_policy(policy: dict) -> None:
+    """Ключи политики доставки: автоперезапуск (#1956) и срок ожидания (#1992)."""
+    validate_delivery_fresh_base_rerun(policy)
+    validate_base_fetch_wait_hours(policy)
+
+
+def base_fetch_wait_hours_of(policy: dict) -> int:
+    """Срок ожидания свежей базы, часов: ключ проекта, иначе config."""
+    value = policy.get(BASE_FETCH_WAIT_HOURS_KEY) if isinstance(policy, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return int(config.BASE_FETCH_WAIT_HOURS)
+    return value
+
+
 # Хост критика для облачной сдачи (#1953). Имя зарегистрированного хоста
 # исполнителя (k8), чей ключ забирает заказы критика. Пусто или нет ключа -
 # выключено: сдача облачной задачи идёт как до задачи. Нечитаемое значение
@@ -1037,7 +1068,11 @@ CEILING_KEYS: tuple[str, ...] = (
 
 
 def validate_steward_approve_max_class(piece: dict) -> None:
-    """Запись ключей потолка: только r0…r5 строчными. ``R1``, ``high``, число — отказ."""
+    """Запись ключей потолка: только r0…r5 строчными. ``R1``, ``high``, число — отказ.
+
+    Ключи двойной чистоты (#1986) проверяются здесь же: они часть потолка.
+    """
+    validate_double_clean(piece)
     for key in CEILING_KEYS:
         value = piece.get(key)
         if key in piece and (
@@ -1066,6 +1101,65 @@ def steward_approve_max_class_of(policy: dict) -> str | None:
 def auto_approve_max_class_of(policy: dict) -> str | None:
     """Потолок автопилота вердикта: r0…r5, None (нет ключа) или ``unreadable``."""
     return _ceiling_of(policy, AUTO_APPROVE_MAX_CLASS_KEY)
+
+
+# Исключение из потолка стюарда при «двойной чистоте» (#1986). Два ключа, и оба
+# нужны: класс, до которого исключение достаёт, и принципалы, чей отчёт
+# обязателен в паре. Читатели терпят то, что попало в базу мимо модели, но в
+# ОБРАТНУЮ сторону, чем потолок: нечитаемое значение читается как «выключено»,
+# а не как «отказ на всё» — ключ расширяет права, поэтому неразобранное не
+# может их открыть. Решение по этим ключам принимает один модуль:
+# ``steward_double_clean``.
+STEWARD_CLEAN_CEILING_KEY = "steward_approve_max_class_double_clean"
+DOUBLE_CLEAN_REVIEWERS_KEY = "double_clean_reviewers"
+#: Длина списка принципалов: список короче любой реальной команды ревьюеров.
+DOUBLE_CLEAN_REVIEWERS_MAX = 50
+
+
+def _principal_ids(raw: object) -> list[int] | None:
+    """Список положительных целых принципалов, либо None, если форма не та."""
+    if not isinstance(raw, list) or len(raw) > DOUBLE_CLEAN_REVIEWERS_MAX:
+        return None
+    if any(isinstance(i, bool) or not isinstance(i, int) or i < 1 for i in raw):
+        return None
+    return list(raw)
+
+
+def validate_double_clean(piece: dict) -> None:
+    """Запись ключей двойной чистоты: класс r0…r5 строчными, принципалы - id > 0."""
+    value = piece.get(STEWARD_CLEAN_CEILING_KEY)
+    if STEWARD_CLEAN_CEILING_KEY in piece and (
+        not isinstance(value, str) or value not in STEWARD_APPROVE_CLASSES
+    ):
+        raise ValueError(
+            f"gate_policy {STEWARD_CLEAN_CEILING_KEY} must be one of "
+            f"{', '.join(STEWARD_APPROVE_CLASSES)} (lowercase), got: {value!r}"
+        )
+    if DOUBLE_CLEAN_REVIEWERS_KEY in piece and (
+        _principal_ids(piece[DOUBLE_CLEAN_REVIEWERS_KEY]) is None
+    ):
+        raise ValueError(
+            f"gate_policy {DOUBLE_CLEAN_REVIEWERS_KEY} must be a list of at most "
+            f"{DOUBLE_CLEAN_REVIEWERS_MAX} principal ids (integers > 0), got: "
+            f"{piece[DOUBLE_CLEAN_REVIEWERS_KEY]!r}"
+        )
+
+
+def steward_double_clean_ceiling_of(policy: dict) -> str | None:
+    """Класс, до которого стюард вправе одобрять при двойной чистоте: r0…r5 или None.
+
+    None - нет ключа ИЛИ он нечитаем: исключение выключено.
+    """
+    value = policy.get(STEWARD_CLEAN_CEILING_KEY) if isinstance(policy, dict) else None
+    return (
+        value if isinstance(value, str) and value in STEWARD_APPROVE_CLASSES else None
+    )
+
+
+def double_clean_reviewers_of(policy: dict) -> list[int]:
+    """Принципалы, один из которых обязан быть в паре; пусто - исключение выключено."""
+    raw = policy.get(DOUBLE_CLEAN_REVIEWERS_KEY) if isinstance(policy, dict) else None
+    return _principal_ids(raw) or []
 
 
 # Заморозка проекта (#1594). Ключ ``freeze`` — {until, allow_work_types, note}:

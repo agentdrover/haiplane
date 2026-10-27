@@ -439,6 +439,12 @@ SWEEP_COVERAGE: dict[str, Coverage] = {
     "executor_runs": Coverage(removed_by=_NONE_YET),
     "executor_slots": Coverage(removed_by=_NONE_YET),
     "executor_orders": Coverage(removed_by=_NONE_YET),
+    "rework_launches": Coverage(
+        scenarios=(
+            "tests/test_rework_dispatch_once.py::"
+            "test_a_crash_after_acceptance_links_the_existing_job",
+        )
+    ),
     "critic_orders": Coverage(
         scenarios=(
             "tests/test_critic_orders_moment.py::test_the_critic_orders_sweep_is_idempotent",

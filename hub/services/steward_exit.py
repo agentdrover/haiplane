@@ -56,7 +56,9 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services import steward_advisor_skip as advisor_skip
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
+from hub.services.steward_objection import empty_kind_counts, objection_kind
 
 #: Минимум пар (approve судьи с полученным ответом советника).
 ACT_MIN_PAIRS = 20
@@ -111,6 +113,10 @@ class ContourCounts:
     advisor_timeout: int = 0
     advisor_refused: int = 0
     advisor_pending: int = 0
+    #: Советник намеренно не заказан (#2024): approve не применится без него.
+    advisor_skipped: int = 0
+    #: object по видам основания (#2025); сумма равна ``object``
+    object_by_kind: dict[str, int] = field(default_factory=dict)
     #: номера задач по процедурным эскалациям — отдельной строкой в сводке
     procedural_by_reason: dict[str, int] = field(default_factory=dict)
 
@@ -134,6 +140,22 @@ class ContourCounts:
         return (self.substantive / self.denominator) if self.denominator else None
 
 
+class _SkipKeys:
+    """(задача, поколение) с записанным пропуском: события сразу, лента - лениво."""
+
+    def __init__(self, events: set[tuple[int, int]]) -> None:
+        self._events = events
+        self._fed: set[tuple[int, int]] | None = None
+
+    async def has(self, db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
+        key = (int(item["task_id"]), int(item["generation"]))
+        if key in self._events:
+            return True
+        if self._fed is None:  # событие вычищено по сроку: одна загрузка ленты
+            self._fed = await advisor_skip.fed_keys(db)
+        return key in self._fed
+
+
 async def contour_counts(
     db: aiosqlite.Connection, since_days: int | None = None
 ) -> ContourCounts:
@@ -150,7 +172,8 @@ async def contour_counts(
     rows = await fetchall(
         db,
         "SELECT j.verdict, j.escalate_reason, a.verdict AS adv_verdict, "  # nosec B608 - constant fragments, values are params
-        "r.status AS run_status "
+        "a.grounds AS adv_grounds, "
+        "j.task_id, j.generation, r.status AS run_status "
         "FROM steward_judgements j "
         "LEFT JOIN steward_judgements a ON a.kind='advisor' "
         "AND a.task_id=j.task_id AND a.generation=j.generation "
@@ -160,6 +183,7 @@ async def contour_counts(
         f"WHERE {where}",
         tuple(params),
     )
+    skip_keys = _SkipKeys(await advisor_skip.recorded_events(db))
     c: dict[str, int] = {
         "judged": 0,
         "procedural": 0,
@@ -171,8 +195,10 @@ async def contour_counts(
         "advisor_timeout": 0,
         "advisor_refused": 0,
         "advisor_pending": 0,
+        "advisor_skipped": 0,
     }
     by_reason: dict[str, int] = {}
+    by_kind = empty_kind_counts()
     for row in rows:
         item = dict(row)
         c["judged"] += 1
@@ -194,13 +220,16 @@ async def contour_counts(
                 c["concur"] += 1
             elif adv == "object":
                 c["object"] += 1
+                by_kind[objection_kind(item.get("adv_grounds"))] += 1
             elif status in ("timeout", "never_started"):
                 c["advisor_timeout"] += 1
             elif status in ("refused", "superseded"):
                 c["advisor_refused"] += 1
+            elif not status and await skip_keys.has(db, item):
+                c["advisor_skipped"] += 1
             else:
                 c["advisor_pending"] += 1
-    return ContourCounts(**c, procedural_by_reason=by_reason)
+    return ContourCounts(**c, procedural_by_reason=by_reason, object_by_kind=by_kind)
 
 
 # ---------------------------------------------------------------------------
@@ -579,9 +608,11 @@ async def contour_report(db: aiosqlite.Connection) -> dict[str, Any]:
         "pairs": counts.pairs,
         "concur": counts.concur,
         "object": counts.object,
+        "object_by_kind": dict(counts.object_by_kind),
         "timeout": counts.advisor_timeout,
         "advisor_refused": counts.advisor_refused,
         "advisor_pending": counts.advisor_pending,
+        "advisor_skipped": counts.advisor_skipped,
         "judged": counts.judged,
         "judge_approve": counts.judge_approve,
         "judge_changes_requested": counts.judge_changes,

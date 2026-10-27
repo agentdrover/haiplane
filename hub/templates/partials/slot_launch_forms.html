@@ -1,0 +1,13 @@
+{#- #1712, #1998: кнопки «Запустить на <хост>» для open и для круга починки (running). -#}
+{%- for slot_host in slot_hosts %}
+<form method="post" action="/tasks/{{ task.id }}/web-executor-slot" class="task-action-stack task-action-stack--separated">
+  {{ csrf_field() }}
+    <input type="hidden" name="host" value="{{ slot_host }}">
+    {%- if launch_plaque and launch_plaque.active %}
+    <button class="btn btn-primary task-action-btn" type="button" disabled>Запуск идёт: {{ launch_plaque.button_label or launch_plaque.headline }}</button>
+    {%- else %}
+    <button class="btn btn-primary task-action-btn" type="submit"
+            onclick="return confirm('Запустить исполнителя на слоте {{ slot_host }} для задачи #{{ task.id }}?{% if task.status.value == 'running' %} Задача вернётся в работу (круг починки).{% endif %} Хаб сам передаст код хосту.')">Запустить на {{ slot_host }}</button>
+    {%- endif %}
+</form>
+{%- endfor %}

@@ -37,7 +37,57 @@
             }
             return sel.options.length ? 0 : -1;
         }
+        // #2035: лист MC-4 хранит подтверждённый сервером снимок значений формы
+        // (form.__hubConfirmed). Несохранённый ввод - это ОТЛИЧИЕ текущего значения
+        // от снимка, проверяемое при каждом вызове; ни флаг, ни события input/change
+        // источником истины не служат (значение могут поменять скриптом без событий).
+        function fieldValue(el) {
+            // Однозначная сериализация: пустой выбор и выбор пустой опции различаются;
+            // у checkbox/radio в запрос идёт и checked, и value.
+            if (el.type === "checkbox" || el.type === "radio") { return JSON.stringify([el.checked, el.value]); }
+            if (el.tagName === "SELECT" && el.multiple) {
+                return JSON.stringify(Array.prototype.filter.call(el.options, function (o) { return o.selected; })
+                    .map(function (o) { return o.value; }));
+            }
+            return String(el.value);
+        }
+        window.hubFormValues = function (form) {
+            var snap = new Array();
+            for (var i = 0; i < form.elements.length; i++) {
+                snap.push([form.elements[i], fieldValue(form.elements[i])]);
+            }
+            return snap;
+        };
+        // snap - значения В МОМЕНТ отправки; без него берутся текущие.
+        window.hubConfirmForm = function (form, snap) {
+            form.__hubConfirmed = snap || window.hubFormValues(form);
+            window.hubRefreshSent(form);
+        };
+        // Форма «подтверждена», пока ВСЕ её поля равны снимку.
+        window.hubFormConfirmed = function (form) {
+            var snap = form.__hubConfirmed;
+            if (!snap) { return false; }
+            for (var i = 0; i < snap.length; i++) {
+                if (fieldValue(snap[i][0]) !== snap[i][1]) { return false; }
+            }
+            return true;
+        };
+        // Атрибут - только производный признак для CSS (скрыть кнопку у подтверждённой формы).
+        window.hubRefreshSent = function (form) {
+            if (window.hubFormConfirmed(form)) { form.setAttribute("data-sent", "true"); }
+            else { form.removeAttribute("data-sent"); }
+        };
+        function confirmedEqual(el) {
+            var snap = el.form && el.form.__hubConfirmed;
+            if (!snap) { return null; }
+            for (var i = 0; i < snap.length; i++) {
+                if (snap[i][0] === el) { return fieldValue(el) === snap[i][1]; }
+            }
+            return null;
+        }
         function dirty(el) {
+            var same = confirmedEqual(el);
+            if (same !== null) { return !same; }
             // #1995: ввод, возвращённый формой после отказа, стал defaultValue;
             // без этой метки автообновление стёрло бы его пустой формой.
             if (el.hasAttribute("data-hub-restored")) {
@@ -59,8 +109,10 @@
         window.hubHasUnsavedInput = function () {
             var main = document.getElementById("main");
             if (!main) { return false; }
+            var sheetForms = main.querySelectorAll(".c2-sheet form");
+            for (var k = 0; k < sheetForms.length; k++) { window.hubRefreshSent(sheetForms[k]); }
             var active = document.activeElement;
-            if (active && main.contains(active) && active.matches(FIELDS) && !SKIP[active.type]) { return true; }
+            if (active && main.contains(active) && active.matches(FIELDS) && !SKIP[active.type] && confirmedEqual(active) !== true) { return true; }
             var fields = main.querySelectorAll(FIELDS);
             for (var i = 0; i < fields.length; i++) {
                 if (dirty(fields[i])) { return true; }
@@ -71,7 +123,9 @@
             var elt = e.detail.requestConfig && e.detail.requestConfig.elt;
             if (!elt || !elt.hasAttribute("data-hub-autorefresh")) { return; }
             var trigger = e.detail.requestConfig.triggeringEvent;
-            if (trigger && trigger.type === "click") { return; }
+            // Ручной клик и обновление после успешного действия листа (c2-refresh,
+            // #1813) разрешены: отправленный лист хранит введённые значения.
+            if (trigger && (trigger.type === "click" || trigger.type === "c2-refresh")) { return; }
             if (window.hubHasUnsavedInput()) { e.detail.shouldSwap = false; }
         });
         var waiting = null;

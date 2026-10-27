@@ -1,10 +1,13 @@
 # Haiplane Hub: the TRUSTED half of a satellite's CI report (#1848).
 #
-# Copy this file to .github/workflows/ on the DEFAULT branch of the satellite.
-# It is NOT laid down by provisioning: it needs settings only the owner can make
+# Where it comes from: provisioning of a NEW GitHub project lays this file down
+# on the default branch by itself (haiplane-ci-report.yml); for an existing
+# project the owner copies it to .github/workflows/ on the DEFAULT branch. Either
+# way the settings only the owner can make stay the owner's
 # (docs/satellite-ci-report.md): the environment `hub-report` with deployment
 # branches limited to the default branch, holding HAIPLANE_HUB_URL and
-# HAIPLANE_HUB_CI_TOKEN (a ci_runner key bound to the project).
+# HAIPLANE_HUB_CI_TOKEN (a ci_runner key bound to the project), and the
+# project's ci_contract. Until then the report is not confirmed.
 #
 # Why this shape:
 #   * `workflow_run` always runs the workflow definition of the DEFAULT branch,

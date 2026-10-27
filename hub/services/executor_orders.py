@@ -36,6 +36,7 @@ from typing import Any, Final
 import aiosqlite
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from fastapi import HTTPException
 
 from hub import config
 from hub import repository as repo
@@ -658,7 +659,7 @@ async def _chosen_task(
     owner = await repo.resolve_project_for_task(db, int(task_id))
     if owner is None or int(owner["id"]) != int(project["id"]):
         return None, f"{REASON_OTHER_PROJECT}: #{task_id}"
-    if task["status"] != "open":
+    if task["status"] not in ("open", "running"):
         return None, f"{REASON_NOT_OPEN}: #{task_id} в статусе {task['status']}"
     return task, ""
 
@@ -767,6 +768,8 @@ class _Booking:
     task: dict[str, Any]
     host: dict[str, Any]
     skill: Any
+    #: Круг починки running-задачи (#1998): возврат в open — в SAVEPOINT выпуска.
+    returning: bool = False
 
 
 async def _book(
@@ -795,7 +798,15 @@ async def _book(
     )
     if refusal:
         return refusal
-    return _Booking(task, host, skill)
+    if task["status"] == "running":
+        # Круг починки (#1998): то же правило допуска, что у облака. Все отказы —
+        # здесь, ДО возврата: строковый отказ после него закоммитил бы open.
+        from hub.services import rework_admission
+
+        why = await rework_admission.refusal(db, task)
+        if why:
+            return f"{REASON_NOT_OPEN}: #{task['id']} в статусе running, {why}"
+    return _Booking(task, host, skill, returning=task["status"] == "running")
 
 
 async def launch_on_slot(
@@ -841,6 +852,9 @@ async def launch_on_slot(
     except HostError as exc:
         # Сохранённый ключ хоста не годится: код не выписан, ничего не осталось.
         return _refused(f"{REASON_HOST_OFF}: {exc.detail}", task_id)
+    except HTTPException as exc:
+        # Задача ушла из running между проверкой и возвратом: откат уже сделан.
+        return _refused(f"{REASON_NOT_OPEN}: {exc.detail}", task_id)
     return LaunchResult(
         True, "", int(booked.task["id"]), row_id=row_id, order_id=order_id, host=host
     )
@@ -860,9 +874,14 @@ async def _issue_atomically(
     транзакции снаружи, и если он закоммитит после отказа, который мы вернули
     значением, выжили бы прогон и код без заказа. Точка сохранения снимает
     это: что бы ни стояло снаружи, до заказа ни кода, ни прогона не остаётся.
+
+    Круг починки running-задачи (#1998): возврат в open — ВНУТРИ этой же точки,
+    поэтому сбой выпуска откатывает и его, а не оставляет open без заказа.
     """
     await db.execute("SAVEPOINT executor_slot_issue")
     try:
+        if booked.returning:
+            await _return_for_repair(db, booked, issuer_principal_id)
         result = await _issue(
             db,
             project,
@@ -876,6 +895,27 @@ async def _issue_atomically(
         raise
     await db.execute("RELEASE executor_slot_issue")
     return result
+
+
+async def _return_for_repair(
+    db: aiosqlite.Connection, booked: _Booking, issuer_principal_id: int
+) -> None:
+    """running → open с записью о том, кто нажал и на какой слот (без commit)."""
+    from hub.services import rework_admission, return_running
+
+    who = await admin_svc.get_principal(db, int(issuer_principal_id))
+    name = str(who["username"]) if who else f"principal #{issuer_principal_id}"
+    await return_running.apply_return_to_open(
+        db,
+        booked.task,
+        actor=name,
+        reason=rework_admission.return_reason(
+            booked.task,
+            where=f"на слоте {booked.host['name']}",
+            issue="#1998",
+            who=name,
+        ),
+    )
 
 
 async def _issue(

@@ -418,6 +418,21 @@ def shard_targets(targets: list["_Target"], index: int, total: int) -> list["_Ta
     ]
 
 
+def module_texts(test_root: Path) -> dict[Path, str]:
+    """Text of every test module under ``test_root``, except ``tests/gui``.
+
+    #1996: the browser scenarios need Chromium, which a mutation run does not
+    have; a mutant must never be judged by them.
+    """
+    if not test_root.is_dir():
+        return {}
+    return {
+        f: f.read_text(encoding="utf-8", errors="replace")
+        for f in sorted(test_root.rglob("test_*.py"))
+        if f.relative_to(test_root).parts[0] != "gui"
+    }
+
+
 def _collect_targets(
     repo: Path, base: str, tests_dir: Path, report: Report, scratch: Path
 ) -> list[_Target]:
@@ -426,10 +441,7 @@ def _collect_targets(
     report.merge_base = merge_base
     report.base_tip = _git(repo, "rev-parse", base).strip()
     test_root = repo / tests_dir
-    texts = {
-        f: f.read_text(encoding="utf-8", errors="replace")
-        for f in (sorted(test_root.rglob("test_*.py")) if test_root.is_dir() else [])
-    }
+    texts = module_texts(test_root)
     diff = _git(repo, "diff", "-U0", "--no-color", merge_base, "HEAD", "--", "*.py")
     targets: list[_Target] = []
     for index, (path, lines) in enumerate(sorted(touched_lines(diff).items())):

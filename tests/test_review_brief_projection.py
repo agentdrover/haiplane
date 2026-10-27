@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hub import cli, mcp_server
+from hub import cli, hub_instance, mcp_server
 from hub import repository as repo
 from hub.models import ReviewBrief
 from hub.services import review_brief_projection as proj
@@ -177,6 +177,18 @@ def served(monkeypatch):
         return copy.deepcopy(box["brief"])
 
     monkeypatch.setattr(mcp_server, "_api_get", fake_get)
+    # Эхо экземпляра входит в конверт и в бюджет знаков: длина server_id - это
+    # имя хоста. Фиксируем значения, чтобы число показанных AC не зависело от
+    # машины (#1985 Nit, testing-playbook #1851).
+    monkeypatch.setattr(
+        hub_instance,
+        "instance_echo_fields",
+        lambda: {
+            "instance": "prod",
+            "base_url": "https://agenthai.ru",
+            "server_id": "vm-5c8197",
+        },
+    )
     return box
 
 
@@ -275,8 +287,8 @@ async def test_mcp_brief_fits_the_budget_and_keeps_the_mandatory_fields(
     if shape == "1664":
         # #1985: pin_verified - решающее поле machine_review и стоит знаков;
         # на границе бюджета число показанных AC зависит от длины имени хоста
-        # в конверте (server_id): 9 в CI, 8 на длинном локальном имени.
-        assert blocks["acceptance_criteria"]["shown"] in (8, 9)
+        # в конверте (server_id); эхо зафиксировано в фикстуре served.
+        assert blocks["acceptance_criteria"]["shown"] == 9
     text = _text(result)
     assert text.startswith("Review brief for task #1647")
     assert "AC-1:" in text or blocks["acceptance_criteria"]["shown"] == 0
@@ -770,9 +782,11 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # больше не делает скан целостности CI (fetch и запись), поэтому в route.reason пакета
 # нет «Справка по CI: … не проверена»; scan_hash в блоке ci_integrity; packet_hash прежний.
 # #1985: machine_review получил reviewed_sha и pin_verified (REST-бриф; пакет стюарда и packet_hash проверяются ниже).
+# #2026: блок ci_evidence получил поле expectation, ProfileDowngradeView — rules: REST-бриф и payload пакета стюарда; packet_hash прежний.
 # #1933: machine_review получил поле ac_tests_unread ([] у этой задачи): REST-бриф и payload пакета стюарда; packet_hash прежний.
-GOLDEN_REST_BRIEF = "734d4f54e6b836f7159a527011c940e4c733875e644fb92b649aa27935378cc2"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "4b9eacf8f80bb2e8743d3a7f691431c0532b8ae8ec4a41ed66411748879704ab"  # pragma: allowlist secret
+# #2090: REST-бриф получил поле outcome_ownership (null у этой задачи: без метрики): переснят REST-бриф и payload пакета стюарда; packet_hash прежний.
+GOLDEN_REST_BRIEF = "57f8f14cc22417f9e2df81abae11337332f034dc09419594388480a4d489dfa1"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "751786f606ea18a17fa38739f929e347ba5260ea67cc47cc9a83029bc9d74b9e"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 

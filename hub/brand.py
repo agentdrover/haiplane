@@ -22,6 +22,7 @@ COOKIE_NAME = "haiplane_hub_session"
 CSRF_COOKIE_NAME = "haiplane_csrf"
 SEEDED_CI = "haiplane-ci.yml"
 SEEDED_STALE = "haiplane-stale.yml"
+SEEDED_CI_REPORT = "haiplane-ci-report.yml"
 GITHUB_OWNER = "agentdrover"
 GITHUB_REPO = "haiplane"
 

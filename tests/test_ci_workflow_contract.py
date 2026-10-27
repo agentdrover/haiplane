@@ -550,6 +550,9 @@ def test_the_suite_runs_in_three_shards_and_one_job_reports() -> None:
             # #1920: the audit file; a name outside the prefix the trusted
             # report reads (hub-ci-results-)
             "static": ["hub-ci-static"],
+            # #1996: the evidence of a failed browser scenario (trace, screenshots,
+            # server log); `if: failure()`, a name outside the report prefix.
+            "gui": ["gui-failure-evidence"],
         }.get(name, [])
         assert uploads == expected, name
 

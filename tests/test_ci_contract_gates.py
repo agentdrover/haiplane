@@ -7,6 +7,8 @@ project's contract, on the same fake GitHub.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from hub import config
@@ -43,9 +45,15 @@ async def test_a_contract_change_between_the_decision_and_the_apply_refuses_the_
 
     from hub import config
     from hub.models import ReviewVerdict, TaskReviewVerdict
-    from hub.services import lifecycle
+    from hub.services import lifecycle, steward_shadow
 
     monkeypatch.setattr(config, "SDD_AC_TESTS", ac_mode)
+    if steward:  # #2040: the global act grant is read in the transaction
+
+        async def _granted_now(_db):
+            return True
+
+        monkeypatch.setattr(steward_shadow, "act_granted_now", _granted_now)
     pid, task_id = await satellite_task(db)
     await base._post(db, task_id, base._sat_attempt(task_id))
     await repo.update_task(db, task_id, status="review")
@@ -55,6 +63,17 @@ async def test_a_contract_change_between_the_decision_and_the_apply_refuses_the_
 
     async def the_contract_changes_first(state):
         await set_contract(db, pid, SAT_CONTRACT_C)
+        if (
+            steward
+        ):  # #2037: the steward's right is read there; keep the verdict delegated
+            await repo.update_project(
+                db,
+                pid,
+                gate_policy=json.dumps(
+                    {"verdict": "steward", "ci_contract": SAT_CONTRACT_C}
+                ),
+            )
+            await db.commit()
         return await real_apply(state)
 
     monkeypatch.setattr(lifecycle, "_apply_verdict", the_contract_changes_first)

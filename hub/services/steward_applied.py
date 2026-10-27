@@ -39,6 +39,7 @@ at-most-once — вердикт привязан к генерации, — и �
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -48,8 +49,10 @@ import aiosqlite
 from fastapi import HTTPException
 
 from hub import repository as repo
-from hub.services import watch_notices
-from hub.models import ReviewVerdict, TaskReviewVerdict
+from hub.services import verdict_owner, watch_notices
+from hub.db import fetchall, write_transaction
+from hub.services.refusal_reason import CodedRefusal
+from hub.models import ReviewFinding, ReviewSeverity, ReviewVerdict, TaskReviewVerdict
 from hub.services.result_kind import (
     AUTOMATION_REFUSAL,
     automation_not_applicable,
@@ -196,14 +199,19 @@ async def apply_judgement(
 
         refusal = await advisor_refusal(db, task_id, generation)
         if refusal is not None:
-            raise HTTPException(
+            raise CodedRefusal(
                 409,
-                detail=(
-                    f"approve судьи не применяется без согласия советника "
-                    f"({refusal[0]}): {refusal[1]}"
-                ),
+                f"{_refusal_claim(refusal[0], 'approve судьи не применяется без согласия советника')} "
+                f"({refusal[0]}): {refusal[1]}",
+                code=refusal[0],
             )
-        await _record(db, task_id, ReviewVerdict.approved, generation, claim=claim)
+        # #2082: пустой отчёт без доказанной работы. Доказательство добывается
+        # здесь, ДО транзакции записи; ей остаётся чистая перепроверка.
+        from hub.services import steward_empty_report
+
+        async with steward_empty_report.proof_scope():
+            await steward_empty_report.require(db, task_id, generation)
+            await _record(db, task_id, ReviewVerdict.approved, generation, claim=claim)
         return APPLIED, f"approve применён к сдаче {generation}"
 
     if verdict != "changes_requested":
@@ -219,13 +227,135 @@ async def apply_judgement(
 
     cycles = int(task.get("review_cycle") or 0)
     if review_budget_exhausted(cycles):
-        await _hand_to_the_human(db, task_id, cycles)
+        await _hand_to_the_human(db, task_id, cycles, generation, claim)
         return ESCALATED_TO_HUMAN, (
             f"бюджет циклов исчерпан ({cycles}) — решение за человеком"
         )
 
-    await _record(db, task_id, ReviewVerdict.changes_requested, generation)
+    await _record(
+        db,
+        task_id,
+        ReviewVerdict.changes_requested,
+        generation,
+        claim=claim,
+        findings=judge_findings(dict(judgement)),
+    )
     return RETURNED, f"работа возвращена автору, цикл {cycles + 1}"
+
+
+_SEVERITY_OF = {
+    "high": ReviewSeverity.high,
+    "p1": ReviewSeverity.high,
+    "critical": ReviewSeverity.high,
+    "low": ReviewSeverity.low,
+    "p3": ReviewSeverity.low,
+}
+
+
+def judge_findings(judgement: dict[str, Any]) -> list[ReviewFinding]:
+    """Находки судьи в виде находок вердикта: автор получает их списком, а не текстом.
+
+    Судья пишет находки свободными словарями; вердикт хранит ``ReviewFinding``.
+    ``finding_uid`` стоит в сообщении только если судья принёс свой (находка
+    машинного отчёта, которую он переписал): ответ ``finding_outcomes`` хранится
+    за строкой отчёта, и uid, выведенный здесь, остался бы «неизвестным».
+    Невнятная находка не теряется - её сообщением становится сам словарь.
+    """
+    try:
+        raw = json.loads(judgement.get("findings") or "[]")
+    except ValueError:
+        raw = []
+    entries = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    findings = [_judge_finding(number, e) for number, e in enumerate(entries, 1)]
+    if len(findings) <= _VERDICT_FINDINGS_MAX:
+        return findings
+    # Судья принимает до 100 находок, вердикт хранит 50: лишние не теряются, а
+    # складываются в последнюю - со счётом и uid, сколько уместится в сообщение.
+    keep, rest = (
+        findings[: _VERDICT_FINDINGS_MAX - 1],
+        findings[_VERDICT_FINDINGS_MAX - 1 :],
+    )
+    head = f"Ещё {len(rest)} находок судьи (не уместились в список): "
+    parts = [
+        (f"{f.file}:{f.line} " if f.file and f.line else f"{f.file} " if f.file else "")
+        + f.message.replace("\n", " ")
+        for f in rest
+    ]
+    body = _fit_folded(head, parts)
+    top = min((f.severity for f in rest), key=_SEVERITY_ORDER.index)
+    keep.append(
+        ReviewFinding(
+            id=_VERDICT_FINDINGS_MAX,
+            severity=top,
+            message=head + body,
+        )
+    )
+    return keep
+
+
+def _fit_folded(head: str, parts: list[str]) -> str:
+    """Склеить свёрнутые находки до 2000 знаков; не влезшее - счётом, не молча.
+
+    Сперва всё без пометки; не влезло - берём сколько помещается вместе с
+    пометкой, слишком длинную находку обрезаем до начала (file:line впереди),
+    а не обрываем на ней список.
+    """
+    sep, limit = " | ", 2000 - len(head)
+    whole = sep.join(parts)
+    if len(whole) <= limit:
+        return whole
+    kept: list[str | None] = list(parts)
+
+    def render() -> str:
+        shown = [x for x in kept if x is not None]
+        omitted = len(parts) - len(shown)
+        text = sep.join(shown)
+        # Пометка только если что-то опущено: «ещё 0» - ложь и лишние знаки.
+        return text + (f" … ещё {omitted} не показано" if omitted else "")
+
+    # Корректно по построению: пока не помещается - сначала обрезаем самую
+    # длинную находку до начала (file:line впереди), потом выбрасываем
+    # последнюю; пометка пересчитывается с новым счётом.
+    while len(render()) > limit:
+        live = [i for i, x in enumerate(kept) if x is not None]
+        longest = max(live, key=lambda i: len(kept[i] or ""))
+        if len(kept[longest] or "") > _SHORT_HEAD + 1:
+            kept[longest] = (kept[longest] or "")[:_SHORT_HEAD] + "…"
+        else:
+            kept[live[-1]] = None
+    return render()
+
+
+#: Начало слишком длинной находки (file:line впереди), когда целиком не влезает.
+_SHORT_HEAD = 160
+
+
+#: Сколько находок вмещает вердикт (``TaskReviewVerdict.findings``).
+_VERDICT_FINDINGS_MAX = 50
+_SEVERITY_ORDER = [ReviewSeverity.high, ReviewSeverity.medium, ReviewSeverity.low]
+
+
+def _judge_finding(number: int, entry: dict[str, Any]) -> ReviewFinding:
+    text = next(
+        (
+            str(entry[key]).strip()
+            for key in ("message", "title", "summary", "detail")
+            if str(entry.get(key) or "").strip()
+        ),
+        json.dumps(entry, ensure_ascii=False),
+    )
+    line = entry.get("line")
+    uid = str(entry.get("finding_uid") or "").strip()
+    return ReviewFinding(
+        id=number,
+        severity=_SEVERITY_OF.get(
+            str(entry.get("severity") or "").strip().lower(), ReviewSeverity.medium
+        ),
+        message=(f"[uid {uid}] {text}" if uid else text)[:2000],
+        file=str(entry.get("file") or "")[:500],
+        line=line if isinstance(line, int) and line >= 1 else None,
+        recommendation=str(entry.get("recommendation") or "")[:2000],
+    )
 
 
 def _refuse_if_the_submission_moved(task: dict[str, Any], generation: int) -> None:
@@ -246,13 +376,12 @@ def _refuse_if_the_submission_moved(task: dict[str, Any], generation: int) -> No
     live = int(task.get("submission_generation") or 0)
     if live == generation:
         return
-    raise HTTPException(
+    raise CodedRefusal(
         409,
-        detail=(
-            f"суждение о сдаче {generation}, а живая сдача — {live}: "
-            "применять его значило бы записать вердикт о коде, которого "
-            "на ветке уже нет"
-        ),
+        f"суждение о сдаче {generation}, а живая сдача — {live}: "
+        "применять его значило бы записать вердикт о коде, которого "
+        "на ветке уже нет",
+        code="submission_moved",
     )
 
 
@@ -270,13 +399,12 @@ def _refuse_if_the_verdict_is_taken(task: dict[str, Any], generation: int) -> No
     verdict_generation = task.get("review_verdict_generation")
     if not stored or verdict_generation != generation:
         return
-    raise HTTPException(
+    raise CodedRefusal(
         409,
-        detail=(
-            f"на сдачу {generation} вердикт уже записан ({stored}) — "
-            "суждение стюарда его не перезаписывает: человек старше, и "
-            "повторное применение тоже"
-        ),
+        f"на сдачу {generation} вердикт уже записан ({stored}) — "
+        "суждение стюарда его не перезаписывает: человек старше, и "
+        "повторное применение тоже",
+        code="verdict_taken",
     )
 
 
@@ -287,6 +415,7 @@ async def _record(
     generation: int,
     *,
     claim: tuple[int, str] | None = None,
+    findings: list[ReviewFinding] | None = None,
 ) -> None:
     """Записать вердикт ТЕМ ЖЕ путём, которым его пишет человек.
 
@@ -304,6 +433,7 @@ async def _record(
             agent=_STEWARD_ACTOR,
             verdict=verdict,
             comments=f"Применено стюардом по суждению генерации {generation}.",
+            findings=findings or [],
         ),
         # #1601: вердикт пишется ТОЛЬКО на то поколение, о котором судили, и
         # только пока на него нет вердикта — условие стоит в самой записи.
@@ -313,8 +443,46 @@ async def _record(
     )
 
 
+async def _fence(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    claim: tuple[int, str] | None,
+) -> None:
+    """Эскалация по бюджету пишет только на ту сдачу, о которой судили (#2053).
+
+    Внутри её транзакции: пересдача (другое поколение), вердикт, уже стоящий на
+    этой сдаче, потерянная метка применения или отозванное право стюарда отменяют
+    решение целиком - как в записи вердикта.
+    """
+    task = dict(await repo.get_task(db, task_id) or {})
+    _refuse_if_the_submission_moved(task, generation)
+    _refuse_if_the_verdict_is_taken(task, generation)
+    if claim is None:
+        return
+    held = await fetchall(
+        db,
+        "SELECT 1 FROM steward_judgements WHERE id=? AND advisor_outcome='applying' "
+        "AND advisor_claimed_at=?",
+        (claim[0], claim[1]),
+    )
+    if not held:
+        raise CodedRefusal(
+            409, "метка применения потеряна - эскалация не записана", code="claim_lost"
+        )
+    from hub.services.steward_apply import authority_refusal
+
+    revoked = await authority_refusal(db, task_id)
+    if revoked:
+        raise CodedRefusal(422, f"{revoked[0]}: {revoked[1]}", code=revoked[0])
+
+
 async def _hand_to_the_human(
-    db: aiosqlite.Connection, task_id: int, cycles: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    cycles: int,
+    generation: int,
+    claim: tuple[int, str] | None = None,
 ) -> None:
     """Бюджет исчерпан: существующий переход в needs_decision, без арбитра.
 
@@ -322,6 +490,14 @@ async def _hand_to_the_human(
     маршруте и требует job. Заводить его сюда значило бы построить второй
     арбитраж ради одного случая; человек здесь и есть арбитр.
     """
+    async with write_transaction(db):
+        await _fence(db, task_id, generation, claim)
+        await _escalate_in_transaction(db, task_id, cycles)
+
+
+async def _escalate_in_transaction(
+    db: aiosqlite.Connection, task_id: int, cycles: int
+) -> None:
     from hub.services.orchestration import log_activity
 
     moved = await repo.transition_status_if(
@@ -333,12 +509,11 @@ async def _hand_to_the_human(
         # карточке, и создал бы впечатление двух разных событий. Этот путь
         # вердикта не пишет, поэтому замок «вердикт уже стоит» его не
         # держит — держит вот этот отказ.
-        raise HTTPException(
+        raise CodedRefusal(
             409,
-            detail=(
-                "бюджет уже исчерпан и задача уже передана человеку — "
-                "повторное применение ничего не меняет"
-            ),
+            "бюджет уже исчерпан и задача уже передана человеку — "
+            "повторное применение ничего не меняет",
+            code="already_escalated",
         )
     await repo.add_task_update(
         db,
@@ -831,7 +1006,7 @@ async def approve_without_a_human(
     стюардом решения считаются в двух разных местах.
     """
     if not decision.allowed:
-        await _hand_to_the_human_because(db, task_id, decision)
+        await _hand_to_the_human_because(db, task_id, decision, generation)
         return ESCALATED_TO_HUMAN, (
             "самостоятельного одобрения нет — " + decision.reason
         )
@@ -863,7 +1038,10 @@ async def approve_without_a_human(
 
 
 async def _hand_to_the_human_because(
-    db: aiosqlite.Connection, task_id: int, decision: SelfApproval
+    db: aiosqlite.Connection,
+    task_id: int,
+    decision: SelfApproval,
+    generation: int,
 ) -> None:
     """Набор не сошёлся: к человеку, и с ИМЕНЕМ того, что не сошлось.
 
@@ -885,6 +1063,12 @@ async def _hand_to_the_human_because(
         + decision.reason
         + ".",
         author_kind="hub",
+    )
+    await verdict_owner.hand_to_human(
+        db,
+        task_id,
+        verdict_owner.reason_of("self_approval_not_converged", decision.reason),
+        generation=generation,
     )
     await db.commit()
 
@@ -979,9 +1163,15 @@ async def _apply_self_approval(
             db,
             task_id,
             f"{advisor[0]}: {advisor[1]}",
-            who="Второго мнения нет: approve судьи без согласия советника",
+            who=_refusal_claim(
+                advisor[0], "Второго мнения нет: approve судьи без согласия советника"
+            ),
+            code=advisor[0],
+            generation=generation,
         )
-        return ESCALATED_TO_HUMAN, "советник не согласен — " + advisor[1]
+        return ESCALATED_TO_HUMAN, (
+            _refusal_claim(advisor[0], "советник не согласен") + " — " + advisor[1]
+        )
 
     from hub.services.steward_apply import apply_refusals
 
@@ -991,6 +1181,8 @@ async def _apply_self_approval(
             db,
             task_id,
             "; ".join(f"{code}: {detail}" for code, detail in refusals),
+            code=refusals[0][0],
+            generation=generation,
         )
         return ESCALATED_TO_HUMAN, (
             "привратник применения возражает — " + refusals[0][0]
@@ -1000,11 +1192,25 @@ async def _apply_self_approval(
     return await approve_without_a_human(db, task_id, generation, decision, claim=claim)
 
 
+def _refusal_claim(code: str, no_consent_claim: str) -> str:
+    """Префикс отказа: при передаче по потолку - её текст, иначе «нет согласия».
+
+    Согласие советника при передаче по потолку может быть действительным,
+    поэтому утверждать его отсутствие нельзя.
+    """
+    from hub.services.refusal_reason import CAP_HANDOFF, REASON_TEXTS
+
+    return REASON_TEXTS[CAP_HANDOFF] if code == CAP_HANDOFF else no_consent_claim
+
+
 async def _hand_to_the_human_named(
     db: aiosqlite.Connection,
     task_id: int,
     reason: str,
     who: str = "Привратник применения возражает",
+    *,
+    generation: int,
+    code: str = "apply_gate_refused",
 ) -> None:
     """Отказ привратника — в карточку своими словами, а не словами правила.
 
@@ -1020,5 +1226,15 @@ async def _hand_to_the_human_named(
         "status",
         f"Самостоятельного одобрения не будет — решает человек. {who}: " + reason + ".",
         author_kind="hub",
+    )
+    # #2052: отказ назван в ленте, и владелец записан в той же транзакции.
+    prefix = f"{code}: "
+    await verdict_owner.hand_to_human(
+        db,
+        task_id,
+        verdict_owner.reason_of(
+            code, reason[len(prefix) :] if reason.startswith(prefix) else reason
+        ),
+        generation=generation,
     )
     await db.commit()

@@ -1592,6 +1592,83 @@ async def test_the_act_readiness_report_is_a_pure_read(
     assert await _everything(db) == before
 
 
+async def test_cap_handoff_blocks_candidate_readiness(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
+):
+    # AC-1 (#2046): действительный concur, потолка класса нет, cap-handoff
+    # активен: кандидат blocked с кодом steward_cap_handoff, а не ready.
+    # Readiness спрашивает именно cap_refusal и ничего не пишет.
+    from hub.services import steward_advisor
+    from tests.steward_cap_support import hand_to_the_human_by_the_cap
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project = await _project(db, "cap-ready-2046", {"verdict": "steward"})
+    free = await _judged_task(db, project, "R1", "concur")
+    capped = await _judged_task(db, project, "R1", "concur")
+    await hand_to_the_human_by_the_cap(db, monkeypatch, capped, project)
+
+    asked: list[str] = []
+    real_cap = steward_advisor.cap_refusal
+    real_refusal = steward_advisor.advisor_refusal
+
+    async def _cap(*args, **kwargs):
+        asked.append("cap_refusal")
+        return await real_cap(*args, **kwargs)
+
+    async def _refusal(*args, **kwargs):
+        asked.append("advisor_refusal")
+        return await real_refusal(*args, **kwargs)
+
+    monkeypatch.setattr(steward_advisor, "cap_refusal", _cap)
+    monkeypatch.setattr(steward_advisor, "advisor_refusal", _refusal)
+
+    before = await _everything(db)
+    writes: list[str] = []
+    real_execute = aiosqlite.Connection.execute
+
+    def _watch(self, sql, *args, **kwargs):
+        if sql.lstrip().split(" ", 1)[0].upper() in (
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "REPLACE",
+        ):
+            writes.append(sql[:80])
+        return real_execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", _watch)
+    resp = await client.get("/api/projects/cap-ready-2046/effective-policy")
+    monkeypatch.setattr(aiosqlite.Connection, "execute", real_execute)
+    assert resp.status_code == 200
+    rest = resp.json()
+    assert writes == [] and await _everything(db) == before
+    assert "advisor_refusal" not in asked and "cap_refusal" in asked
+
+    report = rest["steward"]["readiness"]
+    by_task = {c["task_id"]: c for c in report["candidates"]}
+    assert by_task[free]["state"] == "ready"
+    assert by_task[capped]["state"] == "blocked"
+    assert [r["code"] for r in by_task[capped]["reasons"]] == ["steward_cap_handoff"]
+    assert report["candidate_counts"] == {"ready": 1, "blocked": 1, "unknown": 0}
+
+    async def _via_client(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _via_client)
+    out = await mcp_server.hub_effective_policy("cap-ready-2046")
+    assert out.structuredContent["steward"]["readiness"] == report
+    text = _message(out)
+    assert f"#{capped} gen 1 blocked — steward_cap_handoff" in text
+    assert "candidates: ready 1, blocked 1, unknown 0" in text
+    argv = ["oc-hub", "effective-policy", "cap-ready-2046"]
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(cli, "_api", return_value=rest),
+    ):
+        cli.main()
+    assert capsys.readouterr().out.strip() == text.strip()
+
+
 async def test_the_steward_daily_cap_is_visible(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
 ):
@@ -1668,3 +1745,8 @@ async def test_the_steward_daily_cap_is_visible(
     ):
         assert cli.main() in (0, None)
     assert capsys.readouterr().out.strip() == mcp_text.strip()
+
+
+from tests.steward_empty_report_cases import (  # noqa: E402,F401  (#2082)
+    test_an_empty_report_blocks_candidate_readiness,
+)

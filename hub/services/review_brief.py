@@ -31,6 +31,7 @@ from typing import Any, Awaitable, Iterator
 from hub import commit_scope, config
 from hub.db import fetchall
 from hub import repository as repo
+from hub.services.outcome_ownership import ownership_for_task
 from hub.services.outcomes import outcome_status_for_task
 from hub.integrations.registry import plugins
 from hub.cause_task_view import CauseTaskView
@@ -64,12 +65,14 @@ from hub.services import (
     review_evidence,
 )
 from hub.services.ac_tests import current_ac_test_results
-from hub.services.brief_failure import BriefFailure, failure_from
+from hub.services.evidence_states import downgrade_rules
+from hub.services.brief_failure import BriefFailure, failure_from, scrub_strings
 from hub.services.ci_report import PROVENANCE_NOTE, ci_report_state, stored_provenance
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
 from hub.services.rule_catalogue import rules_for_areas
 from hub.services.statement_freshness import statement_freshness
+from hub.services.task_diff import _is_missing
 from hub.services.test_existence import resolve_locators_at_ref
 
 log = logging.getLogger("hub")
@@ -194,7 +197,9 @@ async def build_call_sites_section(
         report = await asyncio.to_thread(call_sites.analyse, workspace, diff)
     except Exception as exc:  # noqa: BLE001 - advisory section, never fatal
         log.warning("call-site section failed for task #%s: %s", task_id, exc)
-        return CallSiteSection(status=call_sites.UNKNOWN, reason=f"failed: {exc}")
+        return CallSiteSection(
+            status=call_sites.UNKNOWN, reason=f"failed: {failure_from(exc).reason}"
+        )
 
     return CallSiteSection(
         status=report.status,
@@ -338,12 +343,18 @@ async def _ask_base_merge(db, task_view, net=None) -> BaseMergeState:
             # в «спросили, ответа не было» они не идут, решает вызывающий.
             raise
         log.warning("base-merge probe failed for #%s: %s", task_view.id, exc)
-        return BaseMergeState(state="unknown", reason=f"спросить не удалось: {exc}")
+        return BaseMergeState(
+            state="unknown", reason=f"спросить не удалось: {failure_from(exc).reason}"
+        )
     value = getattr(outcome, "value", str(outcome))
     if value == "mergeable":
         return BaseMergeState(state="clean", reason=_clean_merge_reason(detail))
     if value != "conflicting":
-        return BaseMergeState(state="unknown", reason=detail or value)
+        log.warning("base-merge probe for #%s: %s: %s", task_view.id, value, detail)
+        return BaseMergeState(
+            state="unknown",
+            reason=f"проба слияния не дала ответа ({value}) — подробности в логе хаба",
+        )
     # Имена файлов приезжают в детали от того же расчёта, что читает доставка;
     # разбираются здесь, чтобы читателю не пришлось разбирать строку глазами.
     files = [
@@ -479,13 +490,17 @@ async def profile_downgrade_of(
         return None
     state = "отчёт получен" if reported else "заказан"
     channel = dispatch.get("channel") or "cloud"
+    rules = downgrade_rules(reasons)
+    cited = f" (правило {', '.join(rules)})" if rules else ""
     return ProfileDowngradeView(
         reasons=reasons,
         state=state,
         channel=channel,
         dispatch_id=int(dispatch["id"]),
+        rules=rules,
         headline=(
-            f"Требовался deep — {state} lite (канал {channel}): " + "; ".join(reasons)
+            f"Требовался deep — {state} lite (канал {channel}){cited}: "
+            + "; ".join(reasons)
         ),
     )
 
@@ -656,6 +671,52 @@ def _observed_stacking_warning(task_id: int, branch: str, sha: str = "") -> str:
     return f"{message} [сверено {gate_observations.age_phrase(seen.age_minutes)}]"
 
 
+async def _locator_resolution(
+    db, task_id: int, task_view, ac_models, diff_base: dict, timer
+) -> list[ACLocatorResolution]:
+    """Locators of the test ACs at one ref; ``[]`` when there is no test AC."""
+    from hub import services
+
+    if not any(a.verifiable_by.value == "test" for a in ac_models):
+        return []
+    with timer.block("test_locators"):
+        ctx = await services.project_git_context(db, task_id)
+        try:
+            resolved = await resolve_locators_at_ref(
+                plugins.git_ops,
+                ctx.get("repo"),
+                ac_models,
+                submission_sha=task_view.submission_sha or "",
+                branch=task_view.branch or "",
+                base=diff_base.get("base")
+                or ctx.get("base_branch")
+                or config.PAIR_BASE_BRANCH,
+            )
+        except OSError as exc:
+            # #2002: git cannot even start in a missing cwd. "Not checked" is
+            # unknown, never a false "missing"; the brief still renders.
+            log.warning("locators for #%s: git could not run: %s", task_id, exc)
+            # The type alone lies: Python names the git executable in the same
+            # FileNotFoundError, so ask the directory (as task_diff._ask does).
+            gone = _is_missing(str(ctx.get("repo") or ""))
+            why = (
+                "not checked: the project working directory was not found"
+                if gone
+                else f"not checked: git could not run ({type(exc).__name__})"
+            )
+            resolved = [
+                {
+                    "ac_id": a.id,
+                    "locator": a.test_ref,
+                    "status": "unknown",
+                    "reason": why,
+                }
+                for a in ac_models
+                if a.verifiable_by.value == "test"
+            ]
+    return [ACLocatorResolution(**r) for r in resolved]
+
+
 async def build_review_brief(
     db,
     task_id: int,
@@ -758,21 +819,9 @@ async def build_review_brief(
     # (conftest.py, plugins, the tests themselves). Only pays the git reads
     # when the brief actually has test-AC to check.
     ac_models = [services.row_to_ac(r) for r in ac_rows]
-    locator_resolution: list[ACLocatorResolution] = []
-    if any(a.verifiable_by.value == "test" for a in ac_models):
-        with timer.block("test_locators"):
-            ctx = await services.project_git_context(db, task_id)
-            resolved = await resolve_locators_at_ref(
-                plugins.git_ops,
-                ctx.get("repo"),
-                ac_models,
-                submission_sha=task_view.submission_sha or "",
-                branch=task_view.branch or "",
-                base=diff_base.get("base")
-                or ctx.get("base_branch")
-                or config.PAIR_BASE_BRANCH,
-            )
-        locator_resolution = [ACLocatorResolution(**r) for r in resolved]
+    locator_resolution = await _locator_resolution(
+        db, task_id, task_view, ac_models, diff_base, timer
+    )
 
     # #572: does the branch still stand where the submission pinned it? Three
     # states, never collapsed — the reviewer must see "could not look" as
@@ -975,6 +1024,8 @@ async def build_review_brief(
         self_review_warning=self_review_warning,
         stacking_warning=stacking_warning,
     )
+    # The publication boundary (#2002): every string of the finished brief, once.
+    scrub_strings(brief)
     # Last act before the log line and the return: total_ms is read here.
     timings = timer.finish()
     brief.timings = timings
@@ -1075,6 +1126,7 @@ async def _late_reads(
         # #920: the rules this area already paid for, from category_checks.
         rule_rows = await rules_for_areas(db, list(task_view.affected_areas or []))
         outcome_status = await outcome_status_for_task(db, task_row)
+        outcome_ownership = await ownership_for_task(db, task_row)
         ci_evidence = await review_evidence.ci_evidence_state(db, sha_key)
         # #1589: результат ТЕКУЩЕГО поколения; предыдущие не показываются.
         notices = await path_notices.view_for_generation(db, task_id, generation)
@@ -1094,6 +1146,7 @@ async def _late_reads(
             repeated_categories=list(circle.repeated_categories),
         ),
         "outcome_status": outcome_status,
+        "outcome_ownership": outcome_ownership,
         "ci_evidence": ci_evidence,
         "path_notices": notices,
         "review_in_flight": in_flight,

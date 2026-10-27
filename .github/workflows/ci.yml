@@ -987,6 +987,70 @@ jobs:
         if: ${{ steps.scope.outputs.run == 'true' }}
         run: deploy/docker/compose_smoke.sh
 
+  # #1996: browser scenarios of the task card (tests/gui, Playwright, a real hub
+  # in CSRF-require mode). Serverside tests (TestClient) do not see JS, HTMX,
+  # autorefresh or how a browser submits a form; two button defects reached
+  # production that way on 2026-10-22.
+  #
+  # Optional until ten green runs in a row, and that is a decision of the owner,
+  # not of this file: `continue-on-error` at the JOB level keeps a red scenario
+  # from turning the workflow red (the delivery gate reads the workflow
+  # conclusion, ci_trust requires success). The job holds no secret and no
+  # report key: it runs the code of the branch. It needs nothing and nothing
+  # needs it, so it adds no minutes to the critical path of the suite.
+  # tests/gui is excluded from every other run (addopts --ignore in
+  # pyproject.toml), so no other job installs Chromium or sees these nodes.
+  gui:
+    name: GUI
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    env:
+      HAIPLANE_GUI_ARTIFACTS: gui-artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.18"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      # The browsers are keyed by OS and by the lock, which pins the Playwright
+      # version. The install below still runs on a hit: it is the one that puts
+      # the system libraries of the image in place, and it is quick when the
+      # browser is already there.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
+
+      - name: Install Chromium
+        run: uv run playwright install --with-deps chromium
+
+      - name: GUI scenarios
+        run: make gui-test
+
+      - name: Upload the failure evidence
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gui-failure-evidence
+          path: gui-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
   deploy:
     name: Deploy to server
     runs-on: ubuntu-latest

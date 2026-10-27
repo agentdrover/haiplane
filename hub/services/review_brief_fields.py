@@ -144,6 +144,10 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
         FULL_ONLY,
         "label of the outcome-hypothesis lifecycle; says nothing about this submission",
     ),
+    "outcome_ownership": (
+        FULL_ONLY,
+        "who holds the outcome promise (#2090); says nothing about this submission",
+    ),
     "redesign_decision": (
         FULL_ONLY,
         "planning label set at DoR, not evidence about the work",

@@ -30,12 +30,15 @@ from __future__ import annotations
 from hub.services.diff_scan import FILE_STARTS, scan_diff
 
 import logging
-from typing import Any
+import os
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 from hub import config
 from hub import repository as repo
 from hub.integrations.registry import plugins
 from hub.services import review_evidence
+from hub.services.brief_failure import scrub_strings
 
 log = logging.getLogger("hub")
 
@@ -46,6 +49,13 @@ UNREACHABLE_SHA = "unreachable_sha"  # the workspace does not carry that commit
 NO_WORKSPACE = "no_workspace"  # nowhere to look
 UNREADABLE = "unreadable"  # git was there and still could not answer
 MERGED_INTO_BASE = "merged_into_base"  # the commit is already in the base (#1239)
+WORKSPACE_MISSING = "workspace_missing"  # the project directory is not on disk (#2002)
+
+# Stated to the reader as is. The path is NOT in it: a card is read by people
+# who were never told where the hub keeps its clones. It goes to the log.
+WORKSPACE_MISSING_REASON = "дифф недоступен: рабочий каталог проекта не найден"
+
+_T = TypeVar("_T")
 
 
 def _blank(state: str, reason: str, **extra: Any) -> dict[str, Any]:
@@ -61,6 +71,69 @@ def _blank(state: str, reason: str, **extra: Any) -> dict[str, Any]:
         "base": "",
         **extra,
     }
+
+
+class _Unavailable(Exception):
+    """A git question could not even be asked; carries the finished answer."""
+
+    def __init__(self, blank: dict[str, Any]) -> None:
+        super().__init__(blank["state"])
+        self.blank = blank
+
+
+def _failer(sha: str, base: str, fallback: str) -> Callable[[str, str], dict[str, Any]]:
+    def fail(state: str, reason: str) -> dict[str, Any]:
+        return _blank(state, reason, sha=sha, base=base, fallback_command=fallback)
+
+    return fail
+
+
+def _is_missing(path: str) -> bool:
+    """Absent (or a parent is a file) — NOT "cannot look", which is another answer.
+
+    ``os.path.isdir`` folds every ``OSError`` into False, so a parent the hub may
+    not traverse read as a missing directory. Only these two errors mean absent.
+    """
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+async def _ask(
+    workspace: str, call: Awaitable[_T], fail: Callable[[str, str], dict[str, Any]]
+) -> _T:
+    """Await one git question; a directory that is not there is an answer (#2002).
+
+    ``proc.run`` raises instead of returning a non-zero rc when the cwd is
+    missing, and that ``FileNotFoundError`` used to travel up to the page — a
+    500 on the one card where the owner has to act. Python names the
+    EXECUTABLE in that error even when the directory is what is missing, so
+    the directory is asked about directly. The text of the exception carries
+    the path: it goes to the log, never into the answer.
+    """
+    try:
+        return await call
+    except OSError as exc:
+        log.warning("diff: git in %s could not run: %s", workspace, exc)
+        if _is_missing(workspace):
+            raise _Unavailable(
+                fail(WORKSPACE_MISSING, WORKSPACE_MISSING_REASON)
+            ) from exc
+        raise _Unavailable(
+            fail(
+                UNREADABLE,
+                f"git не запустился ({type(exc).__name__}) — подробности в логе хаба",
+            )
+        ) from exc
+
+
+def _publish(result: dict[str, Any]) -> dict[str, Any]:
+    """The one boundary of the diff view: reason strings only, never the code (#2002)."""
+    return scrub_strings(result)
 
 
 def _hunk_start(header: str) -> int | None:
@@ -228,7 +301,11 @@ async def _resolve_target(
     except Exception as exc:  # noqa: BLE001 - a card must render regardless
         log.warning("diff for #%s: no project context: %s", task_id, exc)
         return (
-            fail(NO_WORKSPACE, f"рабочую копию проекта определить не удалось: {exc}"),
+            fail(
+                NO_WORKSPACE,
+                "рабочую копию проекта определить не удалось "
+                f"({type(exc).__name__}) — подробности в логе хаба",
+            ),
             sha,
             base,
             "",
@@ -247,7 +324,12 @@ async def _resolve_target(
             fallback,
         )
 
-    exists = await plugins.git_ops.commit_exists(workspace, sha)
+    try:
+        exists = await _ask(
+            workspace, plugins.git_ops.commit_exists(workspace, sha), fail
+        )
+    except _Unavailable as unavailable:
+        return unavailable.blank, sha, base, workspace, fallback
     if exists is None:
         return (
             fail(
@@ -303,7 +385,11 @@ async def _empty_reason(
     honest empty diff, ``None`` here and the caller renders it), or the
     question could not be asked (``UNREADABLE``, never a silent empty screen).
     """
-    merged = await plugins.git_ops.commit_in_base_history(workspace, base, sha)
+    merged = await _ask(
+        workspace,
+        plugins.git_ops.commit_in_base_history(workspace, base, sha),
+        _failer(sha, base, fallback),
+    )
     if merged is None:
         return _blank(
             UNREADABLE,
@@ -328,6 +414,10 @@ async def _empty_reason(
 
 
 async def submission_files(db: Any, task_id: int) -> dict[str, Any]:
+    return _publish(await _submission_files(db, task_id))
+
+
+async def _submission_files(db: Any, task_id: int) -> dict[str, Any]:
     """Paths and line counts of the pinned submission (#825).
 
     The cheap half of ``submission_diff``: the change map needs to know which
@@ -337,7 +427,20 @@ async def submission_files(db: Any, task_id: int) -> dict[str, Any]:
     blank, sha, base, workspace, fallback = await _resolve_target(db, task_id)
     if blank is not None:
         return blank
-    rows = await plugins.git_ops.commit_diff_stat(workspace, base, sha)
+    try:
+        return await _files_of(workspace, base, sha, fallback)
+    except _Unavailable as unavailable:
+        return unavailable.blank
+
+
+async def _files_of(
+    workspace: str, base: str, sha: str, fallback: str
+) -> dict[str, Any]:
+    rows = await _ask(
+        workspace,
+        plugins.git_ops.commit_diff_stat(workspace, base, sha),
+        _failer(sha, base, fallback),
+    )
     if rows is None:
         return _blank(
             UNREADABLE,
@@ -368,12 +471,28 @@ async def submission_files(db: Any, task_id: int) -> dict[str, Any]:
 
 
 async def submission_diff(db: Any, task_id: int) -> dict[str, Any]:
+    return _publish(await _submission_diff(db, task_id))
+
+
+async def _submission_diff(db: Any, task_id: int) -> dict[str, Any]:
     """The diff of a task's pinned submission, or a stated reason for its absence."""
     blank, sha, base, workspace, fallback = await _resolve_target(db, task_id)
     if blank is not None:
         return blank
+    try:
+        return await _diff_of(workspace, base, sha, fallback)
+    except _Unavailable as unavailable:
+        return unavailable.blank
 
-    raw = await plugins.git_ops.commit_diff(workspace, base, sha)
+
+async def _diff_of(
+    workspace: str, base: str, sha: str, fallback: str
+) -> dict[str, Any]:
+    raw = await _ask(
+        workspace,
+        plugins.git_ops.commit_diff(workspace, base, sha),
+        _failer(sha, base, fallback),
+    )
     if raw is None:
         return _blank(
             UNREADABLE,

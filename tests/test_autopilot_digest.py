@@ -647,3 +647,24 @@ async def test_a_wholly_unjudged_queue_still_says_precision_is_uncomputable(
     flat = re.sub(r"\s+", " ", (await client.get("/digests")).text)
     assert "ни за окно 90 дней, ни за всё время" in flat
     assert "precision не считается вовсе" in flat, "нулевой разбор назван честно"
+
+
+async def test_another_projects_event_does_not_cancel_a_digest(
+    db: aiosqlite.Connection,
+):
+    """#1997: событие чужого проекта и событие без задачи пропускаются, а не
+    обрывают сбор: каждый активный проект получает свой дайджест."""
+    _a, feature_a = await _autopilot_project(db, "dg-first")
+    _b, feature_b = await _autopilot_project(db, "dg-second")
+    await repo.insert_event(
+        db, kind="task_approved", task_id=None, actor="policy", payload={}
+    )
+    t_a = await _policy_approved_task(db, feature_a, "first")
+    t_b = await _policy_approved_task(db, feature_b, "second")
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 2
+    mine = {}
+    for row in await repo.list_digests(db):
+        payload = json.loads(row["payload"])
+        mine[payload["project"]] = {a["task_id"] for a in payload["auto_approvals"]}
+    assert mine == {"dg-first": {t_a}, "dg-second": {t_b}}

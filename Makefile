@@ -11,7 +11,7 @@
 
 REPO ?= .
 
-.PHONY: setup hooks doctor test test-changed lint format types budget layers migration-steps security check check-fast
+.PHONY: setup hooks doctor test test-changed gui-test lint format types budget layers migration-steps security check check-fast
 
 # The first command in a fresh clone. Idempotent: safe to re-run.
 setup:
@@ -50,6 +50,15 @@ test:
 # Сводка по замерам и причины выбора — в scripts/changed_tests.py.
 test-changed:
 	uv run python scripts/changed_tests.py
+
+# #1996: браузерные сценарии карточки задачи (Playwright, настоящий хаб в режиме
+# CSRF require). Вне `test` и `check`: им нужен Chromium (CI ставит его в job
+# GUI; локально `uv run playwright install chromium` или, чтобы ничего не
+# скачивать, HAIPLANE_GUI_CHANNEL=chrome). Путь tests/gui назван явно — обычный
+# прогон его пропускает (addopts --ignore в pyproject.toml). Последовательно:
+# сценарии делят один стенд.
+gui-test:
+	uv run pytest -q tests/gui
 
 # Зелёный lint при красном шаге CI «Check formatting» стоил трёх пересдач за
 # сутки (#1080): форматирование не входило в эту цель, поэтому неотформатиро-

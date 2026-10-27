@@ -47,9 +47,11 @@ from hub.hub_instance import hub_base_url
 from hub.csrf import token_for_request as csrf_token_for_request
 from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
-from hub.services import card_c2
+from hub.services import card_actions, card_c2, card_sheet
 from hub.services import chat_pair as chat_pair_svc
-from hub.services import effective_policy, policy_change, project_policy
+from hub.services import ci_trust_warning, effective_policy, policy_change
+from hub.services import project_policy
+from hub.services.refusal_publish import published_update
 from hub.services import triage_inbox
 from hub.services.project_policy import FREEZE_REFUSED
 from hub.services import steward_dispatch
@@ -1152,6 +1154,8 @@ async def web_projects(
         except Exception:
             log.exception("review cost settings failed for project %s", r["id"])
             review_cost[int(r["id"])] = None
+    # #2027: подтверждается ли CI проекта (сбой чтения - блок unknown).
+    ci_trust_blocks = await ci_trust_warning.blocks_by_project(_db(request), rows)
     # #1412: кнопка запуска исполнителя выписывает код implementer от имени
     # человека — форма несёт CSRF, как и выдача кода руками (#961, #990).
     csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
@@ -1190,6 +1194,7 @@ async def web_projects(
             # ничем не лучше пункта, который отказывает.
             "review_reach": reach,
             "review_cost": review_cost,
+            "ci_trust_blocks": ci_trust_blocks,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
@@ -2943,6 +2948,9 @@ async def _web_task_detail_page(
     ]
     pr_repo, delivered_sha, live_checks = await _card_live_checks(db, task_id)
 
+    c2_view = await card_c2.card_context(
+        db, dict(row), task, decision_brief, delivery, review_in_flight
+    )
     return _card_response(
         request,
         {
@@ -2959,17 +2967,16 @@ async def _web_task_detail_page(
             "machine_review": machine_review,
             "steward_judgement": steward_judgement,
             "decision_brief": decision_brief,
-            "card_c2": await card_c2.card_context(
-                db, dict(row), task, decision_brief, delivery, review_in_flight
+            "card_c2": c2_view,
+            "card_actions": card_actions.for_page(
+                dict(row), c2_view, machine_review, decision_brief
             ),
             "executor_runs": executor_runs,
             "repair_offered": repair_offered,
             "repair_reason": repair_reason,
             "merge_offered": merge_offered,
-            # #1712: хосты, на которые карточка open-задачи предлагает запуск.
-            "slot_hosts": await card_hosts(db, task_id)
-            if task.status.value == "open"
-            else [],
+            # #1712, #1998: хосты, на которые карточка предлагает запуск (open и круг починки).
+            "slot_hosts": await card_hosts(db, dict(row)),
             # #1817: плашка запуска исполнителя (слот или облако).
             "launch_plaque": await launch_feedback.plaque(db, task_id),
             "finding_touch": finding_touch,
@@ -3194,6 +3201,7 @@ async def web_create_task(
 
 
 @router.post("/tasks/{task_id}/web-approve")
+@card_sheet.sheet_action("approve")
 async def web_approve_task(
     task_id: int,
     request: Request,
@@ -3249,6 +3257,7 @@ async def web_approve_task(
 
 
 @router.post("/tasks/{task_id}/web-reject")
+@card_sheet.sheet_action("reject")
 async def web_reject_task(
     task_id: int,
     request: Request,
@@ -3359,6 +3368,12 @@ async def web_send_message(
 
 
 @router.post("/tasks/{task_id}/web-decide")
+@card_sheet.sheet_action(
+    "decide",
+    note=lambda db, task_id, form: _decide_delivery_note(
+        db, task_id, str(form.get("pr_disposition", "")).strip()
+    ),
+)
 async def web_decide_task(
     task_id: int,
     request: Request,
@@ -3375,10 +3390,12 @@ async def web_decide_task(
     # inbox" needs its own flag rather than inbox_project being present.
     from_inbox: bool = Form(False),
     inbox_project: str = Form(""),
+    confirm_no_job: bool = Form(False),
 ):
     _require_human_web(request)
     try:
         body = TaskDecide(
+            confirm_no_job=confirm_no_job,
             action=action,
             instructions=instructions,
             decision_summary=decision_summary,
@@ -3415,7 +3432,8 @@ async def _latest_alert(db: aiosqlite.Connection, task_id: int, prefix: str) -> 
         row = dict(u)
         content = str(row.get("content") or "")
         if row.get("kind") == "alert" and content.startswith(prefix):
-            found = content
+            # Узнаём по сырому тексту, показываем очищенный (#2006).
+            found = str(published_update(row)["content"])
     return found
 
 
@@ -3620,6 +3638,7 @@ def _is_verdict_refusal(exc: HTTPException) -> bool:
 
 
 @router.post("/tasks/{task_id}/web-review-verdict")
+@card_sheet.sheet_action("verdict")
 async def web_review_verdict(
     task_id: int,
     request: Request,
@@ -3743,6 +3762,7 @@ async def web_force_complete_task(
 
 
 @router.post("/tasks/{task_id}/web-return-to-work")
+@card_sheet.sheet_action("return")
 async def web_return_to_work(
     task_id: int,
     request: Request,

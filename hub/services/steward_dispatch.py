@@ -51,7 +51,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
-from hub.services import steward_cap
+from hub.services import steward_cap, verdict_owner
 from hub.services.steward_review_gate import (  # noqa: F401 - реэкспорт
     DEFER_KIND_REVIEW,
     EVENT_DEFERRED,
@@ -104,6 +104,8 @@ RUN_REFUSED = "refused"
 # мелочь формулировки. Ни один читатель терминальные статусы не
 # перечисляет — проверено поимённо, все сравнивают только с RUN_OPEN.
 RUN_NEVER_STARTED = "never_started"
+#: Статусы закрытия, после которых суждения не будет и вердикт у человека.
+_RUN_ENDS_WITHOUT_ANSWER = frozenset({RUN_TIMEOUT, RUN_NEVER_STARTED})
 
 # The lock is taken BEFORE the provider is called and holds this marker until
 # the real agent id replaces it. Anything else would pay first and claim
@@ -373,14 +375,21 @@ async def order_run(
         return None
 
     ordered_model = (model or config.STEWARD_MODEL or "").strip()
+    # #1986: пара «двойной чистоты» фиксируется ЗДЕСЬ, до судьи и советника;
+    # отчёт, пришедший после заказа, режим этого поколения не включает.
+    frozen_pair = ""
+    if kind == KIND_VERDICT:
+        from hub.services.steward_double_clean import freeze_pair
+
+        frozen_pair = await freeze_pair(db, task_id, generation)
     # The order and its uniqueness are one statement: a check-then-insert
     # would be exactly the race the index exists to lose.
     try:
         cursor = await db.execute(
             "INSERT INTO steward_runs "
             "(task_id, generation, kind, status, model, project_id, created_at, "
-            "deadline_at) VALUES (?, ?, ?, ?, ?, ?, ?, "
-            "datetime('now', ?))",
+            "deadline_at, double_clean_pair) VALUES (?, ?, ?, ?, ?, ?, ?, "
+            "datetime('now', ?), ?)",
             (
                 task_id,
                 generation,
@@ -393,6 +402,7 @@ async def order_run(
                 # работу судьи. Рабочее окно поставит захват слота (#1181).
                 # У советника срок один на старт и работу (#1601).
                 f"+{deadline_min if deadline_min is not None else config.STEWARD_START_DEADLINE_MIN} minutes",
+                frozen_pair,
             ),
         )
     except aiosqlite.IntegrityError:
@@ -421,6 +431,10 @@ async def order_run(
             **({"why": why} if why else {}),
         },
     )
+    if kind in (KIND_VERDICT, KIND_ADVISOR):
+        # #2052: передача человеку по потолку или пропуску временная; новый
+        # заказ на этой сдаче снимает её, и маршрут снова называет стюарда.
+        await verdict_owner.reclaim_for_steward(db, task_id, generation)
     await db.commit()
     log.info("steward run ordered: task #%s gen %s kind %s", task_id, generation, kind)
     rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run_id,))
@@ -534,6 +548,18 @@ async def close_run(
             "reason": reason,
         },
     )
+    if status in _RUN_ENDS_WITHOUT_ANSWER and run.get("kind") in (
+        KIND_VERDICT,
+        KIND_ADVISOR,
+    ):
+        # #2052: прогон кончился без суждения - решать больше некому, кроме
+        # человека; код статуса становится кодом маршрута.
+        await verdict_owner.hand_to_human(
+            db,
+            int(run["task_id"]),
+            verdict_owner.reason_of(status, reason),
+            generation=int(run["generation"]),
+        )
     await db.commit()
     if run.get("kind") == KIND_ADVISOR:
         # Локальный советник (#1649): за закрытой строкой может стоять живое
@@ -996,6 +1022,14 @@ async def _close_generation_as_refused(
             "kind": kind,
         },
     )
+    if kind in (KIND_VERDICT, KIND_ADVISOR):
+        # #2052: генерация закрыта отказом, заказа не будет - вердикт за человеком.
+        await verdict_owner.hand_to_human(
+            db,
+            task_id,
+            verdict_owner.reason_of(RUN_REFUSED, f"{reason}: {detail}"),
+            generation=generation,
+        )
     await db.commit()
 
 
@@ -1335,6 +1369,7 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
         apply_advisor_outcomes,
         order_due_advisors,
     )
+    from hub.services.steward_changes_apply import apply_judge_changes_requests
     from hub.services.steward_judgement import stamp_judgement_usage
     from hub.services.steward_shadow import check_escalation_corridor, start_due_runs
 
@@ -1367,4 +1402,12 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     await start_due_runs(db)
     # Применение approve судьи — только после ответа советника и только в act.
     await apply_advisor_outcomes(db)
+    # #2053: возврат на доработку судьи применяется тем же проходом, без советника.
+    await apply_judge_changes_requests(db)
     await check_escalation_corridor(db)
+    # #2052: сторож «забыли записать» - после заказов, чтобы заказ этого
+    # прохода уже считался живым исполнителем. Сбой не роняет проход.
+    try:
+        await verdict_owner.hand_over_stalled_reviews(db)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("verdict owner watchdog failed: %s", exc)

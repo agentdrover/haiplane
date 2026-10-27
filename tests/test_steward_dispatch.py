@@ -3601,3 +3601,74 @@ async def test_the_poller_door_checks_the_persisted_dor_evidence(
     from tests.dor_evidence_support import check_poller_door
 
     await check_poller_door(db, monkeypatch, _project_with_policy, _ready_draft)
+
+
+async def test_a_failed_apply_hands_the_verdict_to_a_human_with_the_reason(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    """#2051 AC-1: сбой проверки потолка при применении approve - событие, маршрут к человеку."""
+    from hub.services import steward_advisor, steward_apply
+    from hub.services.steward_shadow import mode_report
+    from hub.services.verdict_route import verdict_route
+    from tests.steward_double_clean_support import build_case, feed, policy_of
+
+    async def act(_db):
+        return {**await mode_report(_db), "effective": "act"}
+
+    monkeypatch.setattr("hub.services.steward_shadow.mode_report", act)
+    case = await build_case(
+        db,
+        monkeypatch,
+        "apply-failed-route",
+        policy=policy_of("r2", None, None),
+        risk="R2",
+    )
+    before = await verdict_route(db, case.task_id)
+    assert (before.decider, before.final) == ("steward", "steward"), before.reason
+
+    async def ceiling_check_fails(*_args, **_kwargs):
+        raise FileNotFoundError(
+            "/srv/clone-gone/policy.json via "
+            "https://reviewer:" + "unregisteredpass" + "@forge.invalid/repo.git"
+        )
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(steward_apply, "ceiling_gate", ceiling_check_fails)
+        assert await steward_advisor.apply_advisor_outcomes(db) == 1
+
+    judgement = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
+    assert judgement["advisor_outcome"] == "failed"
+    # Сбой проверки не выдаётся за «класс выше потолка».
+    detail = judgement["advisor_outcome_detail"]
+    assert detail.startswith("ceiling_check_failed: "), detail
+    assert "class_above_policy_ceiling" not in detail
+
+    events = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind='steward_apply_failed' AND task_id=?",
+        (case.task_id,),
+    )
+    assert len(events) == 1
+    payload = json.loads(dict(events[0])["payload"])
+    assert payload["generation"] == 1
+    assert payload["judgement_id"] == judgement["id"]
+    assert payload["code"] == "ceiling_check_failed"
+    assert payload["exception_type"] == "FileNotFoundError"
+    assert "exception_text" not in payload
+    assert payload["reason"] == detail
+    # Событие - публикационная граница (#2006): ни пути, ни учётных данных,
+    # ни в базе, ни в /api/events; карточка текста исключения не получает (#2040).
+    served = (await client.get("/api/events?since=0")).text
+    for surface in (
+        json.dumps(payload, ensure_ascii=False),
+        served,
+        await feed(db, case.task_id),
+    ):
+        for leaked in ("clone-gone", "unregisteredpass", "reviewer:"):
+            assert leaked not in surface, (leaked, surface[:200])
+    assert "steward_apply_failed" in served
+
+    route = await verdict_route(db, case.task_id)
+    assert (route.decider, route.final) == ("human", "human"), route
+    assert route.code == "steward_apply_failed"
+    assert "ceiling_check_failed" in route.reason

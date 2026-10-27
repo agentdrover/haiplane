@@ -35,7 +35,7 @@
     },
     {
       "path": "hub/integrations/git_ops.py",
-      "measured": 4672,
+      "measured": 4708,
       "max": 4906,
       "removed_by": "unclaimed"
     },
@@ -53,8 +53,8 @@
     },
     {
       "path": "hub/models.py",
-      "measured": 4992,
-      "max": 5249,
+      "measured": 5281,
+      "max": 5546,
       "removed_by": "unclaimed"
     },
     {
@@ -65,7 +65,7 @@
     },
     {
       "path": "hub/repository.py",
-      "measured": 6586,
+      "measured": 6639,
       "max": 6916,
       "removed_by": "unclaimed"
     },
@@ -83,19 +83,19 @@
     },
     {
       "path": "hub/services/lifecycle.py",
-      "measured": 6693,
-      "max": 7028,
+      "measured": 7054,
+      "max": 7379,
       "removed_by": "unclaimed"
     },
     {
       "path": "hub/services/orchestration.py",
-      "measured": 6595,
+      "measured": 6653,
       "max": 6935,
       "removed_by": "unclaimed"
     },
     {
       "path": "hub/services/review_dispatch.py",
-      "measured": 7900,
+      "measured": 7959,
       "max": 8295,
       "removed_by": "unclaimed"
     },
@@ -113,8 +113,8 @@
     },
     {
       "path": "hub/web.py",
-      "measured": 4399,
-      "max": 4619,
+      "measured": 4628,
+      "max": 4860,
       "removed_by": "unclaimed"
     },
     {

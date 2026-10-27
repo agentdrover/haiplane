@@ -42,6 +42,7 @@ from hub.integrations import cursor_cloud
 from hub.services import project_policy
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
 from hub.services.model_family import same_family
+from hub.services.refusal_publish import safe_detail
 from hub.services.steward_judgement_sample import (
     steward_escalate_body_sample,
     steward_judgement_body_sample,
@@ -740,15 +741,16 @@ _NO_JUDGE_MARK = "[стюард: заказ #{run_id}]"
 def _provider_answer(denial: object) -> str:
     """Что ответил провайдер, одной строкой — то, чего в отказе не хватало.
 
-    Ключей и токенов здесь нет по устройству: ``Refusal`` несёт статус, код
-    ошибки и обрезанный фрагмент ТЕЛА ОТВЕТА — то есть что провайдер сказал
-    про наш запрос, а не то, чем запрос был подписан.
+    Публикуется статус, код ошибки и ВИД отказа транспорта; сырой текст
+    исключения и тело ответа остаются в журнале (``cursor_cloud``), потому что
+    в них бывают пути сервера (#2006).
     """
     if denial is None:
         return "ответа не было"
     status = int(getattr(denial, "status", 0) or 0)
     code = str(getattr(denial, "code", "") or "").strip() or "без кода"
-    detail = str(getattr(denial, "detail", "") or "").strip()[:200]
+    # #2006: вид отказа (имя класса исключения), не сырой текст и не тело ответа.
+    detail = "" if status else safe_detail(denial)
     answer = f"HTTP {status} {code}" if status else code
     return f"{answer} ({detail})" if detail else answer
 
@@ -1287,6 +1289,34 @@ async def effective_mode(db: aiosqlite.Connection) -> str:
         codes = [code for code, _ in refusals]
         await _announce_refusal_once(db, codes, refusals)
     return granted
+
+
+async def act_granted_now(db: aiosqlite.Connection) -> bool:
+    """Выдан ли ``act`` СЕЙЧАС - чистое чтение для write-транзакции (#2040).
+
+    ``effective_mode`` закрепляет ошибочные одобрения и пишет объявление отказа
+    с коммитом: внутри транзакции записи вердикта это недопустимо (коммит
+    закрыл бы её посреди записи). Здесь тот же расчёт выдачи -
+    ``configured_mode`` и ``act_refusals`` через ``granted_mode`` - без записи,
+    без коммита и без сети. Не ``act`` в окружении или любой невыполненный
+    критерий выхода - ``False``.
+    """
+    return not await act_unmet_now(db)
+
+
+async def act_unmet_now(db: aiosqlite.Connection) -> list[str]:
+    """Что мешает ``act`` СЕЙЧАС - тем же чистым чтением; пусто - ``act`` выдан (#2040).
+
+    Строки для журнала хаба: режим окружения либо код и подробности каждого
+    невыполненного критерия выхода. В карточку они не идут.
+    """
+    asked = configured_mode()
+    if asked != "act":
+        return [f"STEWARD_MODE={asked}"]
+    refusals = await act_refusals(db)
+    if granted_mode(asked, refusals) == "act":
+        return []
+    return [f"{code}: {detail}" for code, detail in refusals]
 
 
 def granted_mode(asked: str, refusals: list[tuple[str, str]]) -> str:

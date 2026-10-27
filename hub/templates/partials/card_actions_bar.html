@@ -1,0 +1,21 @@
+{# Нижняя панель действий карточки (#1813). Часть замещаемого фрагмента
+   #c2-live: у неё нет полей ввода и форм - только якоря на листы. Главная
+   кнопка - первая в списке (рекомендованная, если справка её назвала; иначе
+   порядок нейтральный и «рекомендовано» не пишется). Без скрипта якорь
+   открывает лист через :target; со скриптом - классом is-open. #}
+{% set ca = card_actions %}
+{% if ca.actions or ca.more %}
+<nav class="c2-bar" data-c2-bar aria-label="Действия по карточке">
+    {% for a in ca.actions %}
+    <a class="c2-bar-btn c2-bar-btn--{{ a.tone }}" href="#{{ a.sheet }}" data-sheet="{{ a.sheet }}" role="button"{% if a.recommended %} aria-describedby="c2-rec-h"{% endif %}>
+        {{ a.label }}{% if a.recommended %}<span class="c2-bar-mark">рекомендовано</span>{% endif %}
+    </a>
+    {% endfor %}
+    {% if ca.more %}
+    <details class="c2-more" id="c2-more">
+        <summary aria-label="Другие действия">&#8943;</summary>
+        <div class="c2-more-menu">{% for a in ca.more %}<a href="#{{ a.sheet }}" data-sheet="{{ a.sheet }}" role="button">{{ a.label }}</a>{% endfor %}</div>
+    </details>
+    {% endif %}
+</nav>
+{% endif %}

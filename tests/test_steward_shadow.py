@@ -3507,7 +3507,11 @@ async def _act_granted(monkeypatch) -> None:
     async def _granted(_db):
         return "act"
 
+    async def _granted_now(_db):  # #2040: the write reads the global act grant
+        return True
+
     monkeypatch.setattr(sh, "effective_mode", _granted)
+    monkeypatch.setattr(sh, "act_granted_now", _granted_now)
     monkeypatch.setattr(config, "STEWARD_MODE", "act")
 
 
@@ -4816,7 +4820,11 @@ async def test_a_local_advisor_pair_is_applied_and_counted_like_a_cloud_one(
     async def _granted(_db):
         return "act"
 
+    async def _granted_now(_db):  # #2040: the write reads the global act grant
+        return True
+
     monkeypatch.setattr(sh, "effective_mode", _granted)
+    monkeypatch.setattr(sh, "act_granted_now", _granted_now)
     assert await apply_advisor_outcomes(db) == 3
     assert dict(await repo.get_task(db, concur))["review_verdict"] == "approved"
     assert (await _judge_row(db, concur))["advisor_outcome"] == "approved"

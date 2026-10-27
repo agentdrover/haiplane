@@ -25,6 +25,7 @@ from hub import repository as repo
 from hub.db import (
     deserialize_str_list,
     fetchall,
+    committed_if_own,
     get_breadcrumb,
     log_activity,
     write_transaction,
@@ -151,25 +152,15 @@ async def project_git_context(
         ctx["gh_repo"] = d["repo"].strip()
     if (d.get("default_branch") or "").strip():
         ctx["base_branch"] = d["default_branch"].strip()
-    # #1146: форж едет тем же путём, что repo и base_branch, и по той же
-    # причине — это пер-проектная величина того же времени жизни.
-    #
-    # И по тому же ПРАВИЛУ: ключ появляется только там, где проект что-то
-    # объявил. Безусловный ключ ломал бы инвариант #604 — ненастроенный проект
-    # не отдаёт НИ ОДНОГО ключа, и git_ops падает на окружение. Форж без
-    # репозитория и означать нечего: пустое имя читается как «спроси у
-    # настроенного адаптера», то есть ровно как прежнее поведение.
+    # #1146: the forge travels like repo and base_branch, and by the same rule
+    # (#604): a key appears only where the project declared something; an
+    # unconfigured project yields no keys and git_ops falls back to env. An empty
+    # forge name reads as "ask the configured adapter".
     if "gh_repo" in ctx:
         ctx["forge"] = forge_of(row)
-    # No special case for the default project (#604). One existed here —
-    # an unconditional empty context, written when default had no real
-    # fields and "behave like the pre-project hub" was the only correct
-    # answer. Once the owner configured a real repo and workspace (#602),
-    # that compatibility silently threw the configuration away, and every
-    # consumer of ctx["repo"] — locator resolution, the call-sites section,
-    # submission-SHA pinning — stayed blind next to a live clone. The
-    # field-wise omission above IS the legacy behaviour: an unconfigured
-    # project contributes no keys and git_ops falls back to env.
+    # No special case for the default project (#604): once the owner configured a
+    # real repo and workspace (#602), an unconditional empty context threw that
+    # away. The field-wise omission above IS the legacy behaviour.
     return ctx
 
 
@@ -209,37 +200,21 @@ def machine_review_required(task: dict[str, Any], project_policy: str = "auto") 
     work_type = (task.get("work_type") or "feature").strip()
     if work_type in ("docs", "chore", "spike"):
         return False
-    # Size no longer excuses a change to code (#806). The exemption made sense
-    # while a human on the gate read the diff himself — a small change could be
-    # eyeballed. The owner does not read code, so "small task" now means
-    # "nobody looked at all": #522 was S, touched orchestration.py, mcp_server.py
-    # and a template, and reached the human gate with no report and no notice
-    # that one was missing. Size is also the author's own estimate, and an
-    # exemption from oversight resting on self-assessment is exactly what #582
-    # ruled out for risk class.
+    # Size does not excuse a change to code (#806): the owner does not read code,
+    # so "small task" would mean "nobody looked"; size is the author's own
+    # estimate, which #582 ruled out as a basis for an oversight exemption.
     return True
 
 
 # --- Reports that carry no evidence the harness ran (#841) -------------
 #
-# 60 of the 103 reports in the 90-day window on 2026-08-21 were the same
-# shape: raw_count 0, no findings on either side, no tokens, one agent —
-# all 60 landed inside 36 minutes on 2026-08-19 (harness v7). #750 named
-# that shape at intake and left the row in place on purpose: a stamp is
-# still evidence of what a client did. What it did NOT do is change how
-# the row reads afterwards, and downstream both the gate and the practice
-# metrics counted it as a review that ran and found nothing.
+# Zero candidates is absence of data, not absence of findings. Evidence is taken
+# as WIDELY as the stored columns allow: a claimed candidate, an adjudicated
+# finding, a self-counted token, a provider-billed token (#828) or more than one
+# agent means something ran; a report with none of them is "no data" (#750).
 #
-# Zero candidates is absence of data, not absence of findings. Evidence is
-# taken as WIDELY as the stored columns allow — any one of a claimed
-# candidate, an adjudicated finding, a self-counted token, a provider-billed
-# token (#828) or more than one agent means something ran. Only a report
-# with none of them is "no data", so an honest cheap run that found nothing
-# but counted its cost still reads as a review.
-#
-# The condition is written ONCE. Both the gate below and the two metric
-# aggregates use this fragment; a copy would drift, and the whole point is
-# that the gate and the number agree on what a review is.
+# The condition is written ONCE: the gate and the two metric aggregates share
+# this fragment, so they agree on what a review is.
 #
 # #1361: a CARRIED report (``carried_from_review_id``) is evidence by
 # construction — it is only ever made from a report that passed this very
@@ -319,22 +294,17 @@ async def machine_review_gap(
     if mr["submission_generation"] != generation:
         return "machine-review устарел (работа пересдана) — прогоните харнесс заново"
     if mr["self_reviewed"] and config.REVIEW_SELF_APPROVE != "allow":
-        # #728, and the same substitution as the line below: the requirement is
-        # that an INDEPENDENT review ran. This is the queue-passing use the
-        # statement quotes — "для аудита слабо, для пропуска в очередь — ок" —
-        # and it worked because nothing here asked who wrote the report. Solo
-        # mode is the one place that answer is allowed to be "the author".
+        # #728: the requirement is that an INDEPENDENT review ran; solo mode is the
+        # one place where the answer may be "the author".
         return (
             "machine-review подан тем же принципалом, который выполнял "
             "задачу: отчёт о собственной работе не заменяет независимое "
             "ревью — прогоните харнесс под другим принципалом"
         )
     if not report_has_evidence(mr):
-        # The requirement is that a review RAN, and this row is the record of
-        # one that shows no sign of having run. Saying "satisfied" here is the
-        # substitution #750 warned about, one step further down the pipe: in
-        # 'warn' it silences the panel line the reviewer reads instead of the
-        # diff, and in 'require' it would buy an APPROVED verdict outright.
+        # The requirement is that a review RAN, and this row shows no sign of it:
+        # "satisfied" would silence the panel line in 'warn' and buy an APPROVED
+        # verdict in 'require' (#750).
         return (
             "machine-review без данных: ноль кандидатов, ноль находок, "
             "ни одного посчитанного токена — отчёт есть, исполнения не видно "
@@ -343,17 +313,11 @@ async def machine_review_gap(
     return None
 
 
-# What the gate said the findings turned out to be (#877, on #876's data).
-#
-# ``precision`` is the share of judged findings that were REAL. A defect the
-# owner chose not to fix is still a defect the reviewer found, so ``wont_fix``
-# counts as a hit; only ``false_positive`` — "the described defect is not in
-# the code" — counts against it. ``resolution_rate`` is narrower and is the
-# number BugBot publishes: the share that actually got fixed.
-#
-# Both are computed ONLY over judged findings. A confirmed finding nobody
-# judged is not a miss and not a hit, it is an unanswered question, and it is
-# reported beside the rates rather than folded into either (#519, #841).
+# What the gate said the findings turned out to be (#877, from #876's data).
+# precision is the share of judged findings that were REAL: wont_fix
+# counts as a hit, only false_positive counts against. resolution_rate is
+# the share actually fixed. Both are computed ONLY over judged findings;
+# unjudged confirmed ones are reported beside the rates (#519, #841).
 _REAL = ("fixed", "wont_fix")
 
 
@@ -464,23 +428,11 @@ async def _disposition_metrics(
     # Never a share: "0 of 90 judged" and "90 of 90 judged" are the states a
     # reader needs, and a percentage hides which one this is.
     result["reports_unjudged"] = reports_counted - reports_judged
-    # What is actually WAITING, from the same query the queue page reads
-    # (#1038). This used to subtract one sum from another — all confirmed
-    # findings in the window minus all dispositions in it — and that answered a
-    # different question in two ways at once. It counted the findings of
-    # SUPERSEDED reports, which describe code a resubmission has already
-    # replaced and which nobody should be asked to judge; and it let a
-    # judgement filed against a stale report cancel out a live finding, because
-    # totals do not know which finding they came from. The number will read
-    # LOWER than before on the same data. That is the correction, not a
-    # regression: it stopped counting work that does not exist.
-    # Deliberately NOT windowed, unlike every rate above it. Precision is a
-    # flow — how the reports of a period turned out — but "what is waiting" is
-    # a stock, and a backlog does not expire: a finding nobody answered in
-    # April is still unanswered today. Windowing it would hide exactly the
-    # oldest items, and it would also split this number from the queue page it
-    # links to, which shows everything. The page says "за всё время" next to it
-    # so the reader is not told a windowed number by the header.
+    # What is actually WAITING, from the same query the queue page reads (#1038):
+    # superseded reports do not count and a judgement on a stale report cannot
+    # cancel a live finding. Deliberately NOT windowed: this is a stock, not a
+    # flow, and windowing would hide the oldest items and split the number from
+    # the queue page ("за всё время" stands next to it).
     unjudged = await repo.count_unjudged_findings(
         db,
         extra=scope.stock_where(task_column="mr.task_id", model_column="mr.model"),
@@ -741,28 +693,12 @@ async def _cycle_times(db: aiosqlite.Connection, scope: Scope) -> list[dict[str,
     """
     import statistics
 
-    # `completed_at` is the only completion clock (#517). Until #810 a row
-    # without it was filled in from `updated_at`, and that fallback was
-    # defended as a small bias — 0–13.3h against durations of 280–340h. The
-    # comparison used the fallback rows as their own yardstick. Split by
-    # source on production data (21.08.2026, 518 completed tasks), the two are
-    # not the same quantity: measured rows have a median of 0.83h for bug and
-    # 1.70h for feature, while the rows filled in from `updated_at` sit at
-    # 254h and 550h. So the blended median tracked the share of filled-in rows
-    # — bug 35 of 81, feature 55 of 174, refactor 11 of 13 — and reported that
-    # bugs take eight times longer than features when measured bugs are in
-    # fact the fastest rows in the table.
-    #
-    # The other half of that argument — dropping them costs three quarters of
-    # the sample — expired as the window rolled forward: 46 measured bugs and
-    # 119 measured features now stand on their own.
-    #
-    # Rows without the stamp are counted, never estimated. Their membership in
-    # the window is decided by `updated_at` only because nothing else about
-    # them is dated: that is a "recent enough to mention" test, never a
-    # duration. Every row that HAS a completion is filtered and measured by
-    # the same `completed_at` — #518 fixed a version where numerator and
-    # window used different clocks, and that fix stays.
+    # `completed_at` is the only completion clock (#517, #810): rows filled in from
+    # `updated_at` made the blended median track their share, not the work. Rows
+    # without the stamp are counted, never estimated; their window membership is
+    # decided by `updated_at` only as a "recent enough to mention" test, never as a
+    # duration. Every row WITH a completion is filtered and measured by the same
+    # `completed_at` (#518).
     in_completed, p_completed = scope.where("completed_at", task_column="id")
     in_updated, p_updated = scope.where("updated_at", task_column="id")
     cycle_rows = await fetchall(
@@ -780,40 +716,25 @@ async def _cycle_times(db: aiosqlite.Connection, scope: Scope) -> list[dict[str,
     for r in cycle_rows:
         wt = r["work_type"] or "feature"
         if r["no_completion"]:
-            # Checked before the start test below, so a row missing BOTH stamps
-            # is counted once, here. The two exclusions overlap almost entirely
-            # in today's data: on production every row with a bulk-stamped
-            # ready_at also predates completed_at, so unmeasurable_tasks now
-            # reads 0 across the board and no_completion_tasks absorbs those
-            # rows (chore 16, feature 44, docs 5, refactor 1). That is a change
-            # of label, not of exclusion — the #518 test below still guards the
-            # case it was written for: a future row that has a completion but a
-            # start stamped after it.
+            # Checked before the start test below, so a row missing BOTH stamps is
+            # counted once, here. The #518 test below still guards a row whose
+            # completion precedes its start.
             no_completion_by_type[wt] = no_completion_by_type.get(wt, 0) + 1
             continue
         if r["hours"] is None:
             continue
         if r["hours"] <= 0:
-            # A non-positive duration is not a fast task, it is a task whose
-            # start is unknown (#518). On production every such row carries the
-            # same ready_at — a bulk stamp applied to tasks that were already
-            # finished — so ready_at records when someone backfilled the
-            # column, not when the work became ready. Counting these as zero
-            # dragged the feature median from 70h down to 4h.
-            #
-            # Only equality occurs in the data; negatives were checked for and
-            # there are none. The condition stays <= so a clock skew that does
-            # produce one is excluded rather than averaged in.
+            # A non-positive duration is a task whose start is unknown (#518): a
+            # bulk-stamped ready_at records the backfill, not the work, and counted
+            # as zero it dragged the feature median from 70h to 4h. The condition
+            # stays <= so clock skew is excluded rather than averaged in.
             unmeasurable_by_type[wt] = unmeasurable_by_type.get(wt, 0) + 1
             continue
         by_type.setdefault(wt, []).append(r["hours"])
-    # Both exclusions are reported per row rather than folded into the median:
-    # a number that silently mixes measured with inferred values reads as fact.
-    # Same principle as n_excluded in #518 and findings_unaccounted in #519 —
-    # say what is not known instead of estimating it.
-    # A work type all of whose rows are excluded still gets a line: saying
-    # "5 tasks, no completion stamp, no median" is information, while omitting
-    # the row entirely reads as "no work of this type happened" (#518).
+    # Both exclusions are reported per row, not folded into the median: a number
+    # that mixes measured with inferred values reads as fact (#518, #519). A work
+    # type with all rows excluded still gets a line; omitting it reads as "no work
+    # of this type happened".
     # #1790: the queue and the path after the start, each over its own sample,
     # attached BESIDE the total — the keys above are not touched.
     split = await cycle_split(db, scope)
@@ -892,10 +813,7 @@ async def _practice_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str
         "COALESCE(SUM(json_array_length(findings_rejected)), 0) AS rejected_total, "
         "COALESCE(SUM(tokens_spent), 0) AS tokens_total, "
         "COALESCE(SUM(duration_ms), 0) AS duration_ms_total, "
-        # Counted over the reports that ran: a stamp has no cost to omit, and
-        # mixing the two made "73 of 103 reports did not count their tokens"
-        # read as a harness discipline problem when 60 of those 73 were rows
-        # where nothing ran at all (#841).
+        # Counted over the reports that ran: a stamp has no cost to omit (#841).
         f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} AND tokens_spent IS NULL "
         "THEN 1 ELSE 0 END) AS reports_without_tokens, "
         # Findings from the reports that actually reported a cost. The ratio
@@ -919,27 +837,17 @@ async def _practice_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str
     totals["carried_over"] = await _carried_over_count(db, scope)
     confirmed = totals["confirmed_total"] or 0
     raw = totals["raw_total"] or 0
-    # Cost per finding has to take its numerator and denominator from the same
-    # rows. Dividing all tokens by ALL confirmed findings mixed reports that
-    # reported a cost with reports that did not, and understated the result by
-    # 38% on production — 268846 against an honest 433623. A plausible number
-    # is worse than a missing one: nobody double-checks a figure that looks
-    # right (#516).
+    # Cost per finding takes numerator and denominator from the same rows; dividing
+    # all tokens by ALL confirmed findings understated it by 38% (#516).
     confirmed_with_tokens = totals["confirmed_with_tokens"] or 0
     totals["tokens_per_confirmed"] = (
         round(totals["tokens_total"] / confirmed_with_tokens)
         if confirmed_with_tokens
         else None
     )
-    # Filtration is the share of raw findings that did not survive. Computed
-    # against the self-reported raw_count it counted findings that were never
-    # adjudicated at all as successfully filtered noise — 75 of 192 on
-    # production, 39% of the sample, inflating the rate from 0.573 to 0.740.
-    # That flatters the harness in exactly the direction nobody questions.
-    #
-    # The denominator is now what was actually accounted for. The gap is
-    # reported beside it rather than hidden: a rate over an unstated fraction
-    # of the findings is the same kind of half-truth (#519).
+    # Filtration is the share of raw findings that did not survive. The denominator
+    # is what was actually accounted for (never-adjudicated findings are not
+    # "filtered noise"); the gap is reported beside it (#519).
     rejected = totals["rejected_total"] or 0
     adjudicated = confirmed + rejected
     totals["findings_unaccounted"] = max(raw - adjudicated, 0)
@@ -947,13 +855,10 @@ async def _practice_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str
         round(1 - confirmed / adjudicated, 3) if adjudicated else None
     )
 
-    # #828: the cost the PROVIDER billed, computed only over the reports that
-    # carry it. The harness's own figure is never substituted for a missing
-    # one: on the first live cross-model run the two disagreed by 34x
-    # (175 000 reported against 6 013 569 billed, #818), so standing one in
-    # for the other would repeat #516 — a plausible number nobody re-checks —
-    # with a far larger error. Both stay visible; neither is corrected into
-    # the other, because it is not yet established which one is wrong.
+    # #828: the cost the PROVIDER billed, only over reports that carry it. The
+    # harness's own figure is never substituted (the two disagreed 34x, #818; a
+    # plausible number nobody re-checks repeats #516); both stay visible, and
+    # neither is corrected into the other: it is not established which is wrong.
     confirmed_with_provider = totals["confirmed_with_provider"] or 0
     totals["provider_tokens_per_confirmed"] = (
         round(totals["provider_tokens_total"] / confirmed_with_provider)
@@ -1107,11 +1012,8 @@ async def _practice_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str
         "shift_left": await shift_left(db, scope),
         "model_declarations": model_declarations,
         "human_gates": human_gates,
-        # #1107: the shadow table lives BESIDE the other practice numbers,
-        # not in a corner of its own. The question it answers — would the
-        # steward have agreed, and where would it have been wrong — belongs
-        # next to override-rate and review outcomes, because that is where
-        # the owner already looks when deciding what to automate.
+        # #1107: the steward shadow table sits beside override-rate and review
+        # outcomes, where the owner looks when deciding what to automate.
         "steward_shadow": steward_shadow_metrics,
         "human_touches": human_touches,
         "review_outcomes": review_outcomes,
@@ -1701,11 +1603,9 @@ async def _human_gate_metrics(
         (*window_params, *kinds),
     )
 
-    # Project attribution (#747): project_id lives on epics only — children
-    # inherit it by walking up. A direct tasks.project_id join dropped almost
-    # every spike task into 'default' (spike-bo showed 1 decision instead of
-    # ~70). Reuse the SAME resolver the git conveyor uses, memoized per call,
-    # so 'pending → default' and 'outside any epic → default' stay one rule.
+    # Project attribution (#747): project_id lives on epics only, children inherit
+    # it by walking up; a direct tasks.project_id join dropped spike tasks into
+    # 'default'. Reuse the SAME resolver as the git conveyor, memoized per call.
     project_cache: dict[int, str] = {}
 
     async def project_slug_for(task_id: int | None) -> str:
@@ -2343,43 +2243,26 @@ async def switch_pair_workspace_to_task(
 # #392 produced (#424→#425→#426 on top of unmerged task-392).
 STACK_ADVISORY_STATUSES = ["running", "review"]
 
-# #1186, found by the machine review of this very change. The advisory set
-# above answers "is someone working on top of me right now", and two statuses
-# are enough for a hint. A DELIVERY condition asks a different question — "is
-# there work under mine that is not in the base branch yet" — and the first
-# version of this fix answered it with the advisory set, on the premise that a
-# task leaves running/review only by being delivered. That premise is false,
-# and its falseness re-opens the exact incident from a second door: a base that
-# escalated, or is being reworked, still owns an unmerged branch while sitting
-# in a status the walk could not see, and the dependent branch merged over it.
-#
-# Judged by status rather than by pipeline_merges on purpose: git has the final
-# word either way (a delivered base carries no commits outside the base branch,
-# so the probe answers "clear" on its own), and the status list only decides
-# whom to ask. Each member is here for a named reason:
-#   running / review — the original two: work in flight.
-#   ci_check         — between submission and review; the branch exists and is
-#                      pushed, which is the whole precondition for a stack.
-#   fix_requested    — rework after CHANGES_REQUESTED: the branch is alive and
-#                      about to grow more commits.
-#   needs_decision   — an escalated base. The most dangerous member, because
-#                      escalation is ordinary (red CI, exhausted budget, a
-#                      refused merge) and it used to make the base invisible.
-# Deliberately NOT here: `completed` without a delivery — a base accepted by a
-# human but never merged. It is reachable and it is dangerous, but waiting can
-# never resolve it, so it needs a human rather than a hold; the hub already
-# tracks that state separately (hub_undelivered_completed). Carried out as its
-# own task rather than smuggled in under a wait that would never end.
+# #1186: the advisory set above answers "is someone working on top of me right
+# now". A DELIVERY condition asks "is there work under mine that is not in the
+# base branch yet", and a task leaves running/review without being delivered, so
+# the statuses below are held too. Judged by status rather than by
+# pipeline_merges on purpose: git has the final word, status only decides whom
+# to ask. Each member is here for a named reason:
+#   running / review — work in flight.
+#   ci_check         — submitted; the branch exists and is pushed.
+#   fix_requested    — rework after CHANGES_REQUESTED: the branch will grow.
+#   needs_decision   — an escalated base (red CI, exhausted budget, refused
+#                      merge): ordinary, and the most dangerous to miss.
+# Deliberately NOT here: `completed` without a delivery. Waiting can never
+# resolve it, so it needs a human (hub_undelivered_completed tracks it).
 STACK_DELIVERY_STATUSES = [
     "running",
     "review",
     "ci_check",
     "fix_requested",
     "needs_decision",
-    # Found by the dispatched cross-model review: the same door as
-    # needs_decision, and missed for the same reason — the list was written
-    # from the statuses I had in mind rather than from the enum. A task
-    # waiting to report owns a pushed branch like any other.
+    # A task waiting to report owns a pushed branch like any other.
     "pending_report",
     # #1275, found by the #1271 partition test, which walks TaskStatus whole
     # instead of the statuses in mind. Each is reachable from running with the
@@ -2397,23 +2280,17 @@ STACK_DELIVERY_STATUSES = [
 ]
 
 # #1275: statuses whose branch may be unmerged and which will NEVER deliver
-# themselves. `failed` is final (FINAL_STATUSES; LIFECYCLE_TRANSITIONS has no
-# way out of it) and reached from running when a headless run fails — with its
-# branch possibly pushed. Waiting for it would be a promise the hub cannot
-# keep, so it is not in the list above: the delivery walk reads it as a base
-# that cannot deliver itself, and a definite stack on it goes to a human, like
-# the stranded `completed` of #1204. Kept apart from that one on purpose: a
-# failed task has no delivery registry row, and its branch is often never
-# published at all (the run failed before a push) — that case must stay #1283's
-# merge-with-alert, not call a human on every delivery in the project.
+# themselves. `failed` is final (FINAL_STATUSES) with its branch possibly pushed;
+# waiting for it would be a promise the hub cannot keep, so the delivery walk
+# sends a definite stack on it to a human, like the stranded `completed` of
+# #1204. Kept apart from that one: a failed task has no delivery registry row and
+# often no published branch, and that case stays #1283's merge-with-alert.
 STACK_TERMINAL_STATUSES = ["failed"]
 
 
-# #1186: the three answers the delivery gate needs and the advisory hint
-# never did. "clear" and "unknown" were one value (None) for as long as the
-# only consumers were advisories — a missing hint costs nothing. A merge
-# decided on the same value costs the base task its work, so they are split
-# here, once, rather than at each consumer.
+# #1186: the three answers the delivery gate needs. "clear" and "unknown" were
+# one value (None) while only advisories consumed it; a merge decided on that
+# value costs the base task its work, so they are split here, once.
 STACK_STACKED = "stacked"
 STACK_CLEAR = "clear"
 STACK_UNKNOWN = "unknown"
@@ -2437,28 +2314,21 @@ class StackAssessment:
     base_task_status: str = ""
     relation: str = ""
     message: str = ""
-    # #1204: can the base still reach the base branch on its own? Every base
-    # #1186 knew about could — that is why holding was the right answer there.
-    # A task a human accepted WITHOUT delivering never will, and the gate has
-    # to tell the two apart before it decides between waiting and asking.
-    # Carried explicitly rather than inferred from the status: a reader who
-    # has to derive "completed means undelivered here" from which query the
-    # row came out of will eventually derive it wrong.
+    # #1204: can the base still reach the base branch on its own? A task a human
+    # accepted WITHOUT delivering never will; the gate must tell the two apart
+    # before choosing between waiting and asking. Carried explicitly, not inferred
+    # from the status.
     base_can_deliver_itself: bool = True
-    # #1204 (found by the machine review of submission #2): the id of a
-    # STRANDED candidate whose own branch ref could not be resolved. Kept
-    # apart from a plain ``unknown`` because the two need opposite handling:
-    # a plain unknown is retryable and waits, while a terminal task's deleted
-    # branch will never come back — waiting on it is silent and permanent.
+    # #1204: the id of a STRANDED candidate whose branch ref could not be resolved.
+    # Kept apart from a plain ``unknown`` (retryable, waits): a terminal task's
+    # deleted branch never comes back, so waiting would be silent and permanent.
     unprobed_stranded_task_id: int | None = None
     # #1204 (Cursor #385): the registry state of a stranded base — pr_open or
     # pr_closed. Empty for a base still on the conveyor.
     base_delivery_state: str = ""
-    # #1283: the id of a candidate whose branch origin does not have AND whose
-    # tip the hub has never observed there. Not «could not look»: there is
-    # nothing to look AT yet. Kept apart from every other unknown because only
-    # this one says the candidate owns no commits anywhere — see
-    # ``_a_branch_origin_never_had``.
+    # #1283: the id of a candidate whose branch origin does not have AND whose tip
+    # the hub never observed there: nothing to look AT yet, so it owns no commits
+    # anywhere; see ``_a_branch_origin_never_had``.
     unpublished_branch_task_id: int | None = None
 
     def as_advisory(self) -> dict[str, Any] | None:
@@ -2657,41 +2527,19 @@ def _stranded_with_a_dead_ref(
 ) -> "StackAssessment | None":
     """A stranded candidate whose OWN branch ref no longer resolves (#1204).
 
-    Found by the machine review of submission #2, severity high. Such a row
-    cannot be handled the way a plain ``unknown`` is. The plain kind is
-    retryable on purpose: git blinked, the clone will catch up, the next cycle
-    answers. This kind never will — the task is terminal, so nobody is going
-    to push that branch back, and deleting the branch is what GitHub does by
-    default after a manual merge. Left as a retryable unknown it became a
-    SILENT, PERMANENT hold on every delivery in the project that had no
-    definite stack of its own: exactly the brick the foreign-project skip
-    prevents, re-entered through the candidate list this change introduced.
+    Cannot be handled like a plain ``unknown``, which is retryable on purpose (git
+    blinked, the clone catches up). A terminal task's branch is not coming back
+    (GitHub deletes it after a manual merge), so a retryable unknown would be a
+    SILENT, PERMANENT hold on every delivery of the project without a definite
+    stack. Merging is no alternative: it would carry the base's work into the base
+    branch under our number. So this CALLS A HUMAN, like ``stranded_base``.
 
-    Merging is not the alternative — that is the other existing branch of
-    ``unknown``, and the whole point of the stranded question is that merging
-    on top of such a base carries its work into the base branch under our
-    number. So this becomes a refusal that CALLS A HUMAN, the same answer
-    ``stranded_base`` already gives and for the same reason.
-
-    Narrow on purpose: only when the candidate's OWN ref is the ONLY one that
-    did not resolve. A missing workspace or a failed rev-list is about this
-    machine rather than about that branch, would hit every candidate alike,
-    and really can pass by itself — so it stays retryable. Reading which name
-    failed means reading ``details``, which the probe fills with every name it
-    could not resolve; an empty ``details`` falls through to the old behaviour
-    rather than guessing.
-
-    Equality, not membership (#1204, machine review of submission #3). The
-    first version asked whether the candidate was AMONG the unresolved names,
-    and a broken clone puts our own branch in that list beside it — so a
-    machine-level failure was being reported to a human as "that task's branch
-    is gone". The probe itself now refreshes a missing ref once before saying
-    it is missing, so surviving this check really does mean origin does not
-    have it either. And only ``ref_unresolved`` qualifies: a refresh that got
-    NO ANSWER comes back as ``remote_unreachable`` (#1204, machine review of
-    submission #4) and falls through to the retryable unknown below — a
-    timeout or a fetch lock is about this machine, hits every candidate alike,
-    and must not be told to a human as "origin does not have that branch".
+    Narrow on purpose: only when the candidate's OWN ref is the ONLY one that did
+    not resolve (a missing workspace or a failed rev-list is about this machine and
+    stays retryable); read from ``details``, and an empty ``details`` falls
+    through. Equality, not membership: a broken clone lists our own branch beside
+    others. Only ``ref_unresolved`` qualifies; ``remote_unreachable`` (a refresh
+    with NO ANSWER) falls through to the retryable unknown below.
     """
     if int(other["id"]) not in stranded:
         return None
@@ -2789,72 +2637,37 @@ def _a_branch_origin_never_had(
     result: Any,
     stranded: set[int],
 ) -> "StackAssessment | None":
-    """A candidate branch that has not been published yet (#1283).
+    """A candidate branch that has not been published yet (#1283, seen on #1158).
 
-    НАБЛЮДЕНО НА ПРОДЕ 22.09.2026. #1208 и #1158 — одобрены человеком, CI
-    зелёный, отчёты ревью чистые — обе не доставлены одним и тем же
-    сообщением: «stack_unknown … ref_unresolved: task-1281/…». Ветка соседа
-    записана хабом в момент ``hub_pair_start``, а на origin её ещё нет:
-    исполнитель не сделал первый пуш. Между pair_start и первым пушем лежит
-    вся работа над задачей — часы, — и всё это время ни одна одобренная
-    задача проекта не доставляется. Чем больше исполнителей работает
-    параллельно, тем чаще состояние.
+    Between hub_pair_start and the first push the executor's branch is recorded by
+    the hub but absent on origin, for hours, and no approved task of the project
+    would deliver ("stack_unknown ... ref_unresolved"). The #1186 rule (unknown
+    outranks "clear") stays; the CLASSIFICATION was wrong: "could not ask" and
+    "nothing to ask about yet" are different facts.
 
-    Правило #1186 при этом верное и не трогается: неизвестность сильнее
-    «чисто». Неверна КЛАССИФИКАЦИЯ. «Спросить не удалось» и «спрашивать пока
-    не о чем» — разные факты, и ответ у них разный.
+    Two observed facts, both required:
 
-    ДВА наблюдаемых факта, и нужны оба:
+    * ``ref_unresolved`` for this candidate's NAME only. The probe refreshes the
+      ref before answering and separates "origin says no such branch" from
+      "origin did not answer" (``remote_unreachable``, #1204). Equality, not
+      membership: a broken clone puts our own branch into ``details`` too.
+    * the candidate's ``submission_generation`` is zero: the hub's OWN record that
+      the task never submitted work. An empty ``submission_sha`` is NOT used:
+      ``resolve_branch_tip`` leaves it empty also for "could not look", so a task
+      whose tip could not be read would read as "never published". It is not a
+      second condition either: the pin is written by the submit step right after
+      ``bump_submission_generation``, so a non-empty sha without a submission is
+      unreachable.
 
-    * ``ref_unresolved`` по ИМЕНИ этого кандидата и только по нему. Проба
-      перед таким ответом делает целевое обновление ссылки и отличает «origin
-      ответил, что ветки нет» от «origin не ответил» (``remote_unreachable``,
-      #1204). Равенство, а не вхождение — по той же причине, что и у соседа
-      выше: сломанный клон кладёт в ``details`` и нашу ветку, и это факт про
-      машину, а не про ту задачу.
-    * ``submission_generation`` кандидата равен нулю: сдачи не было ни одной.
-      Это СОБСТВЕННАЯ запись хаба о том, что задача ни разу не сдавала
-      работу, и она не зависит от того, удалось ли кому-то посмотреть на
-      origin.
+    Together: origin says no branch and the task never submitted, so its commits
+    exist nowhere and a merge cannot carry them away. Not silent: the outcome
+    stays ``unknown``, non-repeatable, so the merge goes ahead and the reason is
+    alerted with the task number (``_unchecked_stack_alert``). Stranded rows
+    (#1204) do not reach here; they have their own stronger branch above.
 
-    Сначала здесь стоял другой признак — пустой ``submission_sha``, — и он
-    был неточен (находка ревью 1dd76966e24dfa20 на сдаче #1). Пустой sha
-    значит не только «публиковать было нечего»: ``resolve_branch_tip`` сам
-    документирует пустое значение как «посмотреть не удалось» (нет рабочей
-    копии, упал fetch, исключение), ``_step_pin_submission_sha`` в этом
-    случае сдачу всё равно принимает, а вердикт на уехавшую вершину уже
-    закреплённый sha стирает. Задача со сдачей, чью вершину прочитать не
-    смогли, читалась бы тогда как «ветки никогда не было» и переставала бы
-    задерживать чужую доставку — то есть ровно AC-2 держался бы только до
-    первого сбоя пина. Отсутствие пина — не положительный факт; количество
-    сдач — положительный.
-
-    ``submission_sha`` вторым условием НЕ стоит, и это проверено, а не
-    забыто: пин пишется единственным местом — тем же шагом сдачи, сразу
-    после ``bump_submission_generation`` (lifecycle ~2933). Непустой sha без
-    единой сдачи недостижим, так что такое условие было бы кодом, который
-    никогда не выполняется, и мутацию по нему ничто бы не поймало. В обратную
-    сторону — сдача без пина — состояние живое, и его ловит счётчик сдач.
-
-    Вместе с ответом пробы это замыкается без дырок: origin говорит, что
-    ветки нет, и задача ничего не сдавала => коммитов той задачи нет нигде, и
-    унести их мержем невозможно. Сравнивать не с чем — а это не то же самое,
-    что «проверить не удалось». Если ветка на origin ЕСТЬ, проба её разрешит
-    и сюда дело не дойдёт вовсе.
-
-    Не молча: исход остаётся ``unknown``, только неповторяемый, поэтому мерж
-    идёт, а причина с номером задачи ложится в ленту алертом
-    (``_unchecked_stack_alert``). Ограничение постановки — молчаливого
-    «стопки нет» быть не должно.
-
-    Застрявшие строки (#1204) сюда не попадают по построению: у них свой,
-    более сильный разбор выше, и принятая без доставки задача — это как раз
-    тот случай, когда ветка БЫЛА и исчезла.
-
-    Остаточный риск назван в постановке: ветка, опубликованная и удалённая ДО
-    первой сдачи, пройдёт этим путём. Такого случая не наблюдали; если он
-    встретится, признак публикации станет отдельным наблюдаемым фактом
-    (условие пересмотра задачи), а не выводом из отсутствия sha.
+    Residual risk: a branch published and deleted BEFORE the first submission
+    passes this path; if it ever occurs, publication must become its own observed
+    fact.
     """
     if int(other["id"]) in stranded:
         return None
@@ -3037,18 +2850,13 @@ async def assess_branch_stacking(
     stranded: set[int] = set()
     terminal: set[int] = set()
     if statuses is not None:
-        # #1204: the delivery question only. The advisory callers keep asking
-        # "is someone working on top of me", and a task nobody is working on
-        # any more is not part of that question — but it is very much part of
-        # "is there work under mine that will never reach the base branch".
+        # #1204: the delivery question only. A task nobody works on any more is not
+        # part of "is someone working on top of me", but it IS part of "is there
+        # work under mine that will never reach the base branch".
         #
-        # FIRST in the walk, not appended after. The loop answers with the
-        # first stacked row it finds, so walk order IS priority — and putting
-        # these last meant a nearer ordinary base masked a stranded one deeper
-        # in the same stack: the reader got "waiting for #A", a silent retry,
-        # while under them sat a base no wait would ever deliver. Found by the
-        # machine review of this very change; the comment below already
-        # claimed this precedence, and only the order made it true.
+        # FIRST in the walk: the loop answers with the first stacked row, so walk
+        # order IS priority; appended last, a nearer ordinary base masked a
+        # stranded one deeper in the same stack.
         for row in await repo.list_undelivered_completed_branch_tasks(
             db, exclude_task_id=task_id
         ):
@@ -3079,27 +2887,14 @@ async def assess_branch_stacking(
     # its own fix. So a benign match is REMEMBERED and the walk continues; it
     # stands only if nothing dangerous is found anywhere.
     benign: StackAssessment | None = None
-    # The rows worth asking git about, settled BEFORE any git call (#1205).
-    # Two filters, both free next to a subprocess: a row with no branch or
-    # our own, and a row belonging to another project.
-    #
-    # Another project is another REPOSITORY (each carries its own
-    # workspace_path and clone), so its branch names mean nothing here.
-    # Skipped before the probe rather than after: the probe would try to
-    # resolve a foreign name in this repo, fail, and answer "unavailable" —
-    # which #1186 rightly ranks above "clear" and which would then hold a
-    # perfectly clean delivery. Since one such row is enough and it can NEVER
-    # resolve, the hold would be permanent, and it would be permanent for
-    # every delivery in every project at once. Nine active projects on prod at
-    # the time of writing, most of them with work in flight: this was a
-    # hub-wide brick, not an edge case.
-    #
-    # Asked of repo.resolve_project_for_task rather than of a project_id
-    # column: projects live on epics and descendants inherit (#335), so the
-    # column is null for most tasks and a SQL filter would have been a second,
-    # weaker copy of that rule. The walk is a local SQLite lookup and it
-    # REPLACES a git subprocess for every foreign row, so scoping makes the
-    # walk cheaper, not dearer.
+    # The rows worth asking git about, settled BEFORE any git call (#1205): a row
+    # with no branch or our own, and a row of another project. Another project is
+    # another REPOSITORY, so its branch names mean nothing here: probing one would
+    # answer "unavailable", which #1186 ranks above "clear", and since such a row
+    # can NEVER resolve, the hold would be permanent for every delivery in every
+    # project. Asked of repo.resolve_project_for_task, not of a project_id column:
+    # projects live on epics and descendants inherit (#335), so a SQL filter would
+    # be a second, weaker copy of that rule.
     candidates: list[tuple[dict[str, Any], str]] = []
     for row in rows:
         other = dict(row)
@@ -3383,20 +3178,20 @@ async def _approved_code_check(
             # to (gh pr merge --match-head-commit): re-pin it, as the gate's own
             # automerge does (#1706). Not re-read: a push after this line is
             # exactly what the bound merge refuses.
-            # Conditional on the submission and the old pin, and committed at
-            # once: a newer submission keeps ITS pin, and the write lock is not
-            # held over the network steps that follow.
-            await db.execute(
-                "UPDATE tasks SET submission_sha=?, updated_at=datetime('now') "
-                "WHERE id=? AND submission_generation=? AND submission_sha=?",
-                (
-                    current_tip,
-                    task["id"],
-                    task.get("submission_generation"),
-                    pinned,
-                ),
-            )
-            await db.commit()
+            # Conditional on the submission and the old pin, committed at once
+            # by its owner (#2001; never a foreign transaction): a newer
+            # submission keeps ITS pin, and no lock spans the network steps.
+            async with committed_if_own(db):
+                await db.execute(
+                    "UPDATE tasks SET submission_sha=?, updated_at=datetime('now') "
+                    "WHERE id=? AND submission_generation=? AND submission_sha=?",
+                    (
+                        current_tip,
+                        task["id"],
+                        task.get("submission_generation"),
+                        pinned,
+                    ),
+                )
             # The pass now stands on this head. A side key, not ``submission_sha``:
             # the CI/stacking steps below read the snapshot's pin as "what the
             # author submitted" and must keep reading it so.
@@ -3690,44 +3485,24 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
     )
     if assessment.outcome == STACK_STACKED:
         if assessment.relation == git_ops_mod.STACK_ANCESTRY_HEAD_IS_ANCESTOR:
-            # The other branch is built ON TOP of this one, not the other way
-            # round: this IS the base of the stack. Ancestry names an order and
-            # it puts us first, so there is nothing to wait for and nothing to
-            # decide — merging carries only this branch's own commits, which
-            # is exactly what makes the stack resolvable at all.
-            #
-            # Found reviewing #1204 and verified on a real repository, not
-            # reasoned: the predicate is symmetric (the base sees its own
-            # child as "stacked"), so the first version of this gate lumped
-            # head_is_ancestor in with the shapes that name no order and sent
-            # the BASE of every deliberate stack to a human. Its own advisory
-            # said the opposite in the same breath — "'{branch}' merges into
-            # '{base}' FIRST" (#1184) — and the gate refused it anyway. It
-            # would have fired on this very change: #1204's branch stands on
-            # this one, so delivering this task would have escalated instead
-            # of merging.
+            # The other branch is built ON TOP of this one: this IS the base of the
+            # stack. Ancestry puts us first, so there is nothing to wait for or
+            # decide; merging carries only this branch's own commits. The predicate
+            # is symmetric (the base sees its own child as "stacked"), so this case
+            # must be split from the shapes that name no order (#1204, #1184).
             return ""
         if not assessment.base_can_deliver_itself:
-            # #1204. Checked after the case above and before the one below,
-            # and both halves of that are load-bearing.
-            #
-            # AFTER "we are the base": a task accepted without delivery can
-            # perfectly well be the one built ON TOP of us. Then we are not
-            # standing on anything — merging carries only our own commits —
-            # and refusing here would strand the deliverable half of the pair
-            # over the undeliverable one. Found by the machine review of #1204,
-            # which named exactly this pair.
-            #
-            # BEFORE the order question: once we ARE standing on it, whichever
-            # way the rest of the ancestry reads, a base that will never be
-            # delivered cannot be waited for, and naming a merge order would
-            # only suggest that waiting is what is wanted.
-            # Направление называется ТОЛЬКО когда его подтвердил git.
-            # Найдено машинным ревью: проверка застревания стоит выше вопроса
-            # о порядке, значит она ловит и формы, где ancestry ничего не
-            # сказала, — а текст утверждал «ветка стоит на» безусловно. Это
-            # ровно тот же перебор, что уже чинили в алерте о непроверенной
-            # стопке: не утверждать больше, чем хаб знает (#725).
+            # #1204. Checked after the case above and before the one below; both
+            # halves are load-bearing.
+            # AFTER "we are the base": a task accepted without delivery can be the
+            # one built ON TOP of us; refusing would strand the deliverable half of
+            # the pair over the undeliverable one.
+            # BEFORE the order question: once we stand on it, a base that will never
+            # be delivered cannot be waited for, and naming a merge order would
+            # suggest waiting is wanted.
+            # The direction is named ONLY when git confirmed it: the stranded check
+            # sits above the order question and also catches shapes where ancestry
+            # said nothing; claim no more than the hub knows (#725).
             if assessment.relation == git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
                 how = (
                     f"ветка стоит на ветке задачи "
@@ -3745,18 +3520,12 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
                 f"{STRANDED_BASE_PREFIX}: {how}, {_why_base_never_delivers(assessment)}"
             )
         if assessment.relation != git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
-            # #1186, found by the machine review of this very change. Waiting
-            # is only an answer when there is a side to wait FOR. When the two
-            # branches point at the same commit the predicate is true in BOTH
-            # directions — each sees the other as its base — so holding both is
-            # a deadlock neither can leave: the wait is silent by construction
-            # (transient refusals never call anyone) and nothing merges, ever.
-            # The same is possible whenever ancestry names no side. So the
-            # hold is spent only on the one shape it can actually resolve —
-            # this branch standing ON TOP of that one — and every other shape
-            # goes to a human with the message that already explains it
-            # (#1184, #1193). Not a merge either way: refusing to guess a side
-            # is not permission to carry the other task's work into the base.
+            # #1186: waiting is only an answer when there is a side to wait FOR.
+            # With both branches at the same commit the predicate is true in BOTH
+            # directions, and holding both is a deadlock neither can leave (the wait
+            # is silent by construction). The hold is spent only on this branch
+            # standing ON TOP of that one; every other shape goes to a human (#1184,
+            # #1193), never to a merge that carries the other task's work.
             return (
                 f"{STACKED_UNDETERMINED_PREFIX}: ветка делит несмерженные "
                 f"коммиты с веткой задачи #{assessment.base_task_id} "
@@ -3773,14 +3542,11 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             f"номером. Ждём доставки #{assessment.base_task_id}"
         )
     if assessment.outcome == STACK_UNKNOWN and assessment.unprobed_stranded_task_id:
-        # #1204, по машинному ревью сдачи №2. Ни один из двух существующих
-        # исходов unknown здесь не годится, и это надо было увидеть до того,
-        # как класть застрявших в обход. Повторяемый unknown ЖДЁТ, а ждать
-        # тут нечего и вечно: задача терминальная, её ветку никто не вернёт.
-        # Неповторяемый unknown МЕРЖИТ с алертом, а мерж поверх застрявшего
-        # основания — ровно тот инцидент, ради которого условие написано.
-        # Значит третий исход: не ждать и не мержить, а позвать человека,
-        # назвав задачу и то, чего именно хаб не смог проверить.
+        # #1204: neither existing unknown outcome fits. A retryable unknown WAITS
+        # forever on a terminal task; a non-repeatable unknown MERGES with an alert
+        # over a stranded base, the original incident. Third outcome: do not wait,
+        # do not merge, call a human, naming the task and what the hub could not
+        # check.
         return f"{UNPROBED_STRANDED_BASE_PREFIX}: {_unprobed_undeliverable(assessment)}"
     if assessment.outcome == STACK_UNKNOWN and assessment.retryable:
         return (
@@ -3789,11 +3555,11 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             f"же самое, что «стопки нет», поэтому мерж отложен"
         )
     if assessment.outcome == STACK_UNKNOWN:
-        # Merged, but never silently: the alert is the whole difference
-        # between "we looked" and "we could not look".
-        await repo.add_task_update(
-            db, task["id"], "hub", "alert", _unchecked_stack_alert(assessment)
-        )
+        # Merged, never silently; committed before the next network call (#2001).
+        async with committed_if_own(db):
+            await repo.add_task_update(
+                db, task["id"], "hub", "alert", _unchecked_stack_alert(assessment)
+            )
     return ""
 
 
@@ -3828,11 +3594,9 @@ def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
     from hub.services.delivery_state import PR_CLOSED
 
     if assessment.unpublished_branch_task_id:
-        # #1283. Третий факт, доехавший до этого алерта, и он опять не тот же
-        # самый: проба ОТВЕТИЛА, и ответ был «такой ветки у origin нет», а
-        # вершину этой ветки хаб там ни разу не наблюдал. Сказать тут «хаб не
-        # получил ответа» значило бы повторить ровно ту ложь, которую Cursor
-        # #385 нашёл в текстах про застрявшие основания.
+        # #1283. Проба ОТВЕТИЛА «такой ветки у origin нет», а вершину хаб там ни
+        # разу не наблюдал; «хаб не получил ответа» здесь повторило бы ложь, которую
+        # Cursor #385 нашёл в текстах про застрявшие основания.
         return (
             f"Стопку веток сравнивать не с чем ({assessment.reason}) — "
             f"доставка идёт без этой проверки. Ветка "
@@ -3905,12 +3669,9 @@ STACK_UNKNOWN_PREFIX = "stack_unknown"
 # silent. This one calls a human, like every other refusal nobody can resolve
 # by waiting.
 STACKED_UNDETERMINED_PREFIX = "stacked_undetermined"
-# #1204: also deliberately NOT transient, and for a sharper reason than the
-# one above. There the order is unknown; here the order is known and the base
-# is simply never going to move — a human accepted it without delivering it,
-# so the conveyor will not come back for it. A wait would be a promise the
-# hub cannot keep, and transient refusals are silent, so nobody would ever
-# learn the promise had failed.
+# #1204: also deliberately NOT transient: here the order is known and the base is
+# never going to move (a human accepted it without delivering). A wait would be a
+# promise the hub cannot keep, and transient refusals are silent.
 STRANDED_BASE_PREFIX = "stranded_base"
 # #1204 (машинное ревью сдачи №2): тоже НЕ транзитный, и по обеим причинам
 # сразу. Ветка застрявшей задачи, которую не удалось разрешить, не вернётся
@@ -4048,14 +3809,11 @@ PR_DRAFT_WAIT_HINT = (
     "Пересдавать не нужно: новых коммитов нет, пересдача сбросит вердикт (#612)."
 )
 
-# #1030: refusals the executor cures WITHOUT a human — a red CI is fixed by a
-# push, and an approval the branch outran is cured by resubmitting. Both used
-# to share the terminal branch with merge_failed, and needs_decision is a door
-# that only opens outward: from there the agent can neither report done nor
-# submit for review. On 28.08.2026 that cost #1015 a manual merge — the CI fix
-# was pushed four minutes after the refusal and there was no way back onto the
-# conveyor. Not the same class as #951: a transient state resolves itself and
-# nobody has to act, while these two wait for the executor to do something.
+# #1030: refusals the executor cures WITHOUT a human: a red CI is fixed by a push,
+# an approval the branch outran by resubmitting. They used to share the terminal
+# branch with merge_failed, and needs_decision only opens outward (the agent can
+# neither report done nor submit), which cost #1015 a manual merge. Not the class
+# of #951: a transient state resolves itself, these two wait for the executor.
 RECOVERABLE_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.failed.value}",
     "stale_approval",
@@ -4236,14 +3994,11 @@ async def base_automerge_step(
             "автомерж прошёл, но коммит слитой ветки не назван — закрепление "
             "сдачи не трогаем, разбирается человек"
         )
-    # Перезакрепление коммита сдачи — не поблажка, а точность. Этот мерж сделал
-    # САМ гейт: авторского кода в нём нет по построению, и ему не нужно
-    # доказывать это сравнением диффов. Сравнение здесь и не сработало бы —
-    # проверено делом (tests/test_delivery_gate.py): мерж базы меняет в
-    # `git diff base...tip` и строку index, и смещения ханков, даже когда
-    # авторская работа та же. Оставить старый коммит закреплённым значило бы
-    # уронить вердикт, который автомерж только что спас, — то есть отменить
-    # самого себя и всё равно взять с человека второе одобрение.
+    # Перезакрепление коммита сдачи — не поблажка, а точность: этот мерж сделал САМ
+    # гейт, авторского кода в нём нет по построению. Сравнение диффов тут и не
+    # сработало бы (tests/test_delivery_gate.py): мерж базы меняет и строку index, и
+    # смещения ханков, даже когда работа та же. Старое закрепление уронило бы
+    # вердикт, который автомерж только что спас.
     await repo.update_task(db, task_id, submission_sha=detail)
     await repo.add_task_update(
         db,
@@ -4702,12 +4457,10 @@ _ALREADY_DELIVERED = (True, "already delivered")
 # задачи без проекта уникальный индекс её не отсечёт (NULL ≠ NULL).
 #
 # Память процесса, и это граница, а не недосмотр: прочного следа здесь нет.
-# «Запись не легла» случается ровно тогда, когда чужая транзакция держит лок
-# всё ожидание, — и любой след в SQLite (запись в ленте) упирается в тот же
-# лок. След в ленте к тому же подделываем: текст сдачи ложится записью хаба.
-# Перезапуск в этом окне читает влитый PR как merged_outside_gate — к
-# человеку, как до #1428. Корень — сеть под write-транзакцией done-flow;
-# он вынесен отдельной задачей.
+# «Запись не легла» случается, когда чужая транзакция держит лок всё ожидание,
+# — и любой след в SQLite упирается в тот же лок; след в ленте к тому же
+# подделываем. Перезапуск в этом окне читает влитый PR как merged_outside_gate
+# — к человеку, как до #1428. Корень — сеть под записью без commit (#2001).
 _unrecorded_gate_merges: set[tuple[int, int]] = set()
 
 
@@ -5006,20 +4759,15 @@ async def merge_before_completion(
         if await repo.pipeline_merge_recorded(db, task_id, pr_num):
             return True, "already delivered"
 
-        # #612: does the branch still stand where the reviewer approved it?
-        # #572 bound the verdict to a commit and closed the order "push, then
-        # approve". The opposite order — approve, THEN push — reached here
-        # untouched: the verdict stays current because its generation never
-        # changed, and this gate merges whatever the tip is now. Checked BEFORE
-        # the CI probe: there is no point asking about code that will not be
-        # delivered, and a refusal then costs one network call instead of two.
+        # #612: does the branch still stand where the reviewer approved it? #572
+        # closed "push, then approve"; "approve, THEN push" left the verdict current
+        # (generation unchanged) while this gate merges whatever the tip is now.
+        # Checked BEFORE the CI probe: no point asking about undelivered code.
         diverged, sha_note = await _approved_code_check(db, task, pr_num)
         if diverged:
             return False, diverged
-        # sha_note — «доставлено без сверки» — пишется ПОСЛЕ мержа, в
-        # _record_gate_delivery (#1428): запись здесь, до сети, держала
-        # write-лок соединения на всё время вызова форжа, и соседний путь
-        # гейта падал на «database is locked» по влитому PR.
+        # sha_note пишется ПОСЛЕ мержа, в _record_gate_delivery (#1428):
+        # запись до сети держала бы write-лок на весь вызов форжа.
 
         ctx = await project_git_context(db, task_id)
         workspace = ctx.get("repo")
@@ -5167,7 +4915,7 @@ async def _recorded_pr_state(
 async def _live_pr_for_branch(
     db: aiosqlite.Connection, task: dict[str, Any], branch: str
 ) -> tuple[int | None, str]:
-    """An open PR for this branch, or a cause. Records nothing by itself."""
+    """An open PR for this branch, or a cause; a found one is committed (#2001)."""
     try:
         ctx = await project_git_context(db, task["id"])
         found = await plugins.git_ops.pr_for_branch(
@@ -5181,7 +4929,8 @@ async def _live_pr_for_branch(
         return None, f"поиск открытого PR по ветке {branch} не ответил: {exc}"
     if found is None:
         return None, ""
-    await repo.update_task(db, task["id"], pr_number=int(found))
+    async with committed_if_own(db):  # #2001: the caller's next step is the network
+        await repo.update_task(db, task["id"], pr_number=int(found))
     return int(found), ""
 
 
@@ -5269,7 +5018,8 @@ async def ensure_delivery_pr(
             f"PR для ветки {branch} открыть не удалось"
             + ("" if pushed else " (push тоже не прошёл)")
         )
-    await repo.update_task(db, task_id, pr_number=int(pr))
+    async with committed_if_own(db):  # #2001
+        await repo.update_task(db, task_id, pr_number=int(pr))
     return int(pr), ""
 
 
@@ -5293,17 +5043,12 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
     branch = (task.get("branch") or "").strip()
     recorded = int(task["pr_number"]) if task.get("pr_number") else None
     if recorded is not None:
-        # The recorded number is a cached observation, not a fact — the same
-        # thing #767 established for an empty field, now for a stale one. A PR
-        # can close without its author: a stacked PR dies when its base branch
-        # is merged and deleted, which is exactly what stranded #774 with a
-        # live branch, a green PR, and a closed number on the task.
+        # The recorded number is a cached observation, not a fact (#767): a stacked
+        # PR dies when its base branch is merged and deleted, which stranded #774.
         state, note = await _recorded_pr_state(db, task, recorded)
-        # #959: "closed" and "absent" are different facts with one consequence
-        # — the recorded number cannot carry this delivery, so look for the one
-        # that can. They are NOT merged into a single state: the feed has to
-        # say which of the two happened, or the next reader debugging a stuck
-        # task learns nothing from the line that explained it.
+        # #959: "closed" and "absent" have one consequence (look for a PR that can
+        # carry this delivery) but stay separate states, so the feed says which
+        # happened.
         if state in ("closed", "absent"):
             gone = (
                 f"записанный PR #{recorded} закрыт и не слит"
@@ -5356,7 +5101,8 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
         return DeliveryPR(
             reason=f"открытый PR для ветки {branch} не найден — доставка не проверялась"
         )
-    await repo.update_task(db, task["id"], pr_number=found)
+    async with committed_if_own(db):  # #2001
+        await repo.update_task(db, task["id"], pr_number=found)
     return DeliveryPR(int(found))
 
 
@@ -5427,8 +5173,8 @@ BASE_FRESHNESS_WAIT_HINT = (
 )
 # #1983: сдвиг головы может быть и правкой автора — «вердикт сохраняется» нельзя.
 BASE_FETCH_WAIT_HINT = (
-    "Это временное состояние, решение человека не требуется: хаб ждёт свежую "
-    "базу, затем сверит код с одобренным. Пересдавать не нужно."
+    "Это временное состояние: хаб ждёт свежую базу, затем сверит код с одобренным. "
+    "Не придёт за срок проекта (base_fetch_wait_hours, 24 ч) - владелец получит уведомление."
 )
 _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
     (PR_DRAFT_PREFIX, PR_DRAFT_WAIT_HINT),
@@ -5487,23 +5233,16 @@ async def _write_gate_refusal(
     ``write`` of ``record_delivery_outcome``, which re-reads the approval first.
     """
     task_id = task["id"]
-    # #951: a temporary state is not a decision. CI still running
-    # (or unreadable this minute) resolves itself — the poller in
-    # the same situation just retries next pass, and on 25.08.2026
-    # the done-flow's needs_decision here cost a human rework for
-    # a CI that went green four minutes later (#949). The task
-    # stays in running: the existing stale watches and the #418
-    # deadline backstop keep it from waiting forever. Terminal
-    # refusals — a red CI, a merge GitHub refused, a closed PR —
-    # still call a human below: those need an actual decision.
+    # #951: a temporary state is not a decision. CI still running (or unreadable
+    # this minute) resolves itself; needs_decision here cost a human rework for a
+    # CI that went green minutes later (#949). The task stays in running: the
+    # stale watches and the #418 deadline backstop keep it from waiting forever.
+    # Terminal refusals (red CI, a refused merge, a closed PR) still call a human.
     if detail.startswith(TRANSIENT_GATE_PREFIXES):
-        # #959: waiting is still right, but the reason has to be
-        # the true one. When the PR itself could not be read, "wait
-        # for a green CI" names a check that never ran and points
-        # at a PR the gate never established — the shape of hint
-        # #952 removed from the terminal branch, here in the
-        # patient one. A draft is a third cause (#1053): CI is
-        # already green, and resubmitting would stale the verdict.
+        # #959: waiting is still right, but the reason must be the true one. When
+        # the PR could not be read, "wait for a green CI" names a check that never
+        # ran (the hint #952 removed from the terminal branch). A draft is a third
+        # cause (#1053): CI is green, resubmitting would stale the verdict.
         cause = _transient_wait_cause(detail, delivery_pr)
         await repo.add_task_update(
             db,
@@ -5520,14 +5259,10 @@ async def _write_gate_refusal(
         return "running"
     budget_spent = False
     if detail.startswith(RECOVERABLE_GATE_PREFIXES):
-        # #1030: the executor is right here — it just reported —
-        # so the refusal it can cure itself keeps the task on the
-        # conveyor instead of handing a human a door the agent
-        # cannot walk back through. The budget is what stops this
-        # from being an infinite loop: after MAX_CI_FIX_CYCLES
-        # attempts on a still-red CI the escalation below is the
-        # honest answer, and it names the spent budget as the
-        # cause rather than the CI outcome.
+        # #1030: the executor just reported, so a refusal it can cure itself keeps
+        # the task on the conveyor instead of handing a human a door the agent
+        # cannot walk back through. MAX_CI_FIX_CYCLES bounds the loop; after it the
+        # escalation below names the spent budget as the cause.
         cycle = 0
         if detail.startswith(CI_BUDGET_GATE_PREFIXES):
             cycle, budget_spent = await charge_ci_fix_budget(db, task)
@@ -5553,12 +5288,9 @@ async def _write_gate_refusal(
         task_id,
         "hub",
         "alert",
-        # #952: this line is written TOGETHER with the transition
-        # to needs_decision, and is read AFTER it — so it may only
-        # name actions that status accepts. "Report done again"
-        # is not one of them: the hub itself refuses it there
-        # (human_decision_required), which on 25.08.2026 sent an
-        # agent down a dead end the hint had pointed to (#949).
+        # #952: written TOGETHER with the transition to needs_decision and read AFTER
+        # it, so it may only name actions that status accepts: "Report done again"
+        # is refused there (human_decision_required), a dead end (#949).
         f"Done report NOT completed: PR #{task['pr_number']} is not "
         f"delivered — {detail}."
         + (
@@ -5945,13 +5677,10 @@ async def _route_after_done(
         wt = plugins.git_ops.worktree_path(task_id, workspace)
         if wt and os.path.isdir(wt):
             git_repo = wt
-    # #361 I1: the result of this checkout was never inspected, and the
-    # comment above already names the consequence — squash_branch resetting
-    # the wrong branch. checkout() has always returned a bool; nobody read
-    # it. Every step below rewrites history or pushes, so a failed checkout
-    # must stop the tail rather than run it against whatever branch is
-    # current. Silence here is what docs/workspace-safety-policy.md
-    # invariant 4 forbids.
+    # #361 I1: the result of this checkout was never inspected, yet a failed one
+    # lets squash_branch reset the wrong branch. Every step below rewrites history
+    # or pushes, so it must stop the tail (docs/workspace-safety-policy.md
+    # invariant 4).
     if not await plugins.git_ops.checkout(branch, repo=git_repo):
         await repo.update_task(
             db,
@@ -6070,31 +5799,20 @@ async def _route_after_done(
     ):
         return halted
     # #991: the CI gate asks for a PR where it means "is there anything to
-    # deliver". For a task whose work is not code — a policy turned on, a
-    # mechanism watched, a decision recorded — the branch exists (pair_start
-    # always makes one) and carries nothing the base does not have. There is
-    # no PR to open, so the poller retried and escalated: #927 sat in
-    # needs_decision with "Cannot create PR: no commits on branch or push
-    # failed" while its work was finished and evidenced by three live checks.
+    # deliver". For a task whose work is not code the branch exists (pair_start
+    # always makes one) but carries nothing the base lacks; there is no PR to
+    # open, and #927 sat in needs_decision over it.
     #
-    # The question is asked HERE and not earlier, and against git_repo and
-    # not the clone — both learned from the review of the first attempt:
+    # The question is asked HERE, after auto_commit (which turns a dirty tree into
+    # commits; asked before, work-in-progress read as "nothing to deliver"), and
+    # against git_repo, not the clone (in worktree mode the work lives in the
+    # worktree; deciding from the clone is right only by accident).
     #
-    #   * after auto_commit, because auto_commit is what turns a dirty tree
-    #     into commits. Asking before it called work-in-progress "nothing to
-    #     deliver" and skipped the very commit that delivers it.
-    #   * against git_repo, because for a pair task in worktree mode the
-    #     work lives in the worktree while the clone stays on base. Deciding
-    #     from the clone and acting on the worktree is how a decision comes
-    #     out right by accident.
-    #
-    # Three answers, and only one skips: content that does not differ means
-    # the CI gate has no subject. "Could not compare" keeps the old path —
-    # ignorance must not close a task quietly (#725). The REVIEW gate is
-    # untouched either way: skipping it would let anything uncommitted
-    # complete itself, a worse defect than the one being fixed.
-    # The base default belongs to git_ops (_resolve_base, #362 I4) — an
-    # empty base is passed through, never recomputed here.
+    # Three answers, only one skips: content that does not differ means the CI
+    # gate has no subject. "Could not compare" keeps the old path (#725). The
+    # REVIEW gate is untouched either way: skipping it would let anything
+    # uncommitted complete itself. The base default belongs to git_ops
+    # (_resolve_base, #362 I4): an empty base is passed through.
     try:
         differs = await plugins.git_ops.content_differs(
             (ctx.get("base_branch") or "").strip(),

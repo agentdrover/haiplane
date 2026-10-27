@@ -32,6 +32,7 @@ from hub.integrations import cursor_cloud, local_reviewer
 from hub.models import StewardJudgementSubmit
 from hub.services import chat_pair
 from hub.services import steward_shadow as sh
+from hub.services.refusal_reason import CAP_HANDOFF
 from hub.services.steward_advisor import (
     REFUSED_ADVISOR,
     STATE_NOT_ORDERED,
@@ -690,7 +691,11 @@ async def _act(monkeypatch) -> None:
     async def _granted(_db):
         return "act"
 
+    async def _granted_now(_db):
+        return True
+
     monkeypatch.setattr(sh, "effective_mode", _granted)
+    monkeypatch.setattr(sh, "act_granted_now", _granted_now)  # #2040
 
 
 async def _real_packet_hash(db: aiosqlite.Connection, task_id: int) -> str:
@@ -778,10 +783,14 @@ async def test_the_applier_refuses_an_approve_without_a_concur(
 
 
 async def test_the_applier_applies_an_approve_with_a_concur_on_the_same_packet(
-    db: aiosqlite.Connection,
+    db: aiosqlite.Connection, monkeypatch
 ):
     from hub.services.steward_applied import APPLIED, apply_judgement
 
+    async def _granted_now(_db):  # #2040: the write reads the global act grant
+        return True
+
+    monkeypatch.setattr(sh, "act_granted_now", _granted_now)
     task_id = await _scenario(db, "advisor-applier-concur", "concur")
 
     assert (await apply_judgement(db, task_id, 1))[0] == APPLIED
@@ -2585,7 +2594,7 @@ async def test_an_advisor_over_the_cap_hands_the_generation_to_the_owner_until_r
     state = await advisor_state(db, task_id, 1)
     assert state.state == STATE_NOT_ORDERED and "потолок" in state.reason
     refusal = await advisor_refusal(db, task_id, 1)
-    assert refusal is not None and refusal[0] == REFUSED_ADVISOR
+    assert refusal is not None and refusal[0] == CAP_HANDOFF
 
     # Полночь UTC: один заказ для того же живого поколения, маршрут снова стюарда.
     set_clock(monkeypatch, AFTER_MIDNIGHT)
@@ -2636,7 +2645,7 @@ async def test_a_concur_is_not_applied_while_the_generation_is_with_the_owner(
     await db.commit()
 
     refusal = await advisor_refusal(db, task_id, 1)
-    assert refusal is not None and refusal[0] == REFUSED_ADVISOR
+    assert refusal is not None and refusal[0] == CAP_HANDOFF
     assert "потолок" in refusal[1]
     with pytest.raises(HTTPException) as refused:
         await apply_judgement(db, task_id, 1)

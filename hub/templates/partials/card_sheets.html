@@ -1,0 +1,50 @@
+{# Нижние листы действий карточки (#1813). Лежат ВНЕ #c2-live: автообновление
+   фрагмента их не заменяет, поэтому введённый текст и открытый лист живы.
+   Каждая форма ведёт на существующий человеческий маршрут и несёт csrf_field();
+   поля expected_* - это то, что человек видел на экране (hub/services/card_sheet.py
+   сверяет их с живой задачей и отвечает 409 на устаревшее). Весь недоверенный
+   текст экранируется автоматически, без |safe. #}
+{% from "partials/pr_disposition.html" import pr_disposition_select %}
+<link rel="stylesheet" href="/static/card_actions.css?v={{ asset_version|default('20260421a') }}">
+<div id="c2-sheets" data-built-status="{{ card_actions.live.status }}" data-built-submission-generation="{{ card_actions.live.submission_generation }}" data-built-statement-generation="{{ card_actions.live.statement_generation }}" data-built-review-verdict-revision="{{ card_actions.live.review_verdict_revision }}">
+{% for s in card_actions.sheets %}
+<section class="c2-sheet" id="{{ s.id }}" role="dialog" aria-modal="true" aria-labelledby="{{ s.id }}-h" data-sheet-kind="{{ s.kind }}" data-built-status="{{ s.built.status }}" data-built-submission-generation="{{ s.built.submission_generation }}" data-built-statement-generation="{{ s.built.statement_generation }}" data-built-review-verdict-revision="{{ s.built.review_verdict_revision }}">
+    <div class="c2-sheet-panel">
+        <div class="c2-sheet-head">
+            <h2 id="{{ s.id }}-h">{{ s.title }}</h2>
+            <a class="c2-sheet-x" href="#" data-sheet-close>Закрыть</a>
+        </div>
+        <p class="c2-sheet-intro">{{ s.intro }}</p>
+        <p class="c2-sheet-stale" hidden role="alert">Состояние задачи изменилось, пока лист был открыт (например, пришла новая сдача). Введённый текст сохранён; отправка по старому экрану будет отклонена хабом с объяснением. Обновите страницу, чтобы перечитать карточку.</p>
+        <form method="post" action="{{ s.action }}" class="task-action-stack">
+          {{ csrf_field() }}
+            {% for name, value in s.hidden.items() %}<input type="hidden" name="{{ name }}" value="{{ value }}">
+            {% endfor %}
+            {% for f in s.fields %}
+            {% set fid = s.id ~ '-' ~ (f.name or loop.index) %}
+            {% if f.type == 'textarea' %}
+            <label class="task-action-label" for="{{ fid }}">{{ f.label }}</label>
+            <textarea id="{{ fid }}" name="{{ f.name }}" class="task-action-control task-action-textarea"{% if f.required %} required{% endif %}></textarea>
+            {% elif f.type == 'checkbox' %}
+            <label class="task-action-checkbox" for="{{ fid }}"><input type="checkbox" id="{{ fid }}" name="{{ f.name }}" value="1"{% if f.required %} required{% endif %}> {{ f.label }}</label>
+            {% elif f.type == 'findings' %}
+            <fieldset class="c2-sheet-picks"><legend class="task-action-label">{{ f.label }}</legend>
+                {% for o in f.options %}<label class="c2-sheet-pick"><input type="checkbox" data-pick-line="{{ o.line }}"> <span>{{ o.line }}</span></label>
+                {% endfor %}
+            </fieldset>
+            {% elif f.type == 'list' %}
+            <p class="task-action-label">{{ f.label }}</p>
+            <ul>{% for item in f.entries %}<li>{{ item }}</li>{% endfor %}</ul>
+            {% elif f.type == 'pr_disposition' %}
+            <label class="task-action-label" for="{{ fid }}">{{ f.label }}{% if task.pr_number %} (#{{ task.pr_number }}){% endif %}</label>
+            {{ pr_disposition_select(task, fid, 'task-action-control') }}
+            {% endif %}
+            {% endfor %}
+            <button type="submit" class="btn btn-{{ s.submit_tone }} task-action-btn">{{ s.submit_label }}</button>
+        </form>
+        <div class="c2-sheet-result" aria-live="polite"></div>
+    </div>
+</section>
+{% endfor %}
+</div>
+{% include "partials/card_sheets_script.html" %}

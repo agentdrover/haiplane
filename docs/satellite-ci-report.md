@@ -80,7 +80,12 @@ types]}`. Он записан в каждой попытке и в проекц�
    `curl -X PATCH $HUB/api/projects/<id> -H "Authorization: Bearer <токен человека>"
    -H 'Content-Type: application/json' -d '{"gate_policy": {"ci_contract":
    {"workflow_path": ".github/workflows/tests.yml", "required_checks": ["tests"]}}}'`.
-   Имена проверок в `checks:` producer-а должны быть ровно `required_checks`.
+   Имена проверок в `checks:` producer-а должны ВКЛЮЧАТЬ все `required_checks`
+   (обязательное подмножество, а не «ровно»): лишняя проверка из словаря отчёт
+   не ломает, пропущенная обязательная делает его подтверждённым, но не зелёным.
+   Отпечаток контракта для сверки лежит в
+   `GET /api/projects/<slug>/effective-policy` по пути `keys[].value.fingerprint`
+   (элемент `keys` с `key == "ci_contract"`).
 
 `workflow-path` отправителя и `workflow_path` контракта — одно и то же
 значение. Если они разошлись, отчёт останется `unverified(wrong_workflow)`:
@@ -136,7 +141,7 @@ shell-синтаксис, как и раньше. Перевод строки н
 | SHA | закреплённый коммит |
 | ревизии | коммит producer-workflow и коммит sender-workflow в default branch, ревизия `hub-ci-send` |
 | прогон | run id, attempt, artifact id, digest артефакта |
-| отпечаток контракта | sha256 из `GET /api/projects/<slug>/effective-policy` (`ci_contract.fingerprint`) |
+| отпечаток контракта | sha256 из `GET /api/projects/<slug>/effective-policy`, путь `keys[].value.fingerprint` (элемент с `key == "ci_contract"`) |
 | trust | `verified`, `applied=true`, conclusion=success, checks по контракту = pass, validation=pass, результаты тестовых AC |
 | проверенный гейт | `ci_trust.pass_gap` для этих задачи и SHA (по поколению и отпечатку) вернул `None`, либо сдача принята при `ci_before_submit=require` (режим записан) |
 | ожидает | шаги владельца, которые ещё не выполнены |
@@ -160,12 +165,34 @@ shell-синтаксис, как и раньше. Перевод строки н
 
 ## Если workflow ещё нет
 
-С #476 его кладёт провижининг: в репозиторий, где нет ни одного файла в
-`.github/workflows`, хаб коммитит `haiplane-ci.yml` (и `haiplane-stale.yml`) с
-уже подставленными ветками проекта и уже вписанным шагом отчётности ниже.
-Остаётся добавить туда сборку и прогон тестов этого репозитория — шаблон
-намеренно не угадывает их — и объявить проекту `ci_runner` в `gate_policy`,
-если тесты запускаются не через `uv run pytest`.
+**Штатное подключение (новый GitHub-проект, #2027).** Провижининг сам кладёт
+подтверждаемую пару в репозиторий, где нет ни одного файла в `.github/workflows`
+(ни в интеграционной, ни в default-ветке):
+
+- в интеграционную ветку (например `develop`) — `haiplane-ci.yml` (producer,
+  `name: Haiplane CI`, шаг отчётности и загрузка артефакта; шаг тестов с
+  `id: tests` добавляет владелец, хаб его не угадывает) и `haiplane-stale.yml`;
+- в default-ветку GitHub (например `main`, даже если интеграционная другая) —
+  `haiplane-ci-report.yml` (sender): `workflow_run` читается GitHub только из
+  default-ветки.
+
+Посеянная пара **не считается готовым CI**: `provision_detail` называет оба файла
+и статус «ожидает настройки владельцем» с чек-листом — раздел «Настройка
+владельцем» выше (`ci_reader` со scope project; `ci_runner` только в environment
+`hub-report` с деплоем из default-ветки; старый секрет записи убрать из
+репозитория; `ci_contract` `{haiplane-ci.yml, [tests]}` человеческим PATCH).
+Пока этого нет, отчёты проекта `unverified`, и `effective-policy` (поле
+`ci_trust`) и карточка проекта говорят об этом предупреждением; если отчётов
+нет вовсе, фраза другая и это не неисправность. Существующие проекты не
+мигрируются: их переводит владелец по этой инструкции. GitVerse не меняется.
+
+**Прежняя прямая отправка (режим `hub-token`).** До #2027 провижининг клал один
+`haiplane-ci.yml`, который сам отправляет отчёт ключом записи. Такой отчёт
+принимается, но не подтверждается (`unverified(no_provenance)`), и стюард на нём
+не ждёт подтверждения: состояние окончательное. На GitVerse и в проектах,
+заведённых до #2027, остаётся этот режим: добавить сборку и прогон тестов
+этого репозитория (шаблон намеренно не угадывает их) и объявить проекту
+`ci_runner` в `gate_policy`, если тесты запускаются не через `uv run pytest`.
 
 Репозиторий, у которого свой CI уже есть, хаб не трогает: там шаг ниже
 вставляют руками.

@@ -184,6 +184,44 @@ def test_waived_file_that_grew_past_its_measure_is_named(tmp_path, lines, grown)
         assert "hub/old.py" not in proc.stdout
 
 
+@pytest.mark.parametrize(
+    ("lines", "warned", "rc"),
+    [
+        (2100, True, 0),  # запас 0
+        (2099, True, 0),  # 1 строка = 0,048% потолка
+        (2080, True, 0),  # 20 < 21
+        (2079, False, 0),  # 21 = ровно 1% потолка
+        (2000, False, 0),
+        (2101, False, 1),  # выше потолка - ошибка, не предупреждение
+    ],
+)
+def test_ceiling_reserve_warning(tmp_path, lines, warned, rc):
+    """AC-2: 0 <= max - lines < 1% max - предупреждение с размером, потолком и
+    остатком; rc прежний, превышение потолка - ошибка как раньше."""
+    _make_tree(tmp_path, waivers=[_grown_waiver("hub/old.py")])
+    _write_lines(tmp_path, "hub/old.py", lines)
+    proc = _run(tmp_path)
+    assert proc.returncode == rc, proc.stdout
+    data = json.loads(_run(tmp_path, "--json").stdout)
+    if warned:
+        assert data["reserve_low"] == [
+            {"path": "hub/old.py", "lines": lines, "max": 2100, "reserve": 2100 - lines}
+        ]
+        assert "запас почти съеден" in proc.stdout
+        assert "hub/old.py" in proc.stdout
+    else:
+        assert data["reserve_low"] == []
+        assert "запас почти съеден" not in proc.stdout
+
+
+def test_ceiling_reserve_warning_keeps_the_unreadable_base_code(tmp_path):
+    """AC-2: rc=2 при невозможности сравнить с базой остаётся и при тонком запасе."""
+    _make_tree(tmp_path, waivers=[_grown_waiver("hub/old.py")])
+    _write_lines(tmp_path, "hub/old.py", 2100)
+    proc = _run(tmp_path, "--base", "no-such-ref")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+
+
 def test_file_above_its_ceiling_or_threshold_is_red_not_a_warning(tmp_path):
     """AC-1/AC-2: верхние границы — выше max файл over, выше порога new."""
     _make_tree(tmp_path, scripts=100, waivers=[_grown_waiver("hub/old.py")])

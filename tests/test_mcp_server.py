@@ -1500,6 +1500,7 @@ async def test_hub_decide_task_sends_all_params(
             "record_decision": True,
             # #897: the owner's choice about the PR travels with the decision.
             "pr_disposition": "",
+            "confirm_no_job": False,
         },
     )
 
@@ -1525,6 +1526,7 @@ async def test_hub_decide_task_rework_without_summary(
             "decision_summary": "",
             "record_decision": False,
             "pr_disposition": "",
+            "confirm_no_job": False,
         },
     )
 
@@ -2246,7 +2248,9 @@ async def test_hub_submit_for_review(
     assert payload["actor_hint"] == "agent"
     assert payload["transition"] == {"from": "running", "to": "review"}
     mock_api_post.assert_awaited_once_with(
-        "/api/tasks/42/submit-review", {"agent": "dev", "summary": "pass 2"}
+        "/api/tasks/42/submit-review",
+        {"agent": "dev", "summary": "pass 2"},
+        timeout=120.0,
     )
 
 
@@ -2331,6 +2335,105 @@ async def test_submit_answer_names_the_unchanged_generation(
     assert "submitted for review" not in payload["message"], (
         "a same-sha retry must not read like a brand-new submission"
     )
+
+
+async def test_a_submit_timeout_says_a_same_sha_retry_is_safe(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#2057: потерянный ответ сдачи не оставляет агента без совета.
+
+    Транспортный отказ строится НАСТОЯЩИМ _parse_transport_error из настоящего
+    ReadTimeout; безопасность повтора держится на том же sha, а не на маршруте,
+    поэтому generic retry_safe остаётся False. Повтор того же sha из review
+    возвращает текущее поколение без новой сдачи.
+    """
+    import httpx
+
+    from hub import mcp_server as srv
+
+    mock_api_get.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 3,
+    }
+    timeout = srv._parse_transport_error(
+        httpx.ReadTimeout(""),
+        timeout=30.0,
+        write=True,
+        method="POST",
+        path="/api/tasks/42/submit-review",
+    )
+    mock_api_post.side_effect = HubApiError(timeout)
+    sha = "a" * 40
+    lost = json.loads(await hub_submit_for_review(42, expected_sha=sha))
+    assert lost["reason"] == "transport_timeout"
+    assert lost["same_sha_retry_safe"] is True
+    assert lost["retry_safe"] is False
+    assert "ТЕМ ЖЕ expected_sha" in lost["message"]
+    assert "текущее поколение" in lost["message"]
+    assert "hub_task_status" in lost["message"]
+
+    # Без expected_sha обещания нет: сдача могла лечь с пустым sha.
+    mock_api_post.side_effect = HubApiError(timeout)
+    blind = json.loads(await hub_submit_for_review(42))
+    assert blind["same_sha_retry_safe"] is False
+    assert "безопасен" not in blind["message"].split("Сдача:")[1]
+    assert "hub_task_status" in blind["message"]
+
+    # Любые finding_outcomes: окно сервера (422 из гейта на гонке) не закрыто.
+    for outcomes in (
+        [{"finding_uid": "f1", "outcome": "deferred", "note": "n"}],
+        [{"finding_uid": "f1", "outcome": "fixed"}],
+    ):
+        mock_api_post.side_effect = HubApiError(timeout)
+        traced = json.loads(
+            await hub_submit_for_review(42, expected_sha=sha, finding_outcomes=outcomes)
+        )
+        assert traced["same_sha_retry_safe"] is False
+        assert "hub_task_status" in traced["message"]
+
+    # Не транспорт — совет не дописывается.
+    mock_api_post.side_effect = HubApiError({"reason": "head_moved", "message": "x"})
+    refused = json.loads(await hub_submit_for_review(42, expected_sha=sha))
+    assert "same_sha_retry_safe" not in refused
+
+    # Повтор того же sha: то же поколение, без новой сдачи.
+    mock_api_post.side_effect = None
+    mock_api_post.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 3,
+    }
+    again = json.loads(await hub_submit_for_review(42, expected_sha=sha))
+    assert "already on review" in again["message"]
+    assert "submission #3" in again["message"]
+    assert "no new generation opened" in again["message"]
+
+    # Срок: сдача ждёт _TIMEOUT_SUBMIT, остальные записи - прежний _TIMEOUT_SLOW.
+    mock_api_post.assert_awaited_with(
+        "/api/tasks/42/submit-review",
+        {"expected_sha": sha},
+        timeout=srv._TIMEOUT_SUBMIT,
+    )
+    assert srv._TIMEOUT_SUBMIT == 120.0 and srv._TIMEOUT_SLOW == 30.0
+
+
+async def test_only_submit_gets_the_long_client_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2057: настоящий _api_post называет в отказе срок, который просрочил."""
+    from hub import mcp_server as srv
+
+    async with _silent_hub(monkeypatch):
+        monkeypatch.setattr(srv, "_TIMEOUT_SUBMIT", 0.8)
+        with pytest.raises(HubApiError) as other:
+            await srv._api_post("/api/tasks/1/updates", {})
+        with pytest.raises(HubApiError) as submit:
+            await srv._api_post(
+                "/api/tasks/1/submit-review", {}, timeout=srv._TIMEOUT_SUBMIT
+            )
+    assert other.value.payload["timeout_seconds"] == 0.4
+    assert submit.value.payload["timeout_seconds"] == 0.8
 
 
 async def test_submit_answer_reads_as_new_when_the_generation_moves(
@@ -4053,11 +4156,13 @@ def _refusal_probe_arguments(tool: Any) -> dict[str, Any]:
     exist so the call reaches that layer, which is the only thing this probe
     is asking about.
     """
+    import types
     import typing
 
     def sample(annotation: Any) -> Any:
         origin = typing.get_origin(annotation)
-        if origin is typing.Union or type(origin).__name__ == "UnionType":
+        # ``int | None`` has origin ``types.UnionType`` itself, not an instance.
+        if origin is typing.Union or origin is types.UnionType:
             args = [a for a in typing.get_args(annotation) if a is not type(None)]
             return sample(args[0]) if args else "x"
         if annotation is int:

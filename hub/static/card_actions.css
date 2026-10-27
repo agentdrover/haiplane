@@ -1,0 +1,91 @@
+/* Панель действий и нижние листы карточки (#1813).
+   Цвет - только токены style.css (обе темы), литералов нет. Слои: навигация
+   телефона z-index 100, панель 90 (под навигацией, над содержимым), лист 110.
+   Без скрипта лист открывает :target (якорь кнопки панели); со скриптом -
+   класс is-open. */
+
+.c2-bar {
+    position: fixed;
+    left: var(--c2-side-w, 0); right: 0;
+    bottom: 0;
+    z-index: 90;
+    display: flex; align-items: center; gap: var(--sp-2);
+    padding: var(--sp-2) max(var(--sp-3), env(safe-area-inset-left));
+    padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom));
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    box-shadow: var(--shadow-lg);
+}
+.c2-bar--covered { display: none; }
+.c2-bar-btn {
+    flex: 1 1 0; min-width: 0;
+    display: inline-flex; flex-direction: column; align-items: center; justify-content: center;
+    min-height: 48px; padding: 4px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface-hover); color: var(--text);
+    font-weight: 600; font-size: 15px; text-align: center; text-decoration: none;
+    overflow-wrap: anywhere;
+}
+.c2-bar-btn--primary { background: var(--accent); border-color: var(--accent); color: var(--c2-on-accent); }
+.c2-bar-btn--primary:hover { color: var(--c2-on-accent); filter: brightness(1.08); }
+.c2-bar-mark { font-size: 10.5px; font-weight: 500; letter-spacing: 0.05em; text-transform: uppercase; }
+.c2-bar a:focus-visible, .c2-bar summary:focus-visible, .c2-sheet a:focus-visible,
+.c2-sheet button:focus-visible, .c2-sheet textarea:focus-visible,
+.c2-sheet input:focus-visible, .c2-sheet select:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 2px;
+}
+.c2-more { position: relative; flex: 0 0 auto; }
+.c2-more > summary {
+    display: inline-flex; align-items: center; justify-content: center; list-style: none;
+    min-width: 48px; min-height: 48px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface-hover); color: var(--text); font-size: 20px;
+}
+.c2-more > summary::-webkit-details-marker { display: none; }
+.c2-more-menu {
+    position: absolute; right: 0; bottom: calc(100% + var(--sp-2));
+    min-width: 200px; padding: var(--sp-2);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-lg);
+}
+.c2-more-menu a { display: block; padding: var(--sp-3); border-radius: 6px; color: var(--text); min-height: 44px; }
+
+/* Отступ, чтобы панель не закрывала конец страницы. Телефон: ещё и навигация. */
+.main { padding-bottom: 96px; }
+
+@media (max-width: 768px) {
+    /* Нижняя навигация телефона (.sidebar, fixed, z-index 100) - около 94px:
+       иконка и подпись друг над другом. Скрипт уточняет высоту в --c2-nav-h; без
+       скрипта запас 96px. Панель стоит над навигацией и не перекрывает её. */
+    .c2-bar { bottom: var(--c2-nav-h, 96px); padding-bottom: var(--sp-2); }
+    .main { padding-bottom: calc(var(--c2-nav-h, 96px) + 112px); }
+}
+
+.c2-sheet { display: none; position: fixed; inset: 0; z-index: 110; }
+.c2-sheet.is-open, .c2-sheet:target { display: flex; align-items: flex-end; justify-content: center; }
+.c2-sheet::before { content: ""; position: absolute; inset: 0; background: var(--bg); opacity: 0.72; }
+.c2-sheet-panel {
+    position: relative;
+    width: 100%; max-width: 640px; max-height: 92vh; overflow-y: auto;
+    padding: var(--sp-4) max(var(--sp-4), env(safe-area-inset-left));
+    padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom));
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: 14px 14px 0 0; box-shadow: var(--shadow-lg);
+}
+.c2-sheet-panel * { min-width: 0; overflow-wrap: anywhere; }
+.c2-sheet-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); }
+.c2-sheet-head h2 { margin: 0; font-size: 18px; }
+.c2-sheet-x { min-height: 44px; display: inline-flex; align-items: center; color: var(--accent-light); }
+.c2-sheet-intro { margin: var(--sp-2) 0 var(--sp-3); color: var(--text-secondary); font-size: 14px; }
+.c2-sheet-stale, .c2-sheet-note {
+    margin: var(--sp-2) 0; padding: var(--sp-3); border-radius: 8px; font-size: 14px;
+    background: var(--c2-amber-bg); color: var(--c2-amber-ink); box-shadow: inset 0 0 0 1px var(--c2-amber);
+}
+.c2-sheet-done {
+    margin: var(--sp-2) 0; padding: var(--sp-3); border-radius: 8px; font-size: 14px;
+    background: var(--c2-blue-bg); color: var(--c2-blue-ink); box-shadow: inset 0 0 0 1px var(--c2-blue);
+}
+.c2-sheet-stale[hidden] { display: none; }
+.c2-sheet form[data-sent="true"] button[type="submit"] { display: none; }
+.c2-sheet-pick { display: flex; gap: var(--sp-2); align-items: flex-start; min-height: 44px; font-size: 14px; }
+.c2-sheet .task-action-textarea { min-height: 96px; }
+.c2-sheet button[type="submit"] { min-height: 48px; width: 100%; }
+.c2-sheet-note .task-action-note { margin: 0; padding: 0; background: none; border: 0; box-shadow: none; color: inherit; }

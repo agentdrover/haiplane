@@ -48,6 +48,7 @@ def test_cmd_decide_accept_with_summary() -> None:
             "instructions": "",
             "decision_summary": "Accepted after review.",
             "record_decision": True,
+            "confirm_no_job": False,
         },
     )
 
@@ -74,6 +75,7 @@ def test_cmd_decide_rework_with_summary() -> None:
             "instructions": "Fix the bug.",
             "decision_summary": "Edge case in auth.",
             "record_decision": False,
+            "confirm_no_job": False,
         },
     )
 

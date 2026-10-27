@@ -6,7 +6,7 @@ import asyncio
 from functools import partial
 import contextlib
 import os
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 import logging
@@ -18,11 +18,18 @@ from fastapi import FastAPI
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.services import ci_head_run, delivery_notes, delivery_writes, watch_notices
-from hub.services import critic_orders, gate_observations, role_orders
+from hub.services import (
+    critic_orders,
+    delivery_wait,
+    gate_observations,
+    orchestrator_queue,
+    rework_launch,
+    role_orders,
+)
 from hub.services.release_deploy_watch import sweep as release_deploy_sweep
 from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
-from hub.db import fetchall, log_activity
+from hub.db import committed_if_own, fetchall, log_activity
 from hub.integrations.git_ops import WorkspaceNotReadyError
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
@@ -202,33 +209,31 @@ async def _handle_missing_job(db, task: dict, *, reason: str) -> None:
     await services.maybe_destroy_vast(db, task)
 
 
-@contextlib.contextmanager
-def _task_isolation(stage: str, task_id: Any) -> Iterator[None]:
-    """One task's failure must not skip the rest of the sweep (#363 I5).
+@contextlib.asynccontextmanager
+async def _task_isolation(db, stage: str, task_id: Any) -> AsyncIterator[None]:
+    """One task's failure must not skip the rest of the sweep (#363 I5, #1069).
 
-    The whole sweep used to sit inside a single ``try/except Exception``, so any
-    exception — a timed-out git call was the reported cause — abandoned every
-    later stage of that tick: review, ci_check, stale sweeps, claim expiry. And
-    it did so again every tick until the cause cleared. This wrapper stops that
-    at the level of one task; the per-sweep wrapper in ``_poll_running_tasks``
-    stops it at the level of one sweep (#1069).
+    Swallowing is deliberate: the poller re-reads state every tick and is
+    idempotent. ``CancelledError`` is a BaseException and passes through.
 
-    Swallowing here is deliberate and narrow. The poller re-reads state from the
-    database on every tick and is idempotent by design, so a task skipped once
-    is retried in seconds. ``CancelledError`` derives from ``BaseException`` and
-    is not caught, so shutdown still stops the loop promptly.
+    #2005: what the failed task left uncommitted is rolled back BEFORE the
+    exception is swallowed. Sweeps commit their own work (the tick-end rule in
+    ``_poll_once``); kept, the next sweep's commit would persist it (a
+    generation bump with the status unchanged).
     """
     try:
         yield
     except Exception:
         log.exception("Poll: %s failed for task #%s — tick continues", stage, task_id)
+        if db.in_transaction:
+            await db.rollback()
 
 
 async def _sweep_running_dispatch(db) -> None:
     """Running headless tasks: sync each with its dispatch job."""
     rows = await repo.list_running_dispatchable(db)
     for row in rows:
-        with _task_isolation("running", dict(row).get("id")):
+        async with _task_isolation(db, "running", dict(row).get("id")):
             task = dict(row)
             job = plugins.dispatch.get_job(task["job_id"])
             if not job:
@@ -860,7 +865,7 @@ async def _sweep_review(db) -> None:
     """Review tasks: settle finished review jobs into verdict handling."""
     review_rows = await repo.list_review_tasks(db)
     for row in review_rows:
-        with _task_isolation("review", dict(row).get("id")):
+        async with _task_isolation(db, "review", dict(row).get("id")):
             task = dict(row)
             job = plugins.dispatch.get_job(task["review_job_id"])
             if not job:
@@ -938,7 +943,7 @@ async def _sweep_ci_check(db) -> None:
     """ci_check tasks: ensure a PR exists, read CI, route the outcome."""
     ci_rows = await repo.list_ci_check_tasks(db)
     for row in ci_rows:
-        with _task_isolation("ci_check", dict(row).get("id")):
+        async with _task_isolation(db, "ci_check", dict(row).get("id")):
             task = dict(row)
             ctx = await services.project_git_context(db, task["id"])
             workspace = ctx.get("repo")
@@ -1017,6 +1022,7 @@ async def _sweep_ci_check(db) -> None:
                 )
                 continue
             await repo.reset_ci_check_state(db, task["id"])
+            await db.commit()  # #2005: the pass owns it; the network is next
             if ci.outcome == CIProbeOutcome.absent:
                 # A PR with no checks is a definite answer, not a wait: skip
                 # the CI conveyor and go straight to review (#419).
@@ -1027,6 +1033,7 @@ async def _sweep_ci_check(db) -> None:
                     "status",
                     "CI checks absent on PR — skipping CI, dispatching review.",
                 )
+                await db.commit()  # #2005
                 log.info(
                     "Poll: task #%d CI absent on PR #%s, dispatching review",
                     task["id"],
@@ -1251,7 +1258,7 @@ async def _sweep_stale_running(db) -> None:
     """Running tasks: lapsed waits and the silence ladder, one rung at a time."""
     stale_rows = await repo.list_stale_running(db, config.STALE_THRESHOLD_MINUTES)
     for row in stale_rows:
-        with _task_isolation("stale review", dict(row).get("id")):
+        async with _task_isolation(db, "stale review", dict(row).get("id")):
             await _stale_task_tick(
                 db,
                 dict(row),
@@ -1319,7 +1326,7 @@ async def _sweep_stale_statuses(db) -> None:
             require_null_review_job=null_review_job,
         )
         for row in rows:
-            with _task_isolation("stale sweep", dict(row).get("id")):
+            async with _task_isolation(db, "stale sweep", dict(row).get("id")):
                 await _stale_task_tick(db, dict(row), status_name, threshold, action)
 
     # Unrefined drafts (#751): a draft the DoR gate would refuse is a
@@ -1340,7 +1347,7 @@ async def _sweep_unrefined_drafts(db) -> None:
         (f"-{config.UNREFINED_DRAFT_MINUTES} minutes",),
     )
     for row in unrefined:
-        with _task_isolation("unrefined draft sweep", dict(row).get("id")):
+        async with _task_isolation(db, "unrefined draft sweep", dict(row).get("id")):
             task = dict(row)
             if await repo.has_stale_alert(db, task["id"], "draft"):
                 continue
@@ -1563,7 +1570,7 @@ async def _sweep_human_queue(db) -> None:
         sql, params = _human_queue_rows_sql(policy)
         rows = await fetchall(db, sql, params)
         for row in rows:
-            with _task_isolation("human queue", dict(row).get("id")):
+            async with _task_isolation(db, "human queue", dict(row).get("id")):
                 await _human_queue_tick(db, dict(row), policy)
 
 
@@ -1751,7 +1758,7 @@ async def _sweep_expired_claims(db) -> None:
     # seen once. Release does not dispatch; the task waits in open.
     expired_claims = await repo.list_expired_claims(db, config.CLAIM_LEASE_MINUTES)
     for row in expired_claims:
-        with _task_isolation("claim expiry", dict(row).get("id")):
+        async with _task_isolation(db, "claim expiry", dict(row).get("id")):
             task = dict(row)
             if not await run_claim.expire_claim(db, task):
                 await db.commit()  # захват успели сменить: выборка устарела
@@ -1805,7 +1812,7 @@ async def _sweep_machine_deadlines(db) -> None:
             require_review_job_id=policy.require_review_job_id,
         )
         for row in overdue:
-            with _task_isolation("deadline sweep", dict(row).get("id")):
+            async with _task_isolation(db, "deadline sweep", dict(row).get("id")):
                 task = dict(row)
                 await repo.add_task_update(
                     db,
@@ -1841,7 +1848,7 @@ async def _sweep_stale_arbiter(db) -> None:
         db, config.ARBITER_DISPATCH_GRACE_MINUTES
     )
     for row in stale_arbiter:
-        with _task_isolation("arbiter sweep", dict(row).get("id")):
+        async with _task_isolation(db, "arbiter sweep", dict(row).get("id")):
             task = dict(row)
             await repo.add_task_update(
                 db,
@@ -2018,7 +2025,7 @@ async def _sweep_pair_delivery(db) -> None:
         return
     for row in rows:
         task = dict(row)
-        with _task_isolation("pair-delivery", task.get("id")):
+        async with _task_isolation(db, "pair-delivery", task.get("id")):
             await _deliver_pair_task(db, task)
 
 
@@ -2070,8 +2077,10 @@ async def _deliver_pair_task(db, task: dict) -> None:
         ok, detail = False, delivery_pr.reason
     else:
         ok, detail = await services.merge_before_completion(db, task)
-    if not ok and await _explicit_outcome(db, task, detail):
-        return  # an outcome, not a wait: the sweep does not come back (#1706)
+    if (await delivery_wait.settle(db, task, "" if ok else detail, pr_num)) or (
+        not ok and await _explicit_outcome(db, task, detail)
+    ):
+        return  # an outcome, not a wait (#1706); or past its deadline (#1992)
     if not ok:
         # #951: a temporary state is not a decision, and the poller is the
         # place that has always known it — it simply comes back next pass.
@@ -2155,9 +2164,9 @@ async def _deliver_pair_task(db, task: dict) -> None:
         return
 
     if delivery_pr.reason:
-        # Terminal from here too — the task leaves the sweep once delivered,
-        # so this write happens at most once, and the commit below covers it.
-        await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
+        # Terminal, once per task; committed by its owner before the release (#2001).
+        async with committed_if_own(db):
+            await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
     _pair_delivery_waits.pop(task_id, None)
     # #812: delivery grew the release range. Best effort, exactly as on the
     # done path — a release that could not be prepared is a reason in the log,
@@ -2465,15 +2474,6 @@ async def _sweep_mcp_retention(db) -> None:
         )
 
 
-async def _sweep_orchestrator_queue(db) -> None:
-    # Очередь исполнения в тени (#1274): для каждого проекта с
-    # orchestrator_queue=shadow — событие «следующей взял бы #N» с причинами
-    # пропуска, только при смене ответа. Ни статуса, ни claim, ни воркспейса.
-    from hub.services.orchestrator_queue import shadow_pass
-
-    await shadow_pass(db)
-
-
 @dataclass(frozen=True)
 class Sweep:
     """One sweep in the tick: a name for the log and the coroutine to run."""
@@ -2514,6 +2514,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("executor_runs", _sweep_executor_runs),
     Sweep("executor_slots", _sweep_executor_slots),
     Sweep("executor_orders", _sweep_executor_orders),
+    Sweep("rework_launches", rework_launch.sweep),  # #1991: оборванный заказ
     Sweep("critic_orders", critic_orders.expire_due),  # #1953: срок заказа критика
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
@@ -2525,7 +2526,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("sessions_retention", _sweep_sessions_retention),
     Sweep("release_policy", _sweep_release_policy),
     Sweep("release_deploy_watch", release_deploy_sweep),
-    Sweep("orchestrator_queue", _sweep_orchestrator_queue),
+    Sweep("orchestrator_queue", orchestrator_queue.run_sweep),
     Sweep("messages_retention", _sweep_messages_retention),
     Sweep("mcp_retention", _sweep_mcp_retention),
 )

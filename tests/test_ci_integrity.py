@@ -390,6 +390,15 @@ async def test_an_explained_ci_change_goes_to_the_owner_with_a_note(
     refusals = await steward_apply.integrity_refusals(db, task_id)
     assert refusals and "входы CI" in refusals[0][1]
     # and the verdict transaction rereads the database and refuses too
+    # (#2037: the steward's right is read there as well, so the verdict is delegated)
+    project = await repo.resolve_project_for_task(db, task_id)
+    await repo.update_project(db, project["id"], gate_policy='{"verdict": "steward"}')
+    await db.commit()
+
+    async def _granted_now(_db):  # #2040: and the global act grant
+        return True
+
+    monkeypatch.setattr("hub.services.steward_shadow.act_granted_now", _granted_now)
     with pytest.raises(HTTPException) as err:
         await steward_applied._record(db, task_id, ReviewVerdict.approved, 1)
     assert err.value.status_code == 422 and "ci_integrity" in str(err.value.detail)

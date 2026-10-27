@@ -1910,6 +1910,19 @@ async def test_a_report_between_the_verdict_gate_and_its_apply_refuses_the_appro
         return await real_apply(state)
 
     monkeypatch.setattr(lifecycle, "_apply_verdict", a_report_arrives_first)
+    if steward:  # #2037: the steward's right to approve is read in the transaction
+        from hub.services import steward_shadow
+        from tests.test_steward_shadow import _project
+
+        async def _granted_now(_db):
+            return True
+
+        monkeypatch.setattr(steward_shadow, "act_granted_now", _granted_now)
+
+        await repo.update_task(
+            db, task_id, project_id=await _project(db, "ci-trust-steward")
+        )
+        await db.commit()
     with pytest.raises(HTTPException) as refused:
         await lifecycle.record_review_verdict(
             db,

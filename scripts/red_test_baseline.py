@@ -36,6 +36,10 @@ import xml.etree.ElementTree as ET  # nosec B405 - junit XML pytest just wrote
 from pathlib import Path, PurePosixPath
 
 TESTS_DIR = "tests/"
+#: #1996: browser scenarios need Chromium, which no baseline run has. pytest's
+#: `--ignore` does not guard an explicitly named path, and this script names
+#: every changed module explicitly, so the directory is left out here by path.
+BROWSER_TESTS_DIR = "tests/gui/"
 _RUN_TIMEOUT = 480
 _MESSAGE_MAX = 300
 #: Сообщения, по которым провал внутри теста — неверная причина, а не assert.
@@ -65,7 +69,11 @@ def changed_test_files(repo: Path, merge_base: str, head: str) -> list[str]:
     out = git(
         repo, "diff", "--name-only", "--diff-filter=d", merge_base, head, "--", "tests"
     )
-    return sorted(p for p in out.splitlines() if p.startswith(TESTS_DIR))
+    return sorted(
+        p
+        for p in out.splitlines()
+        if p.startswith(TESTS_DIR) and not p.startswith(BROWSER_TESTS_DIR)
+    )
 
 
 def copy_from_head(repo: Path, head: str, paths: list[str], dest: Path) -> None:

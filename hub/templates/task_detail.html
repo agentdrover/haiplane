@@ -101,7 +101,17 @@
     </div>
     {% endif %}
 
+    {# #1813: статус, справка и доступные действия - один фрагмент #c2-live. Он
+       обновляется сам (раз в 15 с, но не при недописанном вводе - защита #1996 - и после ответа листа) и ТОЛЬКО он: .main целиком
+       автообновление больше не заменяет. Листы действий лежат ниже, вне фрагмента,
+       поэтому открытый лист и введённый текст автообновление не трогает; метка
+       data-* нужна листам, чтобы заметить смену сдачи. В фрагменте нет полей ввода. #}
+    <div id="c2-live" data-status="{{ task.status.value }}" data-submission-generation="{{ card_actions.live.submission_generation }}" data-statement-generation="{{ card_actions.live.statement_generation }}" data-review-verdict-revision="{{ card_actions.live.review_verdict_revision }}"
+         hx-get="/tasks/{{ task.id }}" hx-select="#c2-live" hx-target="this" hx-swap="outerHTML" data-hub-autorefresh
+         hx-trigger="{{ 'c2-refresh' if task.status.value in ('completed', 'rejected') else 'every 15s [!window.hubHasUnsavedInput()], c2-refresh' }}">
     {% include "partials/card_c2.html" %}
+    {% include "partials/card_actions_bar.html" %}
+    </div>
 
     {# #1812: ответ на действие (ошибка, одноразовый код, отказ, плашка запуска)
        не должен прятаться в свёрнутом блоке: с обратной связью он раскрыт. #}
@@ -255,6 +265,11 @@
                     } %}
                     <dt>Состояние гипотезы</dt>
                     <dd data-outcome-status="{{ outcome_status_value }}">{{ outcome_status_labels.get(outcome_status_value, outcome_status_value) }}</dd>
+                    {% endif %}
+                    {%- if task.outcome_ownership and task.outcome_ownership.state != 'independent' %}
+                    {% set own = task.outcome_ownership %}
+                    <dt>Владелец обещания</dt>
+                    <dd data-outcome-ownership="{{ own.state }}">{% if own.state == 'covered' %}Держит <a href="/tasks/{{ own.owner_task_id }}">#{{ own.owner_task_id }}</a> (это не ответ){% else %}Связь с <a href="/tasks/{{ own.owner_task_id }}">#{{ own.owner_task_id }}</a> не действует: {{ own.reason }}; она не освобождает обещание{% endif %}</dd>
                     {% endif %}
                     {% if task.outcome_metric %}
                     <dt>Outcome Metric</dt>
@@ -673,19 +688,7 @@
                   {{ csrf_field() }}
                     <button class="btn task-action-btn" type="submit">Передать в облачный чат</button>
                 </form>
-                {#- #1712: хаб сам выдаёт код слоту хоста; человек код не видит. -#}
-                {%- for slot_host in slot_hosts %}
-                <form method="post" action="/tasks/{{ task.id }}/web-executor-slot" class="task-action-stack task-action-stack--separated">
-                  {{ csrf_field() }}
-                    <input type="hidden" name="host" value="{{ slot_host }}">
-                    {%- if launch_plaque and launch_plaque.active %}
-                    <button class="btn btn-primary task-action-btn" type="button" disabled>Запуск идёт: {{ launch_plaque.button_label or launch_plaque.headline }}</button>
-                    {%- else %}
-                    <button class="btn btn-primary task-action-btn" type="submit"
-                            onclick="return confirm('Запустить исполнителя на слоте {{ slot_host }} для задачи #{{ task.id }}? Хаб сам передаст код хосту.')">Запустить на {{ slot_host }}</button>
-                    {%- endif %}
-                </form>
-                {%- endfor %}
+                {%- include "partials/slot_launch_forms.html" %}
 
                 {% elif task.status.value == 'needs_info' %}
                 <div class="task-action-state task-action-state--warning">Answer Required</div>
@@ -722,6 +725,7 @@
                     <button class="btn btn-success task-action-btn" type="submit" name="action" value="accept">Accept as Completed</button>
                     <label class="task-action-label" for="task-rework-instructions">Instructions for rework</label>
                     <textarea id="task-rework-instructions" name="instructions"{% if form_values.get('instructions') %} data-hub-restored{% endif %} class="task-action-control task-action-textarea" placeholder="What specifically needs to be fixed...">{{ form_values.get('instructions', '') }}</textarea>
+                    <label class="task-action-label"><input type="checkbox" name="confirm_no_job" value="1"> Прошлый заказ доработки оборвался, и задания в очереди диспетчера нет (подтверждаю)</label>
                     <button class="btn btn-warning task-action-btn" type="submit" name="action" value="rework">Send Back for Rework</button>
                 </form>
 
@@ -750,10 +754,12 @@
                         hx-select=".main"
                         hx-target=".main"
                         hx-swap="innerHTML"
-                        hx-trigger="click, every 15s [!window.hubHasUnsavedInput()]"
+                        hx-trigger="click"
                         data-hub-autorefresh>
                     Refresh Status <span class="htmx-indicator">&#10227;</span>
                 </button>
+                {#- #1998: после «на доработку» running без признаков работы — круг починки на слоте. -#}
+                {%- include "partials/slot_launch_forms.html" %}
                 {% include "partials/return_to_work.html" %}
 
                 {% else %}
@@ -1085,5 +1091,6 @@
     </div>
     </details>
 </article>
+{% include "partials/card_sheets.html" %}
 {% include "partials/card_c2_script.html" %}
 {% endblock %}

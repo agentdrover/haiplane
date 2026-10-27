@@ -126,7 +126,11 @@ async def _ci_wait_gate(
 
     ci = await ci_wait_view(db, task)
     if not ci.waiting:
-        return gate
+        if not ci.state:
+            return gate
+        # #2027: ждать нечего, но CI не подтверждён — судим и говорим почему.
+        note = f"стюард судит без подтверждённого CI: {ci.state}"
+        return ReviewGate(because=gate.because or note, ci_note=note)
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0)
     stamp = "" if since else await _first_deferral_stamp(db, task_id, generation)

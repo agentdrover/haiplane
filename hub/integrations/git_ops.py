@@ -1,11 +1,8 @@
 """Git operations for the Hub branching workflow, plus the forge they pair with.
 
 Local git operations run against the workspace repo (config.WORKSPACE_REPO_LINK).
-Everything that is asked of the REPOSITORY HOST rather than of git — pull
-requests, CI outcomes, merges — goes through ``protocols.ForgePlugin`` (#1113).
-Until then those nineteen methods called ``gh`` here directly, and "which
-forge" was spread across nineteen call sites with no place to plug a second
-one in.
+Everything asked of the REPOSITORY HOST rather than of git — pull requests, CI
+outcomes, merges — goes through ``protocols.ForgePlugin`` (#1113).
 """
 
 from __future__ import annotations
@@ -163,11 +160,9 @@ def _origin_host(url: str) -> str:
 class WorkspaceNotReadyError(Exception):
     """create_branch refused to prepare a branch (#361).
 
-    Distinct from returning "": that means "no branch was created" and covers
-    the perfectly ordinary case of a hub running without git integration
-    (NoopGitOps). Collapsing a refusal into it would turn an unconfigured hub
-    into a blocked one — the same ambiguity that made auto_commit's False
-    useless to its caller.
+    Distinct from returning "" ("no branch created", e.g. a hub without git
+    integration, NoopGitOps): collapsing a refusal into it would turn an
+    unconfigured hub into a blocked one.
     """
 
 
@@ -226,16 +221,9 @@ class PairBranchConflictError(Exception):
         return enrich_error_payload(payload)
 
 
-# ---------------------------------------------------------------------------
-# Helpers (module-private)
-# ---------------------------------------------------------------------------
-
-
-# Тонкие обёртки над общим слоем запуска процессов (#1113). Именно обёртки, а
-# не присваивание `_run = proc.run`: присваивание захватывает объект функции, и
-# тогда подмена `proc.run` этот модуль уже не затрагивает — сема ломается
-# ровно там, где её и проверяют. Обёртка ищет `proc.run` в момент вызова, так
-# что работают обе точки подмены.
+# Тонкие обёртки над proc (#1113), а не `_run = proc.run`: присваивание
+# захватывает объект функции, и подмена `proc.run` этот модуль не затронет.
+# Обёртка ищет `proc.run` в момент вызова.
 
 
 def _repo_root() -> str:
@@ -273,12 +261,10 @@ _DIRTY_PATHS_NAMED = 10
 async def _dirty_state(repo: str) -> tuple[str, list[str]]:
     """``(raw porcelain, paths)`` for ``repo`` — dirtiness and what is dirty.
 
-    Both halves come from one ``git status`` because they must agree: the raw
-    text decides whether to refuse, the parsed paths say what to name. The
-    ``-z`` form is what makes the second half usable — without it git escapes
-    any non-ASCII path (``docs/Тест.md`` arrives as ``"docs/\\320\\242..."``),
-    and a refusal that names a file under a name the person cannot find in
-    their own checkout has not really named it (#555, same defect one layer up).
+    Both halves come from one ``git status`` so they agree: the raw text
+    decides whether to refuse, the paths say what to name. ``-z`` is required:
+    without it git escapes non-ASCII paths, and a refusal naming a file under a
+    name the person cannot find in their checkout has not named it (#555).
     """
     _, out, _ = await _git("status", "--porcelain", "-z", repo=repo, check=False)
     return out, parse_porcelain_paths(out)
@@ -316,11 +302,9 @@ def _pair_branch_conflict(
 ) -> PairBranchConflictError:
     host = _hostname()
     if hint is None and current_branch and task_id is not None:
-        # #475: the operator is told to check out the branch this project
-        # actually integrates on. A literal here sent a calc-kids operator to
-        # `git checkout develop` in a clone that has no develop — an
-        # instruction that fails is worse than none, because it reads as the
-        # fix and leaves the workspace exactly as it was.
+        # #475: name the base this project integrates on, not a literal
+        # develop (a clone may have none): an instruction that fails reads as
+        # the fix and leaves the workspace as it was.
         base = _resolve_base(base_branch)
         hint = (
             f"SSH to {host}, then: cd {repo} && git checkout {base} "
@@ -353,13 +337,9 @@ async def _count_commits(spec: str, repo: str) -> int:
 class BranchPushStatus:
     """Where a branch's commits live — on the server, or only in this clone.
 
-    Two separate facts, kept separate (#954). The old check asked only whether
-    ``refs/remotes/origin/<branch>`` existed locally and reported its absence
-    as unpushed work, so a branch that was on the remote and simply never
-    fetched was indistinguishable from one that existed nowhere else. On 25.08
-    that read blocked the start of #953 with a warning about commits of #951
-    that did not exist; since #966 it instead makes the hub push a stranger's
-    branch on the same untrue premise.
+    Two separate facts, kept separate (#954, #953): a branch that is on the remote
+    but was never fetched here must not be read as unpushed work, nor make the
+    hub push a stranger's branch on that untrue premise.
     """
 
     on_remote: bool
@@ -375,12 +355,10 @@ class BranchPushStatus:
 async def _branch_push_status(branch: str, repo: str, base: str) -> BranchPushStatus:
     """Ask the remote, not the local cache of it, where a branch stands.
 
-    A clone that never fetched a branch knows nothing about it, and "I have not
-    looked" must not be reported as "the work is not there" — the line #767 and
-    #498 drew for PR lookup, applied to refs. So a missing tracking ref is
-    refreshed with one targeted fetch before any verdict is formed. The refspec
-    is explicit: ``git fetch origin <branch>`` alone is not guaranteed to write
-    ``refs/remotes/origin/<branch>``, and this function's whole job is that ref.
+    "I have not looked" must not be reported as "the work is not there"
+    (#767, #498): a missing tracking ref is refreshed by one targeted fetch
+    before any verdict. The refspec is explicit: ``git fetch origin <branch>``
+    alone is not guaranteed to write ``refs/remotes/origin/<branch>``.
     """
     ref = f"origin/{branch}"
 
@@ -470,8 +448,7 @@ async def _worktree_registered(path: str, repo: str) -> bool:
 def worktree_hint(task_id: int) -> str:
     """Where a task's worktree goes, as a template the caller can read (#1515).
 
-    The hub does not know the folder name of the caller's clone (the project
-    repo agentdrover/Spike_bo may live in a clone called spike_bo), so it can
+    The hub does not know the folder name of the caller's clone, so it can
     name only the shape. The shape is cut from ``_worktree_path`` itself with a
     placeholder clone name: there is no second formula to drift from it.
     """
@@ -576,13 +553,12 @@ async def ensure_task_worktree(
     """Create or reuse the task's worktree at the #459 path; return the path.
 
     A new copy takes the task branch from, in order: the local branch, the
-    branch on origin (tracking it, so work already pushed is not lost), the
-    base. Fetch failures are appended to ``notes``.
+    branch on origin (tracking it, so work already pushed is not lost),
+    ``origin/<base>``, the local base. Both that and fetch failures go to ``notes``.
 
-    Reuses a registered worktree of ``repo`` that is already on ``branch``.
-    Refuses — changing nothing — when the path holds anything else: another
-    branch (its dirty files are named), or a directory git does not know.
-    Never deletes and never switches a branch.
+    Reuses a registered worktree of ``repo`` already on ``branch``; refuses, changing
+    nothing, when the path holds another branch (dirty files named) or a directory
+    git does not know. Never deletes and never switches a branch.
     """
     wt_path = _worktree_path(task_id, repo)
     await _git("worktree", "prune", repo=repo, check=False)
@@ -617,14 +593,18 @@ async def ensure_task_worktree(
         if rc == 0:
             args = ("worktree", "add", "-b", branch, wt_path, remote)
         else:
-            rc, _, _ = await _git("rev-parse", "--verify", base, repo=repo, check=False)
-            start = base if rc == 0 else f"origin/{base}"
-            args = ("worktree", "add", "-b", branch, wt_path, start)
+            # Fetched base first, local as fallback; --no-track: develop is never upstream.
+            ref = f"refs/remotes/origin/{base}"
+            rc, *_ = await _git("rev-parse", "--verify", ref, repo=repo, check=False)
+            start = ref if rc == 0 else base
+            args = ("worktree", "add", "--no-track", "-b", branch, wt_path, start)
     rc, _, err = await _git(*args, repo=repo, check=False)
     if rc != 0:
         raise WorktreeRefused(
             f"git не создал копию {wt_path}: {(err or '').strip() or 'worktree add'}"
         )
+    if "--no-track" in args and args[-1] == base and notes is not None:  # after git
+        notes.append(f"origin/{base} нет: ветка начата от локальной {base}")
     return wt_path
 
 
@@ -650,13 +630,10 @@ async def _default_workspace_error() -> str | None:
     )
 
 
-# Transliteration for slugs (#607). A fully Cyrillic title used to slug to
-# the empty string: pair-start then built "task-601/" (fatal: invalid branch
-# name) and the delivery gate's very first squash subject came out as
-# "feat(task):  (#569)". One table here fixes every consumer at once — six
-# call sites funnel through _slugify, and both incidents were the same hole.
-# Deterministic by construction: the canonical-branch gate (#533) compares
-# names strictly, so one title must always yield one slug.
+# Transliteration for slugs (#607, #569): a fully Cyrillic title must not slug to ""
+# ("task-601/" is an invalid branch name). One table for every _slugify
+# consumer; deterministic, because the canonical-branch gate (#533) compares
+# names strictly: one title, one slug.
 _CYRILLIC_TO_LATIN = {
     "а": "a",
     "б": "b",
@@ -716,28 +693,19 @@ def _scratch_worktree(workspace: str, kind: str, pr_number: int) -> str:
 def canonical_task_branch(task_id: int, branch_slug: str, title: str = "") -> str:
     """The one place a task's branch name is assembled (#884).
 
-    Three call sites used to build ``f"task-{id}/{slug}"`` inline, and none
-    asked whether the slug already carried that prefix. A caller passing
-    "task-818/daily-digest" — which is exactly how the branch is written in a
-    work plan — got ``task-818/task-818/daily-digest``. On production that
-    cost four mechanisms in a row: the gate could not find the PR for such a
-    name, pr_number stayed empty, the merge went outside the pipeline, and
-    the dependency graph then reported delivered code as undelivered.
-
-    Same lesson as #607, which put transliteration behind one function: a
-    rule copied into three call sites drifts, starting with the copy nobody
-    touches.
+    A slug already carrying ``task-<id>/`` (as a work plan writes it) must not
+    double into ``task-818/task-818/...``: the gate then cannot find the PR and
+    delivered code is reported undelivered. One function, not inline copies,
+    so the rule cannot drift (#607).
 
     The prefix is stripped only when it matches THIS task exactly, slash
-    included — a slug like "task-runner-fix" is a name, not a prefix. The
-    strip repeats, so a branch already doubled by the old code normalises on
-    its next pair-start instead of growing again.
+    included — "task-runner-fix" is a name, not a prefix. The strip repeats,
+    so an already doubled branch normalises on its next pair-start.
     """
     slug = (branch_slug or "").strip()
     prefix = f"task-{task_id}/"
-    # Strip BEFORE trimming slashes: "task-601/" only reads as a prefix while
-    # its trailing slash is still there. Trimming first left "task-601" and
-    # produced "task-601/task-601" — caught by the empty-slug test below.
+    # Strip BEFORE trimming slashes: "task-601/" is a prefix only while its
+    # trailing slash is still there.
     while slug.startswith(prefix):
         slug = slug[len(prefix) :]
     slug = slug.strip("/")
@@ -819,11 +787,9 @@ async def _git(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str
     return await _run("git", "-C", repo, *args, cwd=repo, **kw)
 
 
-# #1332: код возврата shell для «команда не найдена». Проверка, которая не
-# смогла запустить свой инструмент, ничего не сказала о дереве — это дефект
-# среды хоста, и читатель обязан увидеть именно его и имя команды, а не
-# «валидация упала»: 23.09.2026 так прочли #1242, и искать бинарь пришлось
-# по ssh.
+# #1332: код возврата shell для «команда не найдена». Проверка, не запустившая
+# свой инструмент, ничего не сказала о дереве: читатель должен увидеть дефект
+# среды хоста и имя команды, а не «валидация упала».
 _COMMAND_NOT_FOUND_RC = 127
 
 
@@ -964,17 +930,14 @@ async def _refresh_remote_ref(name: str, repo: str) -> tuple[str, str]:
 async def _resolve_ref_remote_first(name: str, repo: str) -> str | None:
     """Resolve a branch to a sha, preferring ``origin/<name>`` (#762).
 
-    The mirror image of ``_resolve_ref``, and the difference is the point. For
-    a comparison the hub is going to judge, the pushed branch is the subject:
-    a local ref in the workspace is whatever some earlier checkout left there,
-    and on pair tasks — where the branch is written on a developer's machine —
-    it can trail origin by every commit under review. That is how a submission
-    of real work came back as "дифф пуст" (#759, #756): git answered honestly
-    about a ref that was not the branch anyone meant.
+    The mirror image of ``_resolve_ref``. For a comparison the hub will judge,
+    the pushed branch is the subject: a local ref can trail origin by every
+    commit under review (a submission of real work came back as "дифф пуст",
+    #759, #756).
 
-    Falls back to the local ref when ``origin/<name>`` does not exist at all,
-    which covers a workspace with no remote — there is nothing fresher to
-    prefer, and refusing would turn a local-only repository into an error.
+    Falls back to the local ref when ``origin/<name>`` does not exist at all
+    (a workspace with no remote): refusing would turn a local-only repository
+    into an error.
     """
     for ref in (f"origin/{name}", name):
         rc, out, _ = await _git(
@@ -994,16 +957,13 @@ async def _diff_ends(base: str, sha: str, repo: str) -> tuple[str, str] | None:
     """Both ends of a ``base...sha`` comparison, as SHAs, origin-first (#1239).
 
     ``None`` when either end resolves nowhere — the caller then says "could not
-    read", never "nothing changed". No fallback to the bare names is attempted
-    on that path on purpose: a comparison the hub shows a human must not
-    silently degrade into a comparison against whatever an old checkout left
-    behind, which is precisely the answer this helper exists to stop.
+    read", never "nothing changed". No fallback to the bare names on that path:
+    a comparison shown to a human must not silently degrade into one against an
+    old checkout.
 
-    ``_resolve_ref_remote_first`` is reused rather than reimplemented: it is
-    the resolver ``branch_diff`` and ``branch_diff_paths`` have used since
-    #762/#1055, and its own local fallback (used only when ``origin/<name>``
-    does not exist at all) keeps a local-only clone working. A pinned sha
-    resolves through it too — ``origin/<sha>`` misses, the bare sha hits.
+    Reuses ``_resolve_ref_remote_first``: its local fallback keeps a local-only
+    clone working, and a pinned sha resolves too (``origin/<sha>`` misses, the
+    bare sha hits).
     """
     base_sha = await _resolve_ref_remote_first(base, repo)
     head_sha = await _resolve_ref_remote_first(sha, repo)
@@ -1017,17 +977,14 @@ async def _diff_ends(base: str, sha: str, repo: str) -> tuple[str, str] | None:
     return base_sha, head_sha
 
 
-# Ancestry between two task branches (#1184). The names say which side of the
-# pair the HEAD branch — the one being submitted — sits on, so a caller never
-# has to remember argument order to read the answer.
+# Ancestry between two task branches (#1184). The names say which side of the pair
+# the HEAD branch (the one being submitted) sits on: no argument order to remember.
 STACK_ANCESTRY_HEAD_IS_DESCENDANT = "head_is_descendant"
 STACK_ANCESTRY_HEAD_IS_ANCESTOR = "head_is_ancestor"
 STACK_ANCESTRY_UNRELATED = "unrelated"
-# One commit under two branch names (#1193). Kept apart from "unrelated"
-# because the two facts are opposite: there each branch is outside the
-# other's history, here each IS the other's history. Both name no merge
-# order, and that shared answer is exactly what let the false explanation
-# hide — the caller words them differently.
+# One commit under two branch names (#1193). Kept apart from "unrelated": there
+# each branch is outside the other's history, here each IS the other's. Both
+# name no merge order; the caller words them differently.
 STACK_ANCESTRY_SAME_TIP = "same_tip"
 STACK_ANCESTRY_UNKNOWN = "unknown"
 
@@ -1035,36 +992,25 @@ STACK_ANCESTRY_UNKNOWN = "unknown"
 def _resolve_base(base_branch: str | None) -> str:
     """The base a task's work is cut from AND its PR targets (#362 I4).
 
-    One function on purpose. create_branch used to default to "main" while
-    create_pr defaulted to PAIR_BASE_BRANCH, so on the default project (whose
-    git context is empty) every headless branch was cut from main and its PR
-    aimed at develop. The damage is not a cosmetic diff: with a stale
-    merge-base, a change develop made to a line the task never touched shows
-    up as a conflict against the task branch. Two defaults that must agree
-    are a defect waiting to happen; there is now only one.
+    One function on purpose: two defaults that disagree cut a branch from main
+    while its PR aims at develop, and a stale merge-base turns a change develop
+    made to a line the task never touched into a conflict.
     """
     return base_branch or PAIR_BASE_BRANCH
 
 
 # --- memory for the stacking probe (#1205) ---------------------------------
 #
-# #1186 turned the stacking walk from a twice-per-submission advisory into a
-# DELIVERY CONDITION, evaluated by the poller every POLL_INTERVAL for every
-# task waiting to be delivered — and a hold can last hours. Nothing between
-# cycles remembered the answer, so the whole walk was re-run from scratch
-# every minute for as long as the hold lasted.
+# The stacking walk is a DELIVERY CONDITION (#1186) that the poller re-runs
+# every POLL_INTERVAL while a hold lasts (hours), so its answer is remembered.
 #
-# The key is the three SHAs, never the branch names and never a clock. The
-# probe's whole body is two rev-lists over three resolved commits, so a repeat
-# with the same three commits can only produce the same answer. A name-keyed
-# or time-keyed memory would do the opposite: hand a delivery a ``clear``
-# taken before the branch moved, which is exactly the merge #1186 exists to
-# prevent.
+# The key is the three SHAs, never branch names or a clock: the probe is two
+# rev-lists over three resolved commits, so the same commits give the same
+# answer. A name- or time-keyed memory could hand a delivery a ``clear`` taken
+# before the branch moved, which is the merge #1186 exists to prevent.
 #
-# Only definite answers are remembered. ``unavailable`` is retryable by
-# construction (#1197 keeps it apart from ``unsupported`` for that reason), so
-# caching it would make one failed git call stick to a pair of commits
-# forever.
+# Only definite answers are remembered. ``unavailable`` is retryable (#1197),
+# so caching it would glue one failed git call to a pair of commits forever.
 _STACK_PROBE_CACHE: dict[tuple[str, str, str, str], StackProbeResult] = {}
 
 #: The walk is bounded by the number of tasks with live branches, and the SHAs
@@ -1090,12 +1036,9 @@ def _stack_probe_cache_put(
 ) -> None:
     """Remember a DEFINITE answer for this exact triple of commits.
 
-    Nothing else is remembered. An answer that is not ``stacked`` or ``clear``
-    is one we failed to get — ``unavailable`` is retryable by construction
-    (#1197) — and remembering a failed git call would glue one bad minute to a
-    pair of commits for as long as they stand. There is also no key to
-    remember it under when a SHA did not resolve: the key IS the freshness
-    check, so an answer without one can only be asked for again (#1205 AC-4).
+    Only ``stacked``/``clear``: ``unavailable`` is retryable (#1197), and a
+    remembered failed git call would stick to the pair. An unresolved SHA has no
+    key, and the key IS the freshness check, so it is asked again (#1205 AC-4).
     """
     if result.outcome not in (StackProbeOutcome.stacked, StackProbeOutcome.clear):
         return
@@ -1104,21 +1047,14 @@ def _stack_probe_cache_put(
     _STACK_PROBE_CACHE[key] = result
 
 
-# ---------------------------------------------------------------------------
-# Plugin class
-# ---------------------------------------------------------------------------
-
-
 async def _push_tree_head(
     repo: str, path: str, temp: str, target: str, lease: str | None = None
 ) -> tuple[int, str]:
     """Запушить HEAD одноразового дерева в ``target`` через временную ветку.
 
-    pre-push хук (.githooks/pre-push) читает ЛОКАЛЬНЫЙ ref строки пуша, и ни
-    «HEAD», ни голый sha в его списке нет, — а хаб вооружает хуком каждый клон
-    воркспейса сам (#532). Так резались восстановление релизной ветки (#949),
-    обновление ветки PR (#1419), автомерж базы (#1233) и мерж пушем (#1116):
-    27.09 на проде «Blocked push from branch 'HEAD'» (#1438).
+    pre-push хук (.githooks/pre-push) читает ЛОКАЛЬНЫЙ ref строки пуша, а ни
+    «HEAD», ни голого sha в его списке нет (#1438); хаб вооружает хуком каждый
+    клон воркспейса (#532).
 
     Поэтому коммит кладётся во временную локальную ветку с именем по шаблону
     хука (``temp``) и пушится полным refspec — хук видит обычную ветку, обхода
@@ -1206,10 +1142,8 @@ def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
 class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     """Concrete git_ops plugin: local git here, the repository host behind a forge.
 
-    ``forge`` is an attribute rather than a module-level singleton so a
-    project on another host can be given its own adapter without touching a
-    single call site (#1112). Today every project is on GitHub, so the
-    default is the GitHub adapter and nothing observable changes.
+    ``forge`` is an attribute, not a module-level singleton, so a project on
+    another host gets its own adapter without touching a call site (#1112).
     """
 
     def __init__(self, forge: ForgePlugin | None = None) -> None:
@@ -1218,17 +1152,12 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     def _forge_for(self, forge: str = "") -> ForgePlugin:
         """Адаптер ДЛЯ ЭТОГО ВЫЗОВА (#1146).
 
-        До задачи форж был свойством инстанса: ``plugins.forge`` выбирался один
-        раз при старте и обслуживал все проекты, а колонка ``projects.forge``
-        (#1114) не читалась никем — смена форжа меняла только текст в карточке.
-
-        Правило одно, и оба его случая нужны:
+        Колонка ``projects.forge`` (#1114) раньше не читалась: форж выбирался
+        один раз при старте и обслуживал все проекты.
 
         * Имя не названо ИЛИ настроенный адаптер обслуживает именно этот форж —
-          отвечает настроенный. Это сохраняет поведение всех существующих
-          github-проектов до последнего кода возврата и, что важнее, сохраняет
-          ПОДМЕНУ: тест, вложивший свой адаптер, продолжает получать вызовы, а
-          не свежий настоящий GitHubForge.
+          отвечает настроенный: поведение github-проектов не меняется, а ПОДМЕНА
+          адаптера в тесте продолжает получать вызовы.
         * Проект объявил другой форж — вызов уходит к адаптеру этого форжа.
 
         Отдельно ненастроенный хаб. ``NoopForge`` означает «хостинга нет вовсе»,
@@ -1289,17 +1218,15 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         if not (head and other):
             return STACK_ANCESTRY_UNKNOWN
 
-        # is_ancestor (#497) already answers this question for the whole hub,
-        # with the same three answers — and a second primitive for one
-        # question is how a pair of disagreeing answers gets built.
+        # is_ancestor (#497) is the one primitive for this question; a second
+        # one lets two answers disagree.
         head_is_descendant = await self.is_ancestor(repo, other, head)
         head_is_ancestor = await self.is_ancestor(repo, head, other)
         if head_is_descendant is None or head_is_ancestor is None:
             return STACK_ANCESTRY_UNKNOWN
         if head_is_descendant and head_is_ancestor:
-            # Both answers yes is only possible for one commit: a commit is
-            # its own ancestor, and two DIFFERENT commits cannot each contain
-            # the other. No third git question is needed to know this.
+            # Both yes is possible only for one commit: two DIFFERENT commits
+            # cannot each contain the other.
             return STACK_ANCESTRY_SAME_TIP
         if head_is_descendant:
             return STACK_ANCESTRY_HEAD_IS_DESCENDANT
@@ -1316,12 +1243,10 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> bool:
         """True when ``branch`` carries commits unique to ``other_branch`` (#438).
 
-        The advisory predicate, unchanged for its two advisory callers: a
-        stack is True, everything else — including every way the question
-        could not be answered — is False. It no longer OWNS that judgement,
-        it reads it off ``branch_stacking_probe`` (#1186), so there is one
-        place where the git work is done and one place to fix when it is
-        wrong. What "False" hides is exactly what the probe spells out.
+        The advisory predicate: a stack is True, everything else — including
+        every way the question could not be answered — is False. It reads the
+        judgement off ``branch_stacking_probe`` (#1186), which spells out what
+        "False" hides.
         """
         probe = await self.branch_stacking_probe(
             branch, other_branch, base_branch=base_branch, repo=repo
@@ -1337,9 +1262,8 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> StackProbeResult:
         """Does ``branch`` carry commits unique to ``other_branch`` (#438, #1186)?
 
-        The one-pair question, unchanged for its callers — it is now a walk of
-        one over ``branch_stacking_probe_batch``, so there is a single body
-        doing the git work and a single place where the memory lives.
+        A walk of one over ``branch_stacking_probe_batch``: one body does the
+        git work and holds the memory.
         """
         async for _, result in self.branch_stacking_probe_batch(
             branch, (other_branch,), base_branch=base_branch, repo=repo
@@ -1371,50 +1295,32 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         named, never ``clear``. The distinction is free for the advisory
         callers and load-bearing for the delivery gate, which merges on it.
 
-        WHY A LIST AND NOT A PAIR (#1205). The caller's real question has
-        always been "is this branch stacked on any of these", and asking it a
-        pair at a time made ``branch`` and the base resolve again for every
-        candidate — two extra subprocesses per row, paid every poll cycle for
-        as long as a delivery is held. Hoisting them out of the loop is a
-        property of the SHAPE here, not of the caller remembering to be
-        careful.
+        A LIST, NOT A PAIR (#1205): ``branch`` and the base resolve once for
+        the whole walk, not per candidate (two extra subprocesses per row on
+        every poll cycle while a delivery is held).
 
-        LAZY ON PURPOSE. The gate stops at the first dangerous stack (#1186),
-        so answering the whole list up front would spend rev-lists on rows
-        nobody reads. Yielding pairs lets the caller stop where it always
-        stopped.
+        LAZY ON PURPOSE: the gate stops at the first dangerous stack (#1186),
+        so yielding pairs spares rev-lists on rows nobody reads.
 
         A ref that resolves nowhere is REFRESHED ONCE before the answer is
-        formed (#1204, found by the machine review of submission #3). Without
-        that, ``ref_unresolved`` conflated two opposite facts: a branch deleted
-        on the server, and a branch this clone simply never fetched — the
-        resolver reads local refs only. Consumers cannot tell them apart, and
-        the delivery gate had started to act on the difference, telling a human
-        "nobody will bring that branch back" about a branch that was on origin
-        all along. Same line #954 drew for push status, and the targeted
-        refspec is copied from there for the same reason: plain
-        ``git fetch origin <branch>`` is not guaranteed to write
-        ``refs/remotes/origin/<branch>``.
+        formed (#1204): otherwise ``ref_unresolved`` conflated a branch deleted
+        on the server with one this clone never fetched, and the delivery gate
+        told a human "nobody will bring that branch back" about a branch that
+        was on origin all along. The refspec is the targeted one from #954.
 
-        The refresh itself can fail to get an answer — a 60 s timeout, a
-        parallel fetch holding the lock, auth, origin blinking — and that is
-        NOT ``ref_unresolved`` (#1204, machine review of submission #4). The
-        first version threw the fetch's return code away and then asserted
-        "origin does not have it" about a branch nobody had managed to ask
-        about. Now the refresh is asked the way ``ensure_default_branch`` asks
-        (``ls-remote --heads``: rc != 0 is "no answer", empty output is "no
-        such head"), and no answer comes back as ``remote_unreachable`` —
-        retryable, and never a ground for calling a human.
+        A refresh that gets NO answer (timeout, a parallel fetch holding the
+        lock, auth, origin blinking) is NOT ``ref_unresolved``: it is
+        ``remote_unreachable`` — retryable, never a ground for calling a human.
+        The refresh asks via ``ls-remote --heads`` as ``ensure_default_branch``
+        does (rc != 0: no answer; empty output: no such head).
 
-        THE REFRESH IN A BATCHED WALK (#1204 × #1205). ``branch`` and the base
-        resolve ONCE for the whole walk, so their refresh is attempted once
-        too, and a remote that did not answer about either is not a fact about
-        any single candidate: every row of the walk gets the same
-        ``remote_unreachable``, the way ``workspace_unavailable`` already does.
-        A candidate's own ref is resolved per row, so its refresh is per row.
-        Neither shortcut may be replaced by "refresh the first row only": the
-        rows after it would then be told ``ref_unresolved`` — the one reason
-        the delivery gate is allowed to call a human with.
+        IN A BATCHED WALK (#1204 x #1205) ``branch`` and the base resolve once,
+        so their refresh is attempted once, and an unanswered one is not a fact
+        about any single candidate: every row gets the same
+        ``remote_unreachable``, like ``workspace_unavailable``. A candidate's
+        own ref is resolved, and refreshed, per row. Refreshing the first row
+        only would tell the later rows ``ref_unresolved`` — the one reason the
+        delivery gate may call a human with.
         """
         if repo is None:
             reason = await _default_workspace_error()
@@ -1430,20 +1336,15 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
                     )
                 return
         repo_path = repo or _repo_root()
-        # #1046: judge the pushed refs. Local-first _resolve_ref made a stale
-        # local develop turn independent branches into a false stack.
-        #
+        # #1046: judge the pushed refs (a stale local develop made a false stack).
         # Resolved ONCE for the whole walk: neither the branch under judgement
         # nor the base changes between candidates.
         head = await _resolve_ref_remote_first(branch, repo_path)
         base_name = _resolve_base(base_branch)
         base = await _resolve_ref_remote_first(base_name, repo_path)
-        # One targeted refresh per name that did not resolve, then ask again
-        # (#1204). Only what survives an ANSWERED refresh is genuinely unknown
-        # to origin: a refresh that got no answer is a fact about this machine
-        # and the network, not about that branch, and is reported as such.
-        # These two names are the walk's, not any candidate's, so an
-        # unanswered refresh of them is carried to EVERY row.
+        # One targeted refresh per unresolved name, then ask again (#1204). An
+        # unanswered refresh is a fact about this machine and the network, not
+        # about the branch; for these two walk-wide names it goes to EVERY row.
         shared_unreachable = ""
         if not head:
             state, detail = await _refresh_remote_ref(branch, repo_path)
@@ -1501,9 +1402,8 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
                     ),
                 )
                 continue
-            # The three SHAs ARE the question; the names are just how we found
-            # them. A remembered answer is reused only while all three still
-            # point where they pointed when it was computed (#1205).
+            # The three SHAs ARE the question: a remembered answer is reused only
+            # while all three still point where they did (#1205).
             key = (repo_path, head, other, base)
             remembered = _stack_probe_cache_get(key)
             if remembered is not None:
@@ -1572,18 +1472,11 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         base = _resolve_base(base_branch)
         branch = canonical_task_branch(task_id, "", title)
 
-        # Refuse before touching anything (#361 I2). The old shape checked out
-        # base without looking at the result, then ran `checkout .` + `clean -fd`
-        # on a dirty tree — destroying a person's uncommitted work in the shared
-        # workspace. Worse, the checkout's rc was immediately overwritten by the
-        # next call, so its failure could not be noticed even in principle: the
-        # clean then ran on whatever branch happened to still be checked out.
-        #
-        # docs/workspace-safety-policy.md invariant 4 prescribes the opposite:
-        # when the automation cannot reliably interpret git state, escalate
-        # rather than proceed. P1 of that policy documents the destructive
-        # behaviour as a known wart with "commit or stash first" as the
-        # workaround; this removes the need for the workaround.
+        # Refuse before touching anything (#361 I2). The old shape never read the
+        # checkout's rc and ran `checkout .` + `clean -fd` on a dirty tree,
+        # destroying uncommitted work (on whatever branch was still checked out).
+        # docs/workspace-safety-policy.md invariant 4: when git state cannot be
+        # interpreted reliably, escalate rather than proceed.
         dirty, dirty_files = await _dirty_state(repo)
         if dirty.strip():
             raise WorkspaceNotReadyError(
@@ -1599,8 +1492,7 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
                 + ((err or "").strip() or "git checkout failed")
             )
 
-        # Confirm the checkout actually landed. rc alone is not enough — this is
-        # the guard whose pair-mode twin had no honest test (see the test file).
+        # Confirm the checkout actually landed: rc alone is not enough.
         rc, current, _ = await _git("branch", "--show-current", repo=repo, check=False)
         current = (current or "").strip()
         if rc != 0 or current != base:
@@ -1673,13 +1565,11 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
             # start's business (#954): no work is at risk, so it is neither
             # pushed nor allowed to hold up an unrelated task.
             if status.needs_push:
-                # #966: отказ «зайди на сервер и запушь» невыполним для
-                # вызывающего — доступа к общему клону у агентов нет, и #961
-                # часами ждал человека с root. Push обычной task-ветки в origin
-                # безопасен и обратим (потеря непушенных коммитов — нет), так
-                # что хаб выполняет эту часть remediation сам и отказывает
-                # только когда она не удалась. Только ветки task-<id>/* —
-                # произвольные ветки публиковать не наше решение.
+                # #966: отказ «зайди на сервер и запушь» невыполним для вызывающего
+                # (доступа к общему клону у агентов нет). Push обычной task-ветки
+                # безопасен и обратим, поэтому хаб делает его сам и отказывает,
+                # только если не вышло. Только ветки task-<id>/*: публиковать
+                # произвольные ветки — не наше решение.
                 whereabouts = (
                     f"has {status.commits_at_stake} commit(s) not on origin/{current}"
                     if status.on_remote
@@ -1915,12 +1805,10 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     async def resolve_ref(self, name: str, repo: str) -> tuple[str, str]:
         """Does this ref exist here? ``(state, detail)`` (#725).
 
-        Three states, never two: ``resolved`` with the sha, ``missing`` when
-        the repository was readable and the ref is genuinely not in it, and
-        ``unavailable`` when there was nothing to look in. Collapsing the last
-        two would let "we could not check" print as "that branch does not
-        exist", which is how a brief ends up asserting something it never
-        verified — the failure this was written for.
+        Three states, never two: ``resolved`` with the sha, ``missing`` when the
+        repository was readable and the ref is not in it, ``unavailable`` when
+        there was nothing to look in. Collapsing the last two would print "we
+        could not check" as "that branch does not exist".
         """
         rc, _, err = await _git("rev-parse", "--git-dir", repo=repo, check=False)
         if rc != 0:
@@ -1941,17 +1829,14 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         """Make sure ``branch`` still exists in the remote, from ``source`` (#947).
 
         ``(present|restored|unavailable, detail)``. Called after a release
-        merge, because that is the act that removed it: merging the
-        integration branch into the release branch can end with the
-        integration branch deleted — GitHub offers it, automation takes the
-        offer — and the project is then left with no branch for anything to be
-        delivered into. Nobody notices, because a release that just succeeded
-        looks like the opposite of an outage.
+        merge, which can end with the integration branch deleted (GitHub
+        offers it, automation takes it), leaving nothing to deliver into —
+        unnoticed, since a release that just succeeded looks like the opposite
+        of an outage.
 
-        Restores from the release branch rather than from any local ref: after
-        the merge those two carry the same content by construction, and a
-        local ref is whatever some earlier checkout left behind. Never forces:
-        if the branch is there, it is left exactly as it is.
+        Restores from the release branch, not from a local ref: after the merge
+        integration and release carry the same content, a local ref is whatever
+        an earlier checkout left behind. Never forces: a branch there stays as is.
         """
         if not repo:
             return ("unavailable", "у проекта нет рабочего клона — пушить неоткуда")
@@ -1979,18 +1864,11 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
                 "unavailable",
                 f"не нашёл, от чего восстанавливать: ни origin/{source}, ни {source}",
             )
-        # #949: the restore used to push ``<sha>:refs/heads/<branch>``. The
-        # pre-push hook reads the LOCAL ref of every push line, and a bare sha
-        # matches none of the allowed branch names — so in any armed clone
-        # (which is every workspace clone, the hub arms them itself, #532) the
-        # restore was refused. Production record #4612 shows exactly that:
-        # "Blocked push from branch 'c12ed99…'". The #947 test missed it by
-        # running on bare repositories with no hook.
-        #
-        # The fix is to push a real local branch under the restored name, so
-        # the hook sees ``refs/heads/<branch>`` — the same control any push
-        # passes, no bypass. Which is possible depends on where the clone
-        # stands:
+        # #949 (record #4612): a push of ``<sha>:refs/heads/<branch>`` is refused by the
+        # pre-push hook, which reads the LOCAL ref of every push line, and a bare
+        # sha matches no allowed branch name (every workspace clone is armed,
+        # #532). So push a real local branch under the restored name: the hook
+        # sees ``refs/heads/<branch>``, no bypass. By where the clone stands:
         #   * branch not checked out → ``git branch -f`` and push it;
         #   * branch checked out, tree clean → ``reset --hard`` — this also
         #     realigns the clone with the branch it is about to publish;
@@ -2115,22 +1993,15 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         None rather than "" on failure: an empty diff and an unreadable one are
         different answers, and the section must be able to say which.
 
-        #1055: the names used to be interpolated verbatim, and on a pair task
-        that is a ref the workspace does not have. The branch is written on a
-        developer's machine and arrives as ``origin/<branch>`` only — no local
-        head is ever created — so ``git diff develop...task-1042/queue`` came
-        back "unknown revision", rc was not 0, and every caller lost its
-        subject while saying, honestly and uselessly, that it could not look:
-        the brief dropped call sites and diff volume, and the review dispatcher
-        sized its profile against nothing. Verified on production 29.08 in
-        the hub's own workspace clone: the commit was there and so was
-        origin/<branch>; the local head was not, and never is.
+        #1055: on a pair task the branch is written on a developer's machine and
+        arrives as ``origin/<branch>`` only, with no local head; interpolating
+        the names verbatim gave "unknown revision" and every caller lost its
+        subject (the brief, the review profile sizing).
 
-        Both ends go through ``_resolve_ref_remote_first`` — the resolver
-        ``branch_diff_paths`` has used since #762, not a fourth chain of its
-        own — and a ref that resolves nowhere is fetched once before the answer
-        becomes None. A sha passed instead of a branch name still resolves:
-        ``origin/<sha>`` misses, the bare sha hits.
+        Both ends go through ``_resolve_ref_remote_first`` (as
+        ``branch_diff_paths``, #762), and a ref that resolves nowhere is fetched
+        once before the answer becomes None. A sha passed instead of a branch
+        name still resolves: ``origin/<sha>`` misses, the bare sha hits.
         """
         return await self._branch_diff(repo, base, branch, context, fetch=True)
 
@@ -2252,10 +2123,7 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
 
         Why it exists. The previous submission is an ANCESTOR of the current
         tip, so ``git diff prev current`` also carries everything the author
-        pulled in by merging the base branch. Measured on #1172 generation 2
-        (10.09.2026): 25 files in that diff, of which the author had written
-        two — the other 23 arrived with 9 commits of develop that had already
-        passed the gate as somebody else's work.
+        pulled in by merging the base branch (#1172: 23 of 25 files).
 
         Origin is decided by REACHABILITY, which is the only fact git will
         state: ``--not origin/<base>`` drops every commit the base branch
@@ -2263,9 +2131,8 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         a merge commit says "Merge ..." whoever wrote the code inside it.
 
         ``--cc`` rather than ``--no-merges``: on a merge commit the combined
-        diff shows exactly the hunks that match NEITHER parent, which is the
-        conflict resolution the author typed by hand. Dropping merges outright
-        would lose it, and a resolution is the author's work by definition.
+        diff shows the hunks that match NEITHER parent, i.e. the conflict
+        resolution the author typed by hand, which is the author's work.
         """
         base_sha = await _resolve_ref_remote_first(base, repo)
         if base_sha is None:
@@ -2421,17 +2288,14 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> set[str] | None:
         """Files of ``ref`` where ``word`` occurs as a WHOLE WORD (#1287).
 
-        ``-w`` is the whole point, and it is git's own word rule rather than a
-        rule written here: ``ledger_row`` does not match inside
-        ``ledger_rows``, and a substring hit must never read as presence — it
-        would open a task whose subject does not exist under a name that
-        merely resembles it. ``-F`` keeps a name with regex characters in it
-        from being read as a pattern.
+        ``-w`` is git's own word rule (``ledger_row`` does not match inside
+        ``ledger_rows``): a substring hit must never read as presence, or it
+        would open a task whose subject does not exist under a similar name.
+        ``-F`` keeps regex characters in a name from being read as a pattern.
 
-        Three answers, not two, like every other read of a ref here (#725):
-        the empty set means "looked and it is nowhere", ``None`` means the
-        look itself did not happen. Git says the first with exit code 1 and
-        the second with anything above it.
+        Three answers, not two (#725): the empty set means "looked and it is
+        nowhere", ``None`` means the look did not happen. Git says the first
+        with exit code 1 and the second with anything above it.
         """
         rc, out, _ = await _git(
             "grep",
@@ -2482,14 +2346,10 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         code they are not approving. Carries real context lines — this diff is
         read by a person, unlike the ``-U0`` one call-site analysis parses.
 
-        Both ends go through ``_diff_ends`` since #1239. Until then the names
-        were interpolated verbatim, and the bare base name is not the base the
-        hub judges against: in the shared clone the local ``develop`` trails
-        ``origin/develop`` — nothing ever moves the local ref — so the card
-        showed the submission against a point in the past. Observed on a
-        purpose-built clone: the same commit gives 2 files against the stale
-        local ``develop`` and 0 against ``origin/develop``. Whichever of the
-        two the reader got, nobody told them which one they were looking at.
+        Both ends go through ``_diff_ends`` (#1239): the bare base name is not
+        the base the hub judges against (the shared clone's local ``develop``
+        trails ``origin/develop``), so the card showed the submission against a
+        point in the past and did not say which one the reader saw.
         """
         ends = await _diff_ends(base, sha, repo)
         if ends is None:
@@ -2509,28 +2369,21 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> bool | None:
         """Is ``sha`` already inside the history of the base? (#1239)
 
-        THE question a caller must ask before reading an empty three-dot diff
-        as "this changed nothing". ``base...sha`` is computed from the merge
-        base, so once the commit lands in the base's history the merge base IS
-        the commit and the diff is empty ALWAYS — whatever the submission
-        actually touched. Verified on a purpose-built clone: after the branch
-        was merged, ``git diff --name-only origin/develop...<sha>`` returns 0
-        files for a commit that adds two.
+        THE question to ask before reading an empty three-dot diff as "this
+        changed nothing": once the commit lands in the base's history the merge
+        base IS the commit and ``base...sha`` is empty ALWAYS, whatever the
+        submission touched.
 
-        Three answers, never two, exactly as ``is_ancestor``: ``None`` means
-        the question could not be asked, and it must not collapse into "no" —
-        "we did not check" printed as "not merged" would send the reader back
-        to trusting an empty screen.
+        Three answers, never two, as ``is_ancestor``: ``None`` (could not ask)
+        must not collapse into "no" — "we did not check" printed as "not merged"
+        sends the reader back to trusting an empty screen.
 
-        The ancestry is asked of the SAME tip the diff was computed against —
-        both go through ``_diff_ends`` — because on a bare name they disagree:
-        in the clone above ``merge-base --is-ancestor <sha> develop`` answers
-        rc=1 (not an ancestor) while ``origin/develop`` answers rc=0. Asking
-        the bare name would leave the collapse unrecognised.
+        Ancestry is asked of the SAME tip the diff was computed against (both
+        via ``_diff_ends``): on a bare name they disagree (``merge-base
+        --is-ancestor <sha> develop`` gives rc=1 while ``origin/develop`` gives 0).
 
-        One detector, shared: the card (``task_diff``) and the live evidence
-        packet (``steward_evidence``) both call this, rather than each
-        rebuilding the ref juggling that the disagreement above punishes.
+        One detector, shared by the card (``task_diff``) and the live evidence
+        packet (``steward_evidence``).
         """
         ends = await _diff_ends(base, sha, repo)
         if ends is None:
@@ -2604,10 +2457,8 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> list[tuple[int, int, str]] | None:
         """``git diff --numstat base...sha``, or None when unreadable (#825).
 
-        Paths and counts only. The card needs to know WHICH files a submission
-        touched to lay criteria against them; reading every hunk for that would
-        put the cost of the full diff on every gate render, and the full diff
-        is already loaded on demand (#824).
+        Paths and counts only. The card needs WHICH files a submission touched
+        to lay criteria against them; the full diff is loaded on demand (#824).
 
         Both ends resolved origin-first through ``_diff_ends`` (#1239), for the
         same reason ``commit_diff`` does it: the change map and the diff below
@@ -3034,9 +2885,8 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         """Files the branch changes relative to its base, or None if unknowable.
 
         None and [] are deliberately different: [] means "the branch changes
-        nothing", None means "we could not find out". Collapsing the two is
-        how a check reports agreement it never established — the same
-        one-value-two-meanings mistake that surfaced three times in #361.
+        nothing", None means "we could not find out"; collapsing them is how a
+        check reports agreement it never established.
 
         ``-z`` from the start: git escapes non-ASCII paths in the plain form
         exactly as ``git status`` does, and these paths are compared against
@@ -3152,19 +3002,16 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> bool:
         """Commit the task's work. Refuses to commit onto a foreign branch.
 
-        ``expected_branch`` closes the other half of #361 I1. The done-pipeline
-        checks out the task branch and then calls this — but it never looked at
-        whether the checkout succeeded, so a failed checkout (a dirty tree is
-        enough) left the commit landing on whichever branch was still current.
-        With the branch named, a mismatch refuses instead.
+        ``expected_branch`` (#361 I1): the done-pipeline checks out the task
+        branch and then calls this; a failed checkout (a dirty tree is enough)
+        left the commit landing on whichever branch was still current. With the
+        branch named, a mismatch refuses instead.
 
-        The blanket ``git add -A`` below stages whatever is dirty. Do NOT read
-        that as "everything dirty belongs to the task": create_branch's refusal
-        to start on a dirty tree (#361 I2) only proves the tree was clean at
-        t=0, and a headless task then shares the main clone for its whole run.
-        Attribution lives one level up, in the commit-scope gate
-        (hub/commit_scope.py), which compares the dirty set against
-        the task's declared affected_areas before this is called.
+        The blanket ``git add -A`` stages whatever is dirty; do NOT read that as
+        "everything dirty belongs to the task" (the tree was clean only at t=0,
+        and a headless task shares the main clone). Attribution lives in the
+        commit-scope gate (hub/commit_scope.py), which compares the dirty set
+        against the task's declared affected_areas before this is called.
         """
         repo = repo or _repo_root()
 
@@ -3214,17 +3061,12 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> bool:
         """Return the shared workspace to its base branch and fast-forward it.
 
-        The branch is the task's base, not the literal "main" this used to
-        name (#552). Since #362 a task's work is cut from PAIR_BASE_BRANCH, so
-        naming main here left the clone parked on whatever branch was current
-        and pulled a branch nobody builds on — on a repository without main it
-        simply did nothing at all. Reproduced: after a merge the workspace was
-        still sitting on the task branch.
+        The branch is the task's base, not the literal "main" (#552): since
+        #362 work is cut from PAIR_BASE_BRANCH, so naming main left the clone
+        parked on the task branch and pulled a branch nobody builds on.
 
-        A failed checkout raises rather than falling through to the pull. The
-        old code discarded that rc; git happened to refuse the pull too, so no
-        damage was reachable, but the caller could not tell the difference
-        between "returned to base" and "still on someone's branch".
+        A failed checkout raises rather than falling through to the pull, so
+        the caller can tell "returned to base" from "still on someone's branch".
         """
         repo = repo or _repo_root()
         base = _resolve_base(base_branch)
@@ -3249,15 +3091,12 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> bool:
         """Collapse the task's commits into one, measured from its own base.
 
-        The squash point must be the branch's base — the same one create_branch
-        cut from and create_pr targets. It used to be hardcoded to origin/main,
-        which agreed with create_branch only while that also defaulted to main.
-        Once #362 moved the cut to the integration branch, merge-base against
-        origin/main became the point where the two branches forked, so the
-        reset swallowed every commit the base had gained since: the PR then
-        showed the base's own work as the task's, and merging it raised
-        add/add conflicts on files the task never touched. Reproduced on a
-        real repository before this was changed.
+        The squash point must be the branch's base — the one create_branch cut
+        from and create_pr targets, not a hardcoded origin/main: with the cut on
+        the integration branch (#362), merge-base against origin/main is where
+        the two forked, so the reset swallowed every commit the base had gained
+        since, showing the base's work as the task's and raising add/add
+        conflicts on merge.
         """
         repo = repo or _repo_root()
         base = _resolve_base(base_branch)
@@ -3528,10 +3367,9 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> int | None:
         """The open PR whose head is ``branch``, or None (#605).
 
-        The pair flow never records pr_number — only the headless create_pr
-        paths do — so the delivery gate would have keyed on a field nobody
-        sets. Discovery at submission time closes that: the hub looks the PR
-        up itself instead of asking anyone to remember a number.
+        The pair flow never records pr_number (only the headless create_pr
+        paths do), so the hub looks the PR up itself at submission time rather
+        than key the delivery gate on a field nobody sets.
         """
         return await self._forge_for(forge).pr_for_branch(
             branch, repo=repo, gh_repo=gh_repo
@@ -3552,14 +3390,11 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         question could not be asked, and the caller must not read that as
         "nothing to release".
 
-        Exists because counting commits stopped answering this question. A
-        squash release writes a new commit on the release branch instead of
-        carrying the originals, so ``base..head`` never empties and every
-        cycle looked like undelivered work. On 26.08.2026 that opened twenty
-        release PRs in ninety minutes, nineteen of them empty, each one
-        redeploying production. Trees are how git states "the same content",
-        so this compares them directly rather than counting what the graph
-        happens to contain.
+        Exists because counting commits stopped answering this: a squash
+        release writes a new commit on the release branch, so ``base..head``
+        never empties and every cycle looked like undelivered work (twenty
+        release PRs in ninety minutes, nineteen empty, each redeploying
+        production). Trees are how git states "the same content": compare them.
         """
         base = _resolve_base(base)
         # The clone may be behind, and the question is about upstream, not
@@ -3607,17 +3442,14 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         """Can this PR be merged, and if not, why (#970).
 
         The forge answers the outcome; the FILES of a conflict come from the
-        clone, because only git can name them. The 409 a forge returns names
-        nothing, and a reason has to lead somewhere — #969 already reads them
-        out of the clone, so this is the same question with the same answer,
-        not a second one.
+        clone, because only git can name them: the forge's 409 names nothing
+        and a reason has to lead somewhere (same question as #969).
         """
         outcome, detail = await self._forge_for(forge).pr_mergeability(
             pr_number, repo=repo, gh_repo=gh_repo
         )
-        # Форж, который не умеет мержить, обычно не умеет и предсказывать мерж
-        # (#1116). Тогда вопрос задаётся git: пробное слияние в одноразовом
-        # рабочем дереве — единственный способ узнать ответ, не тронув ничего.
+        # Форж без мержа обычно не умеет и предсказывать мерж (#1116): вопрос
+        # задаётся git — пробное слияние в одноразовом дереве ничего не трогает.
         if outcome is MergeabilityOutcome.unavailable and not (
             self._forge_for(forge).can_merge_via_api
         ):
@@ -3861,9 +3693,8 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         Best effort by contract: GitHub's 409 names nothing, and the local
         clone may be absent, stale, or running a git too old for
         ``merge-tree --write-tree``. Empty means "could not name them", never
-        "there were none" — the caller reports the conflict either way, since
-        a conflict without a file list is still a conflict somebody must go
-        and resolve.
+        "there were none" — the caller reports the conflict either way: a
+        conflict without a file list is still one somebody must resolve.
         """
         if not repo:
             return []
@@ -3904,13 +3735,10 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         а без этого доказательства автомерж не имеет права срабатывать.
 
         ``tip`` — коммит, НА КОТОРОМ строится дерево, и он обязан быть тем самым
-        закреплённым коммитом сдачи. Пока здесь стоял ``origin/<branch>``,
-        автомерж брал вершину ветки КАКОЙ ОНА СТАЛА: пуш, приехавший в окно
-        ожидания, попадал в дерево, в слитый коммит и в перезакрепление, и
-        человеческий вердикт переезжал на код, которого человек не видел.
-        Наблюдено на настоящем git: неодобренный коммит оказывался предком
-        перезакреплённого (tests/test_delivery_gate.py). Это ровно обратное
-        предмету #1233, поэтому якорь здесь — закрепление, а не вершина.
+        закреплённым коммитом сдачи, а не ``origin/<branch>``: вершина ветки
+        «какой она стала» тащила пуш из окна ожидания в слитый коммит и в
+        перезакрепление, и человеческий вердикт переезжал на код, которого
+        человек не видел (tests/test_delivery_gate.py).
         """
         rc, _, err = await _git(
             "fetch",
@@ -3970,9 +3798,8 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
                 check=False,
             )
         except BaseException:
-            # Вызывающие чистят дерево, только когда путь им вернули. Отмена
-            # посреди мержа (гашение поллера) иначе бросала его рядом с клоном
-            # с незавершённым мержем внутри (находка f529be6df1e61160).
+            # Вызывающие чистят дерево, только когда путь им вернули: отмена
+            # посреди мержа (гашение поллера) иначе бросила бы его с недомержем.
             await _git("worktree", "remove", "--force", path, repo=repo, check=False)
             raise
         if rc == _TIMEOUT_RC or rc >= 128:
@@ -4146,13 +3973,11 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
 
         ``probed`` — конфликтующие файлы ТОЙ САМОЙ пробы, по которой считалось
         ``resolutions``. Аренда стережёт ветку задачи, но не базу, а дерево
-        здесь строится заново и сливает уже НОВЫЙ ``origin/<base>``. Без сверки
-        байты разрешения, посчитанные на старой базе, ложились поверх свежих
-        файлов, ``git add`` снимал с них признак U, и проверка «остались ли
-        конфликты» ничего не видела: строки, приехавшие в базу между пробой и
-        пушем, пропадали молча, а следующий squash в базу мог бы стереть их и
-        там (находка 2327bd9255c601cc, high). Поэтому конфликт пересчитывается
-        и сверяется байт в байт; разошёлся — отказ, а не догадка.
+        строится заново и сливает уже НОВЫЙ ``origin/<base>``: без сверки байты
+        разрешения, посчитанные на старой базе, легли бы поверх свежих файлов,
+        ``git add`` снял бы с них признак U, и строки, приехавшие в базу между
+        пробой и пушем, пропали бы молча (#1233). Поэтому конфликт
+        пересчитывается и сверяется байт в байт; разошёлся — отказ, а не догадка.
         """
         path, why = await self._prepare_base_merge_tree(
             repo, base, branch, task_id, tip
@@ -4222,11 +4047,9 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
             rc, sha, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
             sha = (sha or "").strip()
             if rc != 0 or not sha:
-                # Раньше код возврата здесь не смотрели и возвращали
-                # ``True, ""``. Пустая строка уезжала в submission_sha и СТИРАЛА
-                # закрепление, а пустое закрепление гейт читает как «сверка не
-                # проводилась» и доставляет без неё (#572). Молчаливая потеря
-                # закрепления хуже несостоявшегося автомержа.
+                # Пустой sha стёр бы закрепление в submission_sha, а пустое
+                # закрепление гейт читает как «сверка не проводилась» и доставляет
+                # без неё (#572): потеря закрепления хуже несостоявшегося автомержа.
                 return False, "коммит слитой ветки не прочитан — закрепление не трогаем"
             # Аренда — это сравнение-и-запись: пуш пройдёт, только если ветка
             # ВСЁ ЕЩЁ стоит на закреплённом коммите. Дерево тоже построено на
@@ -4278,9 +4101,8 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         carries. ``None`` — the cut could not be asked, and the caller must
         not read that as "nothing to release" (#725).
 
-        Lives next to ``release_range`` rather than inside it because that
-        helper has a second consumer (``red_base._commits_between``) that
-        still needs the full ``base...head`` interval (#972 AC-6).
+        Not inside ``release_range``: its other consumer
+        (``red_base._commits_between``) needs the full interval (#972 AC-6).
         """
         workspace = repo or _repo_root()
         await _git(
@@ -4434,15 +4256,12 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     def merge_preserves_ancestry(self, forge: str = "") -> bool:
         """Останется ли сдаточный коммит предком базовой ветки после доставки.
 
-        Спрашивается у ТОГО ЖЕ адаптера, который будет мержить: ``_forge_for``
-        с тем же именем форжа, что получит ``merge_pr``. Не у настройки рядом
-        и не у имени в строке — иначе ответ про стратегию и сама стратегия
-        разъехались бы ровно так, как разъезжаются два источника правды.
+        Спрашивается у ТОГО ЖЕ адаптера, который будет мержить (``_forge_for``
+        с тем же именем форжа, что у ``merge_pr``), а не у настройки рядом и не
+        у имени в строке: два источника правды разъехались бы.
 
-        Синхронный и без единого обращения наружу: это объявленное свойство
-        конвейера, а не наблюдение. Именно поэтому потребитель может спросить
-        ПЕРЕД git-вызовом и не платить за вопрос, на который всё равно нельзя
-        ответить (#1214).
+        Синхронный и без обращений наружу: объявленное свойство конвейера, а
+        не наблюдение, поэтому потребитель спрашивает ПЕРЕД git-вызовом (#1214).
         """
         return bool(self._forge_for(forge).merge_preserves_ancestry)
 
@@ -4549,18 +4368,15 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
 
         1. Ветки берутся у PR, а не у вызывающего: имя ветки задачи могло
            разойтись с тем, что в PR на самом деле.
-        2. Мерж делается в ОДНОРАЗОВОМ worktree, а не в рабочем клоне. Клон
+        2. Мерж делается в ОДНОРАЗОВОМ worktree, а не в рабочем клоне: клон
            общий, может стоять на чужой ветке с грязным деревом и несёт
-           взведённый pre-push хук — три способа повредить чужую работу
-           бухгалтерским мержем (#949 был одним из них).
+           взведённый pre-push хук (#949).
         3. Доставка подтверждается достижимостью полученного SHA в базовой
-           ветке НА REMOTE, а не кодом возврата push. Измерено 01.09.2026:
-           GitVerse после такого мержа оставляет PR в состоянии open,
-           merged=False, а GET /pulls/{n}/merge отвечает 404 и до, и после —
-           то есть форж об успехе не сообщает вовсе.
-        4. Только после подтверждения PR закрывается явно. Незакрытый висел бы
-           открытым вечно, и pr_for_branch находил бы его на уже доставленной
-           ветке.
+           ветке НА REMOTE, а не кодом возврата push: GitVerse после такого
+           мержа оставляет PR open, merged=False, а GET /pulls/{n}/merge
+           отвечает 404 и до, и после — об успехе форж не сообщает вовсе.
+        4. Только после подтверждения PR закрывается явно: незакрытый висел бы
+           открытым, и pr_for_branch находил бы его на доставленной ветке.
         """
         workspace = repo or _repo_root()
         base, head = await self._forge_for(forge).pr_refs(
@@ -4623,12 +4439,10 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
                 check=False,
             )
             if rc != 0:
-                # Конфликт РАСПОЗНАЁТСЯ по индексу, а не по коду возврата и не
-                # по тексту. Код у конфликта rc=1, но его же отдают и другие
-                # отказы; текст локализован — на боевом хосте git пишет
-                # «КОНФЛИКТ», и поиск слова conflict его не найдёт. Неслитые
-                # пути в индексе есть только у настоящего конфликта, и они же
-                # и есть список файлов, который отказ обязан назвать.
+                # Конфликт РАСПОЗНАЁТСЯ по индексу, а не по коду возврата (rc=1
+                # отдают и другие отказы) и не по тексту (git локализован:
+                # «КОНФЛИКТ» слово conflict не найдёт). Неслитые пути в индексе
+                # бывают только у настоящего конфликта и они же — список файлов.
                 _, unmerged, _ = await _git(
                     "diff",
                     "--name-only",
@@ -4730,11 +4544,9 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
     ) -> bool:
         """Remove a merged task branch. Returns whether it is actually gone.
 
-        Two fixes (#552). The checkout named "main" by literal, so once #362
-        moved task branches onto PAIR_BASE_BRANCH this could not step off the
-        very branch it was asked to delete — git then refused the delete and
-        the branches piled up. And the success line was logged unconditionally,
-        so the log claimed a deletion that had not happened.
+        The checkout must name the task's base, not the literal "main" (#552):
+        git refuses to delete the branch it stands on. The success line is
+        logged only when the deletion happened.
         """
         repo = repo or _repo_root()
         base = _resolve_base(base_branch)
@@ -4776,11 +4588,9 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
         origin and fetched instead of re-cloned — the fetch itself validates
         access, no ls-remote needed.
 
-        ``forge`` НАЗЫВАЕТ ПЛОЩАДКУ, и до #1118 его здесь не было вовсе: обе
-        строки-кандидата были захардкожены на github.com. 01.09.2026 проект
-        #8 с ``forge=gitverse`` склонировался с GitHub и отчитался
-        ``provision_status=ok`` — содержимое совпало лишь потому, что
-        репозитории пока зеркалят друг друга.
+        ``forge`` НАЗЫВАЕТ ПЛОЩАДКУ (#1118): раньше обе строки-кандидата были
+        захардкожены на github.com, и проект с ``forge=gitverse`` клонировался
+        с GitHub и отчитывался ``provision_status=ok``.
 
         Значение по умолчанию — github, как у единственного читателя (#1114):
         вызывающий без форжа получает ровно прежнее поведение.
@@ -4805,12 +4615,10 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
                     f"existing workspace origin mismatch: {origin or err} "
                     f"(expected {repo_url})"
                 )
-            # Совпадения owner/name НЕ ХВАТАЕТ, и это вторая половина дефекта
-            # #1118. Проверка выше сравнивает только слаг, а «mrpda/snip-portal»
-            # содержится в github-адресе ровно так же, как в gitverse-адресе.
-            # Значит клон с чужой площадки проходил её как годный — и прошёл бы
-            # даже после того, как клонирование научили форжу: каталог на месте,
-            # новый клон не создаётся, статус остаётся зелёным навсегда.
+            # Совпадения owner/name НЕ ХВАТАЕТ (#1118): «mrpda/snip-portal»
+            # содержится и в github-адресе, и в gitverse-адресе, так что клон с
+            # чужой площадки проходил проверку как годный, а статус оставался
+            # зелёным навсегда.
             foreign = forge_registry.forge_of_host(_origin_host(origin))
             if foreign and foreign != forge:
                 return False, (
@@ -4883,8 +4691,7 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
             return False, f"clone failed ({url}): {err[:300]}"
         # Arm the hook while the hub has the clone in its hands. A setup step
         # a person must remember is the same failure as the hook nobody
-        # activated — this is the one moment where nobody has to remember
-        # (#532). Best effort: a hook that cannot be armed never fails a clone.
+        # activated (#532). Best effort: an unarmable hook never fails a clone.
         git_policy.activate_quietly(workspace_path, base_branch=base_branch)
 
         transport = "https" if url.startswith("https") else "ssh"
@@ -4896,7 +4703,6 @@ class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
             forge,
             transport,
         )
-        # Форж в детали не украшение: до #1118 строка «cloned mrpda/snip-portal
-        # (main, https)» одинаково описывала клон с любой площадки, и по ней
-        # нельзя было понять, откуда взялся репозиторий.
+        # Форж в детали не украшение (#1118): по строке без него нельзя понять,
+        # с какой площадки взялся репозиторий.
         return True, f"cloned {repo_url} from {forge} ({base_branch}, {transport})"

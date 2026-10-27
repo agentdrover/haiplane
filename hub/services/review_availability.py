@@ -32,16 +32,8 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.models import GenerationReview
 from hub.services.orchestration import report_has_evidence
+from hub.services.refusal_publish import REFUSAL_ALERT_PREFIXES, public_text
 from hub.services.result_kind import automation_not_applicable
-
-#: Начала алертов ``maybe_dispatch_review``, означающих «провайдер агента не
-#: создал»: прямой отказ и ответ, который не дошёл при подтверждённой пустоте.
-#: Отказ по конфигурации хаба («не хватает конфигурации») сюда не входит —
-#: это не провайдер.
-REFUSAL_ALERT_PREFIXES: tuple[str, ...] = (
-    "Кросс-модельное ревью НЕ вызвано: провайдер отказал",
-    "Кросс-модельное ревью НЕ вызвано: ответ провайдера не дошёл",
-)
 
 #: Событие хаба «ревьюер недоступен» и его снятие. Снятие названо нейтрально
 #: намеренно: сигнал снимается и тогда, когда провайдер НЕ ожил, а очередь
@@ -76,7 +68,7 @@ _REFUSAL_PARAMS: tuple[Any, ...] = tuple(
 def refusal_detail(content: str) -> str:
     """Текст отказа без общего начала алерта и хвоста про вердикт."""
     text = content.split(": ", 1)[-1]
-    return text.split(". Вердикт", 1)[0].strip()
+    return public_text(text.split(". Вердикт", 1)[0].strip())
 
 
 async def _latest_refusal(db, task_id: int, since: str | None) -> dict[str, Any] | None:
@@ -178,7 +170,7 @@ def _headline(view: GenerationReview) -> str:
         )
     text = f"ревью у поколения {view.generation} НЕТ: {_REASON_TEXT[view.reason]}"
     if view.reason_detail:
-        text += f" ({view.reason_detail})"
+        text += f" ({public_text(view.reason_detail)})"
     if view.previous_generation is not None:
         text += (
             f"; отчёт поколения {view.previous_generation} — отчёт прошлой "

@@ -2729,6 +2729,7 @@ async def test_the_sweep_order_is_pinned(db):
         "executor_runs",
         "executor_slots",
         "executor_orders",
+        "rework_launches",
         "critic_orders",
         "expired_claims",
         "machine_deadlines",
