@@ -91,6 +91,9 @@ REPORT_NOTE_MAX: Final[int] = 500
 #: Минимум ключа хоста: RSA-3072 (PEM SPKI).
 MIN_KEY_BITS: Final[int] = 3072
 HOST_KEY_DAYS: Final[int] = 90
+#: #2107: незакрытых заказов на хост одновременно — от 1 (по умолчанию) до 4.
+HOST_SLOTS_MIN: Final[int] = 1
+HOST_SLOTS_MAX: Final[int] = 4
 
 EVENT_ORDER_CLOSED = "executor_order_closed"
 
@@ -165,6 +168,7 @@ def _host_view(row: dict[str, Any]) -> dict[str, Any]:
         "created_by": row["created_by"],
         "disabled_at": row["disabled_at"],
         "disabled_by": row["disabled_by"],
+        "slots": int(row["slots"]) if "slots" in row.keys() else 1,
     }
 
 
@@ -711,20 +715,24 @@ async def _task_busy(db: aiosqlite.Connection, task_id: int) -> str:
     )
 
 
-async def _slot_busy(db: aiosqlite.Connection, host: str) -> str:
+async def _slot_busy(db: aiosqlite.Connection, host: str, slots: int = 1) -> str:
+    """Отказ, если незакрытых заказов хоста уже ``slots`` (#2107); иначе пусто."""
     rows = await fetchall(
         db,
         "SELECT id, task_id, state FROM executor_orders WHERE host = ? "
-        "AND state <> 'closed'",
+        "AND state <> 'closed' ORDER BY id",
         (host,),
     )
-    if not rows:
+    if len(rows) < max(int(slots), 1):
         return ""
-    row = dict(rows[0])
-    return (
-        f"{REASON_SLOT_BUSY}: {host} держит задачу #{row['task_id']} "
-        f"({row['state']}), заказ #{row['id']}"
-    )
+    held = ", ".join(f"#{r['task_id']} ({r['state']}, заказ #{r['id']})" for r in rows)
+    if len(rows) == 1 and int(slots) <= 1:  # прежний текст для хоста с одним слотом
+        row = dict(rows[0])
+        return (
+            f"{REASON_SLOT_BUSY}: {host} держит задачу #{row['task_id']} "
+            f"({row['state']}), заказ #{row['id']}"
+        )
+    return f"{REASON_SLOT_BUSY}: {host} {len(rows)}/{int(slots)}, задачи {held}"
 
 
 async def _order_text(
@@ -794,7 +802,7 @@ async def _book(
     refusal = (
         await _task_busy(db, int(task["id"]))
         or await _task_refusal(db, task)
-        or await _slot_busy(db, host_name)
+        or await _slot_busy(db, host_name, int(host.get("slots") or 1))
     )
     if refusal:
         return refusal
