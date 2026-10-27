@@ -496,7 +496,7 @@ async def test_merge_is_delivery_second_merge_is_new_context(
     await _apply(db, prev["token"])
     assert (await _counts(db))["retired_total"] == 1
 
-    await _merge(db, task_id, pid, days_ago=70)  # earlier moment, new merge
+    await _merge(db, task_id, pid, days_ago=60)  # same moment, a new merge
 
     assert (await _counts(db))["retired_total"] == 0
     states = {r["task_id"]: r["state"] for r in await _history(db)}
