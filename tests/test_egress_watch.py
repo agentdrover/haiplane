@@ -227,8 +227,8 @@ async def test_probe_is_bounded_and_never_blocks_the_loop(client, db):
                 await asyncio.sleep(0.01)
     finally:
         watcher.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await watcher
+        with pytest.raises(asyncio.CancelledError):
+            await watcher
     assert runs >= 3
     assert peak == 1
 
