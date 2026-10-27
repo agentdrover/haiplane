@@ -4,7 +4,10 @@
 говорит, что измерили; снятие говорит, что измерять уже никто не будет, и
 результат неизвестен. Поэтому:
 
-* ``outcome_answers``, ``tasks.archived`` и lifecycle не затрагиваются;
+* ``outcome_answers``, ``tasks.archived``, lifecycle и лента задач
+  (``task_updates``) не затрагиваются: ~630 записей лент одним применением
+  разбудили бы входящие, дайджест и стюарда, а аудит (identity, причина,
+  batch, время) уже лежит в самой строке журнала;
 * поздний ответ сильнее снятия: пока у задачи есть хоть один ответ, она
   отвечена, а строка снятия лежит в истории (``superseded_by_answer``);
 * отмена возвращает обещание в долг, строка остаётся в истории;
@@ -378,18 +381,6 @@ async def _retire_one(
         context_snapshot=json.dumps(context, sort_keys=True, ensure_ascii=False),
         context_hash=context_hash,
     )
-    await repository.add_task_update(
-        db,
-        task_id,
-        retired_by,
-        "status",
-        (
-            f"Outcome check retired (batch {str(preview['token'])[:8]}): {reason}. "
-            "Result unknown - this is not an answer."
-        ),
-        principal_id=principal_id,
-        author_kind="principal" if principal_id is not None else "anonymous",
-    )
 
 
 async def cancel_retirement(
@@ -419,15 +410,6 @@ async def cancel_retirement(
         try:
             await repository.cancel_outcome_retirement(
                 db, int(decision["id"]), cancelled_by=cancelled_by, reason=text
-            )
-            await repository.add_task_update(
-                db,
-                task_id,
-                cancelled_by,
-                "status",
-                f"Outcome check retirement cancelled: {text}. The promise is in the debt again.",
-                principal_id=principal_id,
-                author_kind="principal" if principal_id is not None else "anonymous",
             )
         except BaseException:
             await db.execute("ROLLBACK TO outcome_retire_cancel")

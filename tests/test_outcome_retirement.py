@@ -246,25 +246,26 @@ async def test_retirement_is_atomic_and_retry_safe(
     twin = await _preview(db)  # a second preview of the same cohort
     before = await _guarded_state(db)
 
-    # Audit failure: neither the rows nor the feed entries survive.
+    # Audit failure (the journal write): neither rows nor a half result survive.
     calls = 0
-    real = repo.add_task_update
+    real = repo.insert_outcome_retirement
 
     async def flaky(*a: Any, **k: Any) -> int:
         nonlocal calls
         calls += 1
         if calls == 2:
-            raise RuntimeError("feed down")
+            raise RuntimeError("journal down")
         return await real(*a, **k)
 
-    with patch.object(repo, "add_task_update", flaky), pytest.raises(RuntimeError):
+    quiet = "SELECT (SELECT COUNT(*) FROM task_updates), (SELECT COUNT(*) FROM events)"
+    feed_before = [tuple(r) for r in await db.execute_fetchall(quiet)]
+    with (
+        patch.object(repo, "insert_outcome_retirement", flaky),
+        pytest.raises(RuntimeError),
+    ):
         await _apply(db, prev["token"])
     await db.rollback()
     assert await _retired_rows(db) == []
-    assert not await db.execute_fetchall(
-        "SELECT 1 FROM task_updates WHERE content LIKE '%retired%' "
-        "OR content LIKE '%снят%'"
-    )
 
     # Two connections applying the same token: one set of rows.
     from hub.db import connect
@@ -281,6 +282,9 @@ async def test_retirement_is_atomic_and_retry_safe(
     assert sorted(fresh[0]["retired"]) == sorted(tasks)
     rows = await _retired_rows(db)
     assert sorted(r["task_id"] for r in rows) == sorted(tasks), "no duplicates"
+
+    # No feed line, no event, no alert: 630 of them would wake every listener.
+    assert [tuple(r) for r in await db.execute_fetchall(quiet)] == feed_before
 
     # Another preview of the same cohort cannot retire it twice.
     dup = await _apply(db, twin["token"])
