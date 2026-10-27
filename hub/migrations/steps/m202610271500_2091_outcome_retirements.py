@@ -11,7 +11,9 @@ identity, время, batch (токен предпросмотра), cutoff и �
 строка, а двойное снятие одного и того же - ошибка базы, не дубль.
 
 ``outcome_retirement_previews`` - сохранённый предпросмотр: применение берёт
-из него когорту и отпечатки, а не доверяет клиенту.
+из него когорту и отпечатки, а не доверяет клиенту. Токен применяется один
+раз: ``applied_at``/``applied_result`` хранят итог, повтор возвращает его и
+ничего не пишет (иначе запоздавший повтор переиграл бы последующую отмену).
 """
 
 MIGRATIONS = [
@@ -52,7 +54,9 @@ MIGRATIONS = [
             entries    TEXT NOT NULL DEFAULT '[]',
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            expires_at TEXT NOT NULL
+            expires_at TEXT NOT NULL,
+            applied_at TEXT,
+            applied_result TEXT
         )""",
     ),
 ]

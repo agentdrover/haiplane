@@ -6779,3 +6779,14 @@ async def get_retirement_preview(
         (token,),
     )
     return rows[0] if rows else None
+
+
+async def mark_retirement_preview_applied(
+    db: aiosqlite.Connection, token: str, result: str
+) -> None:
+    """A token is applied once: the outcome is kept for repeats (#2091)."""
+    await db.execute(
+        "UPDATE outcome_retirement_previews SET applied_at=datetime('now'), "
+        "applied_result=? WHERE token=? AND applied_at IS NULL",
+        (result, token),
+    )

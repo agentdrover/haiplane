@@ -243,6 +243,7 @@ async def test_retirement_is_atomic_and_retry_safe(
     tasks = [await _old(db, f"Old {i}") for i in range(3)]
     prev = await _preview(db)
     assert prev["cohort_total"] == 3
+    twin = await _preview(db)  # a second preview of the same cohort
     before = await _guarded_state(db)
 
     # Audit failure: neither the rows nor the feed entries survive.
@@ -275,18 +276,32 @@ async def test_retirement_is_atomic_and_retry_safe(
         )
     finally:
         await other.close()
-    assert sorted(first["retired"] + second["retired"]) == sorted(tasks)
+    fresh = [r for r in (first, second) if not r["repeated"]]
+    assert len(fresh) == 1, "a token applies once, whoever gets the lock first"
+    assert sorted(fresh[0]["retired"]) == sorted(tasks)
     rows = await _retired_rows(db)
     assert sorted(r["task_id"] for r in rows) == sorted(tasks), "no duplicates"
 
-    # Retry of the same token: idempotent.
+    # Another preview of the same cohort cannot retire it twice.
+    dup = await _apply(db, twin["token"])
+    assert dup["retired"] == []
+    assert {s["reason"] for s in dup["skipped"]} == {"already_retired"}
+
+    # Retry of the same token returns the stored outcome and writes nothing.
     again = await _apply(db, prev["token"])
-    assert again["retired"] == []
-    assert {s["reason"] for s in again["skipped"]} == {"already_retired"}
+    assert again["repeated"] is True and again["retired"] == fresh[0]["retired"]
     assert len(await _retired_rows(db)) == 3
     assert (await _guarded_state(db))[1] == before[1]
     assert (await _guarded_state(db))[0] == before[0]
     assert (await _counts(db))["retired_total"] == 3
+
+    # A late retry cannot replay over a later cancel.
+    await cancel_retirement(
+        db, task_id=tasks[0], reason="back", cancelled_by="denis", principal_id=1
+    )
+    await _apply(db, prev["token"])
+    assert (await _counts(db))["retired_total"] == 2
+    assert len(await _retired_rows(db)) == 3
 
     # A stale or unknown token is refused as a whole.
     with pytest.raises(LookupError):
@@ -372,3 +387,21 @@ async def _history(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     from hub.services.outcome_retirement import list_retirements
 
     return (await list_retirements(db))["rows"]
+
+
+async def test_apply_skips_tasks_that_left_the_previewed_project(
+    db: aiosqlite.Connection,
+):
+    """Область предпросмотра перепроверяется при применении (Codex P2)."""
+    epic = await _task(db, "Epic", task_type="epic", metric="")
+    child = await _old(db, "Child", parent_id=epic)
+    prev = await _preview(db)
+    assert [c["task_id"] for c in prev["cohort"]] == [child]
+    other = await repo.create_project(db, slug="other", name="Other")
+    await db.execute("UPDATE tasks SET project_id=? WHERE id=?", (other, epic))
+    await db.commit()
+
+    result = await _apply(db, prev["token"])
+
+    assert result["retired"] == []
+    assert result["skipped"] == [{"task_id": child, "reason": "left_project_scope"}]

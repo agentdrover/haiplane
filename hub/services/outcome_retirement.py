@@ -247,12 +247,15 @@ async def _skip_reason(
     entry: Mapping[str, Any],
     delivery: frozenset[int],
     active: Mapping[int, Row],
+    scope: set[int],
 ) -> tuple[str, dict[str, Any] | None, str]:
     """Why an entry is not applied, or "" when it is. Plus the task and its hash."""
     task_id = int(entry["task_id"])
     task, current = await _current_view(db, task_id, delivery)
     if task is None:
         return "no_longer_debt", None, ""
+    if task_id not in scope:
+        return "left_project_scope", task, current
     if await repository.list_outcome_answers_for_task(db, task_id):
         return "answered", task, current
     decision = active.get(task_id)
@@ -277,7 +280,9 @@ async def apply_retirement(
 
     All or nothing for the rows written: the decision rows and their feed
     entries share one SAVEPOINT. A record that changed since the preview is
-    skipped by name, never retired quietly. Repeating a token is harmless.
+    skipped by name, never retired quietly. A token applies ONCE: a repeat returns
+    the stored outcome (``repeated``) and writes nothing, so a late retry cannot
+    replay over a later cancel.
     """
     text = str(reason or "").strip()
     if not text:
@@ -291,7 +296,10 @@ async def apply_retirement(
             raise LookupError(
                 "preview not found or expired: run the preview again and apply its token"
             )
+        if preview["applied_at"] is not None:
+            return {**json.loads(preview["applied_result"] or "{}"), "repeated": True}
         entries = json.loads(preview["entries"])
+        scope = await _scope_ids(db, json.loads(preview["projects"]))
         delivery = await project_policy.merge_is_delivery_projects(db)
         active = {
             int(r["task_id"]): dict(r)
@@ -303,7 +311,9 @@ async def apply_retirement(
         try:
             for entry in entries:
                 task_id = int(entry["task_id"])
-                why, task, current = await _skip_reason(db, entry, delivery, active)
+                why, task, current = await _skip_reason(
+                    db, entry, delivery, active, scope
+                )
                 if why:
                     skipped.append({"task_id": task_id, "reason": why})
                     continue
@@ -324,13 +334,16 @@ async def apply_retirement(
             await db.execute("RELEASE outcome_retire_apply")
             raise
         await db.execute("RELEASE outcome_retire_apply")
-    return {
-        "batch_id": token,
-        "retired": retired,
-        "retired_total": len(retired),
-        "skipped": skipped,
-        "skipped_total": len(skipped),
-    }
+        result = {
+            "batch_id": token,
+            "retired": retired,
+            "retired_total": len(retired),
+            "skipped": skipped,
+            "skipped_total": len(skipped),
+            "repeated": False,
+        }
+        await repository.mark_retirement_preview_applied(db, token, json.dumps(result))
+    return result
 
 
 async def _retire_one(

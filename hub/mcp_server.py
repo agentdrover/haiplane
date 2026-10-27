@@ -4210,13 +4210,13 @@ def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
 
 
 _OUTCOME_DEBT_HINT = (
-    "Остальное: выберите status=overdue|observing|unknown|answered и листайте "
+    "Остальное: выберите status=overdue|observing|unknown|answered|retired и листайте "
     "offset; полный JSON — REST GET /api/metrics/outcome-debt без параметров "
     "или CLI hp-hub outcome-debt без флагов."
 )
 _ACTIONABLE_HINT = (
-    "Остальное: выберите status=overdue|observing|unknown|answered|covered|"
-    "invalid_owner и листайте offset; полный старый срез — view=all."
+    "Остальное: выберите status=overdue|observing|unknown|answered|retired|"
+    "covered|invalid_owner и листайте offset; полный старый срез — view=all."
 )
 
 
@@ -4297,7 +4297,13 @@ def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
 @mcp.tool()
 async def hub_outcome_debt(
     status: Literal[
-        "overdue", "observing", "unknown", "answered", "covered", "invalid_owner"
+        "overdue",
+        "observing",
+        "unknown",
+        "answered",
+        "retired",
+        "covered",
+        "invalid_owner",
     ] = "overdue",
     limit: int = 20,
     offset: int = 0,
