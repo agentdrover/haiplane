@@ -397,10 +397,11 @@ async def test_a_human_approve_that_won_the_race_is_not_called_the_stewards(
         await other.close()
 
     row = dict(await repo.get_steward_judgement(db, case.task_id, 1, "verdict"))
-    assert row["advisor_outcome"] == "failed"
+    # #2054: гонка с человеком - не сбой применения: skipped, без тревоги стюарда.
+    assert row["advisor_outcome"] == "skipped"
     assert "verdict_already_stands" in row["advisor_outcome_detail"]
     text = await feed(db, case.task_id)
-    assert "Одобрение стюарда не применено, решает человек" in text
+    assert "Одобрение стюарда не применено" not in text
     assert "записано, но следующий шаг" not in text
 
 
@@ -520,7 +521,7 @@ def test_a_fixed_text_is_a_general_claim_with_a_pointer_to_the_log():
     """
     from hub.services.refusal_reason import REASON_TEXTS, WHERE
 
-    assert len(REASON_TEXTS) == 21
+    assert len(REASON_TEXTS) == 23  # +ceiling_fact_unbound, +already_escalated (#2054)
     for code, text in REASON_TEXTS.items():
         assert text.endswith("точная причина в журнале хаба"), code
         claim = text.split(" — ", 1)[0]

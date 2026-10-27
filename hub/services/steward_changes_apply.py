@@ -102,10 +102,13 @@ async def _apply_one(
     try:
         result = await apply_judgement(db, task_id, generation, claim=claim)
     except Exception as exc:  # noqa: BLE001 - исход записывается в любом случае
-        from hub.services.refusal_reason import reason_line
+        from hub.services.refusal_reason import RACE_CODES, code_of, reason_line
 
         log.warning("judge changes_requested not applied for #%s: %s", task_id, exc)
-        return OUTCOME_FAILED, reason_line(exc)
+        # #2054, B-2: другой писатель успел первым (человек поставил вердикт,
+        # сдача сдвинулась) - это не сбой применения: skipped, без тревоги.
+        race = code_of(exc) in RACE_CODES
+        return (OUTCOME_SKIPPED if race else OUTCOME_FAILED), reason_line(exc)
     if result[0] == RETURNED:
         return OUTCOME_RETURNED, result[1]
     return (

@@ -50,6 +50,7 @@ from hub.services import gate_grounds as grounds
 from hub.services.refusal_reason import (
     ACT_REVOKED,
     CEILING_CHECK_FAILED,
+    CEILING_FACT_UNBOUND,
     REASON_TEXTS,
     CodedRefusal,
 )
@@ -304,6 +305,22 @@ class CeilingUnavailable(CodedRefusal):
         self.reason = f"{REASON_TEXTS[CEILING_CHECK_FAILED]} ({name})"
 
 
+#: Текст отказа, когда факта ранней проверки для этой сдачи нет (``ceiling_gate``).
+_UNBOUND_MARK = "ранняя проверка не относится к этой сдаче"
+
+
+def unbound_fact_refusal(detail: str) -> HTTPException:
+    """422 ворот записи вердикта по потолку; нет факта ранней проверки - свой код (#2054).
+
+    Текст отказа прежний (клиенты читают его), код ``ceiling_fact_unbound`` - для
+    причины применения: «класс не вычислен для этой сдачи» проходит сам, а «класс
+    выше потолка» нет.
+    """
+    if _UNBOUND_MARK in detail:
+        return CodedRefusal(422, detail, code=CEILING_FACT_UNBOUND)
+    return HTTPException(422, detail)
+
+
 @asynccontextmanager
 async def ceiling_check_guard() -> AsyncIterator[None]:
     """Исключение проверки потолка - ``CeilingUnavailable``, а не безымянная ошибка.
@@ -421,7 +438,7 @@ async def ceiling_gate(
         return (
             REFUSED_CLASS_CEILING,
             f"{key}={ceiling}: недостающий факт risk_class — "
-            "ранняя проверка не относится к этой сдаче (поколение или коммит)",
+            f"{_UNBOUND_MARK} (поколение или коммит)",
         )
     fact = record[2]
     if fact is not None and fact.state == "present":
