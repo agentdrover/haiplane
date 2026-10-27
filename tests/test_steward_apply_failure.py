@@ -95,7 +95,9 @@ async def test_a_gate_refusal_inside_the_ceiling_check_is_not_a_check_failure(
     )
 
     assert row["advisor_outcome_detail"].startswith("generation_moved: ")
-    assert [e["code"] for e in events] == ["generation_moved"]
+    # #2054, B-2: гонка 409 - не сбой применения: исход skipped, события отказа нет.
+    assert row["advisor_outcome"] == "skipped"
+    assert events == []
 
 
 async def _current_ceiling_breaks(monkeypatch) -> None:
