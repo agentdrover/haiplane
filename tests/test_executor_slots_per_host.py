@@ -154,6 +154,25 @@ async def test_two_orders_live_independently(world):
         (b,),
     )
     assert live, "захват B не должен сниматься сдачей A"
+    row_b = (
+        await _rows(
+            world.db,
+            "SELECT claimed_by, claim_session_id, executor_run_id FROM tasks WHERE id = ?",
+            (b,),
+        )
+    )[0]
+    assert row_b["claimed_by"] and row_b["claim_session_id"] == f"slot-{b}"
+    assert row_b["executor_run_id"] == got[b]["executor_run_id"]
+    acted = await world.client.post(  # B ещё может действовать как держатель задачи
+        f"/api/tasks/{b}/updates",
+        json={
+            "agent": config.CHAT_PAIR_AGENT,
+            "kind": "progress",
+            "content": "B работает после сдачи A",
+        },
+        headers=sessions[b],
+    )
+    assert acted.status_code in (200, 201), acted.text
     assert len(await _open(world)) == 1
     off = await world.client.post(
         "/api/admin/executor-hosts/k8/disable", headers=world.human_auth
