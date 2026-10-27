@@ -6,6 +6,10 @@
 
 from __future__ import annotations
 
+import json
+
+from hub import repository as repo
+
 from tests import test_executor_orders as _eo
 from tests.test_executor_orders import (
     _launch_redeem,
@@ -322,3 +326,106 @@ async def test_submitted_order_is_silent_after_the_task_moves_on(world, monkeypa
     await world.db.commit()
     leak = await _read(world, "k8", lived["order"]["id"])
     assert "plain-secret-xyz" not in leak.text
+
+
+async def _project(world, slug: str) -> int:
+    pid = await repo.create_project(world.db, slug=slug, name=slug)
+    await repo.update_project(
+        world.db,
+        pid,
+        gate_policy=json.dumps({"executor_launch": "manual"}),
+        forge="github",
+        repo="agentdrover/haiplane",
+    )
+    await world.db.commit()
+    return pid
+
+
+async def _epic_task(world, epic_project: int, title: str) -> tuple[int, int]:
+    """Лист в эпике, привязанном к проекту (проект наследуется от эпика)."""
+    kw = dict(
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        priority="medium",
+    )
+    epic = await repo.create_task(
+        world.db, title=f"эпик {title}", task_type="epic", parent_id=None, **kw
+    )
+    await repo.update_task(world.db, epic, project_id=epic_project)
+    leaf = await repo.create_task(
+        world.db, title=title, task_type="task", parent_id=epic, **kw
+    )
+    await repo.update_task(world.db, leaf, branch=f"task-{leaf}/work")
+    await world.db.commit()
+    return epic, leaf
+
+
+async def _launch_in(world, slug: str, task_id: int, host: str = "k8"):
+    resp = await world.client.post(
+        f"/api/projects/{slug}/executor-launch",
+        json={"target": f"slot:{host}", "task_id": task_id},
+        headers=world.human_auth,
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["order_id"]
+
+
+async def test_delivered_order_carries_launch_project(world):
+    """AC-1: оба ответа адресату несут тот же id и project; чужой хост заказа не видит."""
+    pid = await _project(world, "olymp-helper")
+    _epic, leaf = await _epic_task(world, pid, "лист олимпа")
+    order_id = await _launch_in(world, "olymp-helper", leaf)
+
+    first = (await _eo._orders(world, "k8")).json()["orders"]
+    again = (await _eo._orders(world, "k8")).json()["orders"]
+    assert [o["id"] for o in first] == [order_id] == [o["id"] for o in again]
+    assert first[0]["project"] == "olymp-helper" == again[0]["project"]
+    assert (await _eo._orders(world, "k9")).json()["orders"] == []
+
+
+async def test_order_project_is_fixed_at_issue(world):
+    """AC-2: смена привязки эпика после выпуска не меняет project выпущенного заказа."""
+    pid = await _project(world, "olymp-helper")
+    other = await _project(world, "other-proj")
+    epic, leaf = await _epic_task(world, pid, "лист олимпа")
+    order_id = await _launch_in(world, "olymp-helper", leaf)
+    assert (await _eo._orders(world, "k8")).json()["orders"][0]["project"] == (
+        "olymp-helper"
+    )
+
+    await repo.update_task(world.db, epic, project_id=other)
+    await world.db.commit()
+    got = (await _eo._orders(world, "k8")).json()["orders"]
+    assert [o["id"] for o in got] == [order_id]
+    assert got[0]["project"] == "olymp-helper"
+
+
+async def test_order_project_null_for_legacy_and_present_in_waiting_memory(world):
+    """AC-3: строка без project_slug -> null; waiting_memory несёт slug выпуска."""
+    legacy = await _task(world, "старый")
+    legacy_id = (await _eo._launch(world, legacy, "k8")).json()["order_id"]
+    await world.db.execute(
+        "UPDATE executor_orders SET project_slug = NULL WHERE id = ?", (legacy_id,)
+    )
+    await world.db.commit()
+    got = (await _eo._orders(world, "k8")).json()["orders"]
+    assert [o["id"] for o in got] == [legacy_id] and got[0]["project"] is None
+
+    waiting = await _task(world, "ждёт памяти")
+    waiting_id = (await _eo._launch(world, waiting, "k9")).json()["order_id"]
+    phase = await world.client.post(
+        f"/api/executor-hosts/k9/orders/{waiting_id}/phase",
+        json={"phase": "waiting_memory", "need_mib": 6144, "free_mib": 3072},
+        headers=world.k9_auth,
+    )
+    assert phase.status_code == 200, phase.text
+    for _ in range(2):
+        orders = (await _eo._orders(world, "k9")).json()["orders"]
+        assert [o["id"] for o in orders] == [waiting_id]
+        assert orders[0]["state"] == "waiting_memory"
+        assert orders[0]["project"] == world.slug

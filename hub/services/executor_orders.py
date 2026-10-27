@@ -973,8 +973,8 @@ async def _issue(
     cursor = await db.execute(
         "INSERT INTO executor_orders (host, task_id, generation, executor_run_id, "
         "pair_code_id, code_ciphertext, order_text, expires_at, code_hash, "
-        "run_seconds, statement_generation) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "run_seconds, statement_generation, project_slug) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host["name"],
             task_id,
@@ -989,6 +989,8 @@ async def _issue(
             # #1942: поколение ПОСТАНОВКИ на момент выпуска (не путать с generation —
             # поколением сдачи); по нему считается серия неудач одной постановки.
             int(task.get("statement_generation") or 0),
+            # #2122: проект запуска фиксируется при выпуске и не пересчитывается.
+            str(project["slug"]),
         ),
     )
     order_id = int(cursor.lastrowid or 0)
@@ -1036,6 +1038,8 @@ def _order_view(row: dict[str, Any]) -> dict[str, Any]:
         "expires_at": row["expires_at"],
         "delivered_at": row["delivered_at"],
         "run_seconds": row["run_seconds"],
+        # #2122: проект выпуска; NULL у заказов до миграции.
+        "project": row["project_slug"],
     }
 
 
