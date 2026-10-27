@@ -7,7 +7,7 @@ implementer channel=slot и заказ хосту с шифротекстом н
 Здесь проверяются границы, которые держат безопасность: открытого кода нет
 нигде (грепается вся база, ответы и журнал), ключ хоста открывает шесть маршрутов
 своего хоста и ничего больше (настоящий DB API key, не подмена роли), бронь слота
-держит индекс, а любое закрытие сжигает код.
+держит сама база (до #2107 — индекс, теперь триггер слотов хоста), а любое закрытие сжигает код.
 """
 
 from __future__ import annotations
@@ -587,8 +587,8 @@ async def test_one_task_per_slot_across_both_doors(world):
     loser = second if winner == first else first
     assert "слот занят" in next(r for r in both if r.status_code == 409).text
     assert len(await _rows(world.db, "SELECT 1 FROM executor_orders")) == 1
-    # Бронь держит САМ индекс, не только проверка: второй открытый заказ хоста
-    # база не примет, закрытый — примет.
+    # Бронь держит сама база (триггер слотов #2107), не только проверка: второй
+    # открытый заказ хоста с одним слотом база не примет, закрытый — примет.
     import aiosqlite
 
     open_order = (await _rows(world.db, "SELECT * FROM executor_orders"))[0]

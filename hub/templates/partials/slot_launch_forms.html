@@ -7,7 +7,7 @@
     <button class="btn btn-primary task-action-btn" type="button" disabled>Запуск идёт: {{ launch_plaque.button_label or launch_plaque.headline }}</button>
     {%- else %}
     <button class="btn btn-primary task-action-btn" type="submit"
-            onclick="return confirm('Запустить исполнителя на слоте {{ slot_host }} для задачи #{{ task.id }}?{% if task.status.value == 'running' %} Задача вернётся в работу (круг починки).{% endif %} Хаб сам передаст код хосту.')">Запустить на {{ slot_host }}</button>
+            onclick="return confirm('Запустить исполнителя на слоте {{ slot_host }} для задачи #{{ task.id }}?{% if task.status.value == 'running' %} Задача вернётся в работу (круг починки).{% endif %} Хаб сам передаст код хосту.')">Запустить на {{ slot_host }}{% if slot_capacity and slot_capacity.get(slot_host) %} · {{ slot_capacity[slot_host] }}{% endif %}</button>
     {%- endif %}
 </form>
 {%- endfor %}
