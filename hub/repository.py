@@ -8,7 +8,7 @@ No Pydantic models, no business logic.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any, NamedTuple
 from urllib.parse import urlencode
 
@@ -815,6 +815,9 @@ class FixDeploy(NamedTuple):
 
     at: str | None
     assumed: bool = False
+    # Which delivery ``at`` belongs to: the released sha of the chosen merge, or
+    # ``merge:<sha>`` on the merge-is-delivery path. Never used to compute ``at``.
+    ident: str = ""
 
 
 _FIX_TREE_SQL = (
@@ -838,7 +841,8 @@ async def _merge_is_delivery_fix(
     """
     merges = await fetchall(
         db,
-        "SELECT project_id, merged_at, TRIM(COALESCE(released_sha, '')) AS sha "
+        "SELECT project_id, merged_at, TRIM(COALESCE(released_sha, '')) AS sha, "
+        "TRIM(COALESCE(merge_sha, '')) AS merge_sha "
         "FROM pipeline_merges WHERE task_id = ? ORDER BY id DESC",
         (task_id,),
     )
@@ -855,10 +859,13 @@ async def _merge_is_delivery_fix(
         "WHERE status = 'success' AND project_id = ?",
         (last["merged_at"], int(project_id)),
     )
+    ident = f"merge:{last['merge_sha'].lower()}"
     if not deploys[0]["n"]:
-        return FixDeploy(str(last["merged_at"]) if last["merged_at"] else None, True)
+        return FixDeploy(
+            str(last["merged_at"]) if last["merged_at"] else None, True, ident
+        )
     after = deploys[0]["first_after"]
-    return FixDeploy(str(after) if after else None)
+    return FixDeploy(str(after) if after else None, False, ident)
 
 
 async def first_fix_deploy_at(
@@ -888,26 +895,31 @@ async def first_fix_deploy_at(
     tree = _FIX_TREE_SQL if with_descendants else "SELECT ? AS id"
     rows = await fetchall(
         db,
-        f"SELECT MAX(d) AS at FROM (SELECT (SELECT MIN(r.deployed_at) FROM releases r "  # nosec B608
+        "SELECT (SELECT MIN(r.deployed_at) FROM releases r "  # nosec B608
         "WHERE r.status = 'success' "
-        "AND LOWER(TRIM(r.deployed_sha)) = LOWER(TRIM(pm.released_sha))) AS d "
+        "AND LOWER(TRIM(r.deployed_sha)) = LOWER(TRIM(pm.released_sha))) AS d, "
+        "LOWER(TRIM(pm.released_sha)) AS sha "
         f"FROM ({tree}) AS tr "
         "JOIN pipeline_merges pm ON pm.id = (SELECT MAX(p2.id) FROM pipeline_merges p2 "
-        "WHERE p2.task_id = tr.id AND TRIM(COALESCE(p2.released_sha, '')) != ''))",
+        "WHERE p2.task_id = tr.id AND TRIM(COALESCE(p2.released_sha, '')) != '')",
         (task_id,),
     )
-    strict = str(rows[0]["at"]) if rows and rows[0]["at"] else None
+    # The latest moment wins (an epic is out when its last child is); on a tie
+    # the larger sha, so the choice is stable.
+    best = max(((str(r["d"]), str(r["sha"])) for r in rows if r["d"]), default=None)
+    strict = FixDeploy(best[0], False, best[1]) if best else FixDeploy(None)
     if not delivery_projects:
-        return FixDeploy(strict)
+        return strict
     projects = frozenset(delivery_projects)
     ids = await fetchall(db, tree if with_descendants else "SELECT ?", (task_id,))
-    moments = [FixDeploy(strict)]
+    moments = [strict]
     for row in ids:
         moments.append(await _merge_is_delivery_fix(db, int(row[0]), projects))
     dated = [m for m in moments if m.at]
     if not dated:
         return FixDeploy(None)
-    return FixDeploy(max(m.at for m in dated if m.at), any(m.assumed for m in dated))
+    top = max(dated, key=lambda m: (m.at or "", m.ident))
+    return FixDeploy(top.at, any(m.assumed for m in dated), top.ident)
 
 
 async def pipeline_merge_recorded(
@@ -2655,10 +2667,54 @@ async def list_outcome_debt(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     return await fetchall(
         db,
         "SELECT id, title, task_type, outcome_metric, outcome_indicator, "
-        "outcome_deadline, outcome_revisit_condition, completed_at, updated_at "
+        "outcome_deadline, outcome_revisit_condition, completed_at, updated_at, "
+        "parent_id, outcome_owner_task_id "
         "FROM tasks "
         "WHERE archived=0 AND status='completed' AND TRIM(outcome_metric) != '' "
         "ORDER BY COALESCE(completed_at, updated_at) ASC",
+    )
+
+
+async def list_ownership_context(
+    db: aiosqlite.Connection, task_ids: Collection[int], owner_ids: Collection[int]
+) -> list[aiosqlite.Row]:
+    """Every ancestor of ``task_ids`` plus the named owners, in ONE query (#2090).
+
+    The rows a promise's owner link is judged against. Ancestors are walked with
+    a recursive CTE, so the cost does not grow with the number of tasks judged;
+    the ids travel as two JSON arrays, so the bound-variable count stays two
+    however many tasks are judged.
+    """
+    ids, owners = sorted(set(task_ids)), sorted(set(owner_ids))
+    if not ids and not owners:
+        return []
+    return await fetchall(
+        db,
+        "WITH RECURSIVE chain(id) AS ("
+        "SELECT parent_id FROM tasks WHERE id IN (SELECT value FROM json_each(?)) "
+        "AND parent_id IS NOT NULL "
+        "UNION SELECT t.parent_id FROM tasks t JOIN chain c ON t.id = c.id "
+        "WHERE t.parent_id IS NOT NULL) "
+        "SELECT id, parent_id, status, archived, outcome_metric, "
+        "outcome_owner_task_id FROM tasks "
+        "WHERE id IN (SELECT id FROM chain) "
+        "OR id IN (SELECT value FROM json_each(?))",
+        (json.dumps(ids), json.dumps(owners)),
+    )
+
+
+async def set_outcome_owner_column(
+    db: aiosqlite.Connection, task_id: int, owner_task_id: int | None
+) -> None:
+    """Write the owner link and nothing else (#2090); the caller commits.
+
+    Not ``update_task``: that bumps ``updated_at``, which stands in for the
+    completion time of rows without ``completed_at``, so a delegation would move
+    the age of the promise it does not answer.
+    """
+    await db.execute(
+        "UPDATE tasks SET outcome_owner_task_id=? WHERE id=?",
+        (owner_task_id, task_id),
     )
 
 
@@ -6637,3 +6693,112 @@ async def wait_for_executor_cost(
         (row_id, f"-{minutes} minutes"),
     )
     return bool(rows)
+
+
+# --- outcome retirements (#2091) ---------------------------------------------
+
+
+async def list_active_retirements(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Decisions not cancelled: at most one per task (partial unique index)."""
+    return await fetchall(
+        db,
+        "SELECT * FROM outcome_retirements WHERE cancelled_at IS NULL ORDER BY id",
+    )
+
+
+async def list_outcome_retirements(
+    db: aiosqlite.Connection, task_id: int | None = None
+) -> list[aiosqlite.Row]:
+    """The whole history, cancelled rows included, oldest first."""
+    if task_id is None:
+        return await fetchall(db, "SELECT * FROM outcome_retirements ORDER BY id")
+    return await fetchall(
+        db,
+        "SELECT * FROM outcome_retirements WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+
+
+async def insert_outcome_retirement(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    batch_id: str,
+    reason: str,
+    retired_by: str,
+    principal_id: int | None,
+    cutoff: str,
+    context_snapshot: str,
+    context_hash: str,
+) -> int:
+    cur = await db.execute(
+        "INSERT INTO outcome_retirements (task_id, batch_id, reason, retired_by, "
+        "principal_id, cutoff, context_snapshot, context_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            batch_id,
+            reason,
+            retired_by,
+            principal_id,
+            cutoff,
+            context_snapshot,
+            context_hash,
+        ),
+    )
+    return int(cur.lastrowid or 0)
+
+
+async def cancel_outcome_retirement(
+    db: aiosqlite.Connection, retirement_id: int, *, cancelled_by: str, reason: str
+) -> None:
+    """Close the decision; the row stays in the history."""
+    await db.execute(
+        "UPDATE outcome_retirements SET cancelled_at=datetime('now'), "
+        "cancelled_by=?, cancel_reason=? WHERE id=? AND cancelled_at IS NULL",
+        (cancelled_by, reason, retirement_id),
+    )
+
+
+async def save_retirement_preview(
+    db: aiosqlite.Connection,
+    *,
+    token: str,
+    cutoff: str,
+    projects: str,
+    entries: str,
+    created_by: str,
+    ttl_hours: int,
+) -> None:
+    await db.execute(
+        "DELETE FROM outcome_retirement_previews WHERE expires_at < datetime('now')"
+    )
+    await db.execute(
+        "INSERT INTO outcome_retirement_previews (token, cutoff, projects, entries, "
+        "created_by, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', ?))",
+        (token, cutoff, projects, entries, created_by, f"+{int(ttl_hours)} hours"),
+    )
+
+
+async def get_retirement_preview(
+    db: aiosqlite.Connection, token: str
+) -> aiosqlite.Row | None:
+    """A saved preview that has not expired, or None."""
+    rows = await fetchall(
+        db,
+        "SELECT * FROM outcome_retirement_previews "
+        "WHERE token=? AND expires_at >= datetime('now')",
+        (token,),
+    )
+    return rows[0] if rows else None
+
+
+async def mark_retirement_preview_applied(
+    db: aiosqlite.Connection, token: str, result: str
+) -> None:
+    """A token is applied once: the outcome is kept for repeats (#2091)."""
+    await db.execute(
+        "UPDATE outcome_retirement_previews SET applied_at=datetime('now'), "
+        "applied_result=? WHERE token=? AND applied_at IS NULL",
+        (result, token),
+    )

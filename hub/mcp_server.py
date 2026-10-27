@@ -1410,6 +1410,14 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
         parts.append(f"Project: {_project_slug(task)}")
     if task.get("outcome_status"):
         parts.append(f"Outcome hypothesis: {task['outcome_status']}")
+    own = task.get("outcome_ownership") or {}
+    if own.get("state") == "covered":
+        parts.append(f"Outcome promise: held by #{own.get('owner_task_id')}")
+    elif own.get("state") == "invalid_owner":
+        parts.append(
+            f"Outcome promise: link to #{own.get('owner_task_id')} does not hold "
+            f"({own.get('reason')})"
+        )
     parts += [
         f"Source: {task.get('source', 'human')}",
         f"Runtime: {task.get('runtime', 'auto')}",
@@ -4156,6 +4164,22 @@ async def hub_undelivered_completed() -> CallToolResult:
     return structured_echo_result("\n".join(lines), delivery_discrepancies=data)
 
 
+def _ownership_line(item: dict[str, Any]) -> list[str]:
+    """Who holds the promise, for rows of the actionable view (#2090)."""
+    own = item.get("ownership") or {}
+    if own.get("state") == "covered":
+        answered = "" if "latest_answer" in item else " (not answered)"
+        return [f"    held by #{own.get('owner_task_id')}{answered}"]
+    if own.get("state") == "invalid_owner":
+        return [
+            f"    owner link to #{own.get('owner_task_id')} does not hold: "
+            f"{own.get('reason')}"
+        ]
+    if own.get("suggested_owner_task_id"):
+        return [f"    hint: #{own['suggested_owner_task_id']} states a metric too"]
+    return []
+
+
 def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
     """One row of the outcome-debt page: an open promise or an answered one."""
     if "latest_answer" in item:
@@ -4165,6 +4189,7 @@ def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
             f" ({item.get('answers', 0)} check(s), last by "
             f"{latest.get('answered_by') or 'unknown'})",
             f"    measured: {latest.get('measured_value') or '—'}",
+            *_ownership_line(item),
         ]
     waited = item.get("days_unanswered")
     waited_text = f"{waited}d unanswered" if waited is not None else "age unknown"
@@ -4181,31 +4206,65 @@ def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
         lines.append(f"    said by: {item['outcome_deadline']}")
     if item.get("outcome_revisit_condition"):
         lines.append(f"    revisit if: {item['outcome_revisit_condition']}")
-    return lines
+    return lines + _ownership_line(item)
 
 
 _OUTCOME_DEBT_HINT = (
-    "Остальное: выберите status=overdue|observing|unknown|answered и листайте "
+    "Остальное: выберите status=overdue|observing|unknown|answered|retired и листайте "
     "offset; полный JSON — REST GET /api/metrics/outcome-debt без параметров "
     "или CLI hp-hub outcome-debt без флагов."
 )
+_ACTIONABLE_HINT = (
+    "Остальное: выберите status=overdue|observing|unknown|answered|retired|"
+    "covered|invalid_owner и листайте offset; полный старый срез — view=all."
+)
+
+
+def _actionable_head(data: dict[str, Any]) -> str:
+    """Head of the actionable view: zero debt here never means "all answered"."""
+    others = (
+        f"{data.get('covered_total', 0)} covered by an owner (coverage is not an answer), "
+        f"{data.get('invalid_owner_total', 0)} with an invalid owner link, "
+        f"{data.get('answered_total', 0)} answered, "
+        f"{data.get('retired_total', 0)} retired by the owner (result unknown, not answers)"
+    )
+    if not data.get("total", 0):
+        return f"No actionable outcome debt; that is not 'all answered': {others}."
+    return (
+        f"{data.get('total', 0)} completed tasks stated an outcome nobody answered "
+        f"and no valid owner holds ({data.get('overdue_total', 0)} overdue, "
+        f"{data.get('observing_total', 0)} observing, "
+        f"{data.get('unknown_total', 0)} unknown); {others}."
+    )
 
 
 def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
     """Text of one outcome-debt page (#1605). "No debt" only when ``total`` is 0:
     an empty page says nothing about the other statuses."""
     answered = data.get("answered_total", 0)
-    if not data.get("total", 0):
+    actionable = data.get("view") == "actionable"
+    if actionable:
+        lines = [_actionable_head(data)]
+    elif not data.get("total", 0):
+        retired = data.get("retired_total", 0)
         lines = [
             "No outcome debt: every completed task with a stated metric has "
-            f"an answer ({answered} answered).",
+            f"an answer ({answered} answered)"
+            + (
+                f" or a check retired by the owner ({retired}; result unknown, "
+                "not an answer)."
+                if retired
+                else "."
+            ),
         ]
     else:
         lines = [
             f"{data.get('total', 0)} completed tasks stated an outcome nobody "
             f"answered ({data.get('overdue_total', 0)} overdue, "
             f"{data.get('observing_total', 0)} observing, "
-            f"{data.get('unknown_total', 0)} unknown); {answered} answered.",
+            f"{data.get('unknown_total', 0)} unknown); {answered} answered, "
+            f"{data.get('retired_total', 0)} retired by the owner "
+            "(result unknown, not answers).",
         ]
     rows = data.get("rows")
     if rows is not None:
@@ -4225,7 +4284,9 @@ def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
             lines.append(f"{shown}; это последняя страница.")
     else:
         lines.append("Только счётчики, строк нет.")
-    if data.get("total", 0):
+    if actionable:
+        lines.append(_ACTIONABLE_HINT)
+    elif data.get("total", 0):
         lines.append(_OUTCOME_DEBT_HINT)
     lines.append("")
     for item in rows or []:
@@ -4235,22 +4296,34 @@ def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
 
 @mcp.tool()
 async def hub_outcome_debt(
-    status: Literal["overdue", "observing", "unknown", "answered"] = "overdue",
+    status: Literal[
+        "overdue",
+        "observing",
+        "unknown",
+        "answered",
+        "retired",
+        "covered",
+        "invalid_owner",
+    ] = "overdue",
     limit: int = 20,
     offset: int = 0,
     only_counts: bool = False,
+    view: Literal["all", "actionable"] = "all",
 ) -> CallToolResult:
-    """Outcome promises and the answers to them (#766, #819).
+    """Outcome promises and their answers (#766, #819).
 
-    Completed tasks whose stated outcome nobody answered, plus answered ones
-    with the last verdict. Record an answer with hub_answer_outcome. Due =
-    first deploy of the fix + 14 days (#1568); due_assumed = counted from the
-    merge (#1572); outcome_deadline stays free text.
+    Completed tasks whose outcome nobody answered, plus answered ones with the
+    last verdict (hub_answer_outcome). Due = first deploy of the fix + 14 days
+    (#1568); due_assumed = counted from the merge (#1572).
 
-    Returns counters plus ONE page (#1605): status overdue by default, limit
-    1-200, offset to page on; only_counts drops the rows. Not the full list.
+    ONE page plus counters (#1605): status overdue by default, limit 1-200,
+    offset; only_counts drops rows. view=actionable (#2090): minus promises a
+    valid owner holds (a human sets it); adds statuses covered,
+    invalid_owner. Coverage is no answer.
     """
     params: dict[str, Any] = {"status": status, "limit": limit, "offset": offset}
+    if view != "all":
+        params["view"] = view
     if only_counts:
         params["only_counts"] = "true"
     try:
@@ -4271,19 +4344,17 @@ async def hub_answer_outcome(
     measured_value: str,
     note: str = "",
 ) -> CallToolResult:
-    """Record one check of a completed task's stated outcome (#819).
+    """Record one check of a completed task's outcome (#819).
 
-    A check is not a success: not_moved and unmeasurable are filed exactly like
-    moved. The verdict is your declaration, auditable rather than provable -
-    answered_by comes from your identity, not from an argument. Checks are
-    appended, so a task can be answered at several moments.
+    A check is not a success: not_moved and unmeasurable are filed like moved.
+    The verdict is your declaration; answered_by is your identity. Checks are
+    appended.
 
     Args:
         task_id: Completed task whose outcome_metric is being answered.
         verdict: moved | not_moved | unmeasurable.
         measured_value: What was observed - the number and where it was read.
-            Required: an answer without one is an opinion.
-        note: Optional context, caveats, or what to do next.
+        note: Optional context.
     """
     try:
         result = await _api_post(
