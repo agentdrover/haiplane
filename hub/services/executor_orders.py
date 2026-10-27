@@ -11,9 +11,12 @@
   ровно до шифрования RSA-OAEP на открытый ключ хоста. В базе — хеш кода (как у
   любого кода chat-pair) и шифротекст; в ответах, аудите, событиях и журнале
   кода нет. Расшифровать может только владелец закрытого ключа — хост.
-* **Заказ — бронь слота.** Один незакрытый заказ на хост держит частичный
-  UNIQUE-индекс, а не проверка перед вставкой: два нажатия с двух соединений не
-  пройдут оба. Бронь непрерывна от выпуска кода до закрытия, в том числе между
+* **Заказ — бронь слота.** Новый заказ (и переоткрытие) хост получает, только
+  пока незакрытых заказов меньше ``executor_hosts.slots`` (#2107): ``_book``
+  считает их под замком записи, а триггеры базы отказывают во вставке и
+  переоткрытии сверх предела, поэтому два нажатия с двух соединений за
+  последнее место не пройдут оба. Снижение ``slots`` открытые заказы не
+  закрывает: занятость может быть выше предела, пока они не закроются. Бронь непрерывна от выпуска кода до закрытия, в том числе между
   выкупом и захватом задачи.
 * **Любое закрытие, кроме сдачи, сжигает код.** Выкуп кода хоста проверяет в
   той же операции, что его заказ не закрыт и хост включён
@@ -91,6 +94,9 @@ REPORT_NOTE_MAX: Final[int] = 500
 #: Минимум ключа хоста: RSA-3072 (PEM SPKI).
 MIN_KEY_BITS: Final[int] = 3072
 HOST_KEY_DAYS: Final[int] = 90
+#: #2107: незакрытых заказов на хост одновременно — от 1 (по умолчанию) до 4.
+HOST_SLOTS_MIN: Final[int] = 1
+HOST_SLOTS_MAX: Final[int] = 4
 
 EVENT_ORDER_CLOSED = "executor_order_closed"
 
@@ -165,6 +171,7 @@ def _host_view(row: dict[str, Any]) -> dict[str, Any]:
         "created_by": row["created_by"],
         "disabled_at": row["disabled_at"],
         "disabled_by": row["disabled_by"],
+        "slots": int(row["slots"]) if "slots" in row.keys() else 1,
     }
 
 
@@ -711,20 +718,24 @@ async def _task_busy(db: aiosqlite.Connection, task_id: int) -> str:
     )
 
 
-async def _slot_busy(db: aiosqlite.Connection, host: str) -> str:
+async def _slot_busy(db: aiosqlite.Connection, host: str, slots: int = 1) -> str:
+    """Отказ, если незакрытых заказов хоста уже ``slots`` (#2107); иначе пусто."""
     rows = await fetchall(
         db,
         "SELECT id, task_id, state FROM executor_orders WHERE host = ? "
-        "AND state <> 'closed'",
+        "AND state <> 'closed' ORDER BY id",
         (host,),
     )
-    if not rows:
+    if len(rows) < max(int(slots), 1):
         return ""
-    row = dict(rows[0])
-    return (
-        f"{REASON_SLOT_BUSY}: {host} держит задачу #{row['task_id']} "
-        f"({row['state']}), заказ #{row['id']}"
-    )
+    held = ", ".join(f"#{r['task_id']} ({r['state']}, заказ #{r['id']})" for r in rows)
+    if len(rows) == 1 and int(slots) <= 1:  # прежний текст для хоста с одним слотом
+        row = dict(rows[0])
+        return (
+            f"{REASON_SLOT_BUSY}: {host} держит задачу #{row['task_id']} "
+            f"({row['state']}), заказ #{row['id']}"
+        )
+    return f"{REASON_SLOT_BUSY}: {host} {len(rows)}/{int(slots)}, задачи {held}"
 
 
 async def _order_text(
@@ -794,7 +805,7 @@ async def _book(
     refusal = (
         await _task_busy(db, int(task["id"]))
         or await _task_refusal(db, task)
-        or await _slot_busy(db, host_name)
+        or await _slot_busy(db, host_name, int(host.get("slots") or 1))
     )
     if refusal:
         return refusal
@@ -847,7 +858,7 @@ async def launch_on_slot(
                 issuer_human=issuer_human,
             )
     except aiosqlite.IntegrityError:
-        # Второе соединение успело вставить заказ раньше: UNIQUE по хосту.
+        # Второе соединение заняло последнее место раньше: триггер слотов хоста.
         return _refused(f"{REASON_SLOT_BUSY}: {host}", task_id)
     except HostError as exc:
         # Сохранённый ключ хоста не годится: код не выписан, ничего не осталось.

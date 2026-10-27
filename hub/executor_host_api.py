@@ -25,7 +25,13 @@ from pydantic import BaseModel, Field, ValidationError
 
 from hub import config
 from hub.auth import LoginRateLimiter, current_identity, require_human_or_admin
-from hub.services import executor_orders, host_redeem, launch_feedback, memory_wait
+from hub.services import (
+    executor_host_slots,
+    executor_orders,
+    host_redeem,
+    launch_feedback,
+    memory_wait,
+)
 
 router = APIRouter()
 
@@ -49,6 +55,10 @@ class ExecutorHostCreate(BaseModel):
     name: str
     public_key_pem: str
     expires_days: int = Field(default=executor_orders.HOST_KEY_DAYS, ge=1, le=365)
+
+
+class ExecutorHostSlots(BaseModel):
+    slots: int = Field(strict=True)
 
 
 class ExecutorOrderAck(BaseModel):
@@ -163,6 +173,20 @@ async def api_executor_host_disable(name: str, request: Request) -> dict:
     try:
         return await executor_orders.disable_host(
             _db(request), name, by=identity.principal_id
+        )
+    except executor_orders.HostError as exc:
+        raise _as_http(exc) from exc
+
+
+@router.post("/api/admin/executor-hosts/{name}/slots")
+async def api_executor_host_slots(
+    name: str, body: ExecutorHostSlots, request: Request
+) -> dict:
+    """#2107: сколько незакрытых заказов хост держит одновременно (1..4); только человек."""
+    identity = await _human(request, "executor host slots")
+    try:
+        return await executor_host_slots.set_host_slots(
+            _db(request), name, body.slots, by=identity.principal_id
         )
     except executor_orders.HostError as exc:
         raise _as_http(exc) from exc

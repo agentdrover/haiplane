@@ -396,7 +396,9 @@ async def test_migration_rebuilds_the_check_and_keeps_orders(monkeypatch):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        # Занятый слот держит индекс и в ожидании.
+        # Занятый слот держит индекс и в ожидании. Здесь #1972 пересоздаёт таблицу
+        # ПОСЛЕ остальных шагов (в том числе #2107): индекс #1972 вернулся, триггеров
+        # слотов нет. На прямом порядке шагов отказ даёт триггер (#2107).
         try:
             await conn.execute(
                 "INSERT INTO executor_orders (host, task_id, generation, "

@@ -77,7 +77,21 @@ def cmd_executor_host(args: argparse.Namespace) -> int:
             return 0
         for host in result["hosts"]:
             state = "включён" if host["enabled"] else "отключён"
-            print(f"{host['name']}\t{state}\tprincipal #{host['principal_id']}")
+            print(
+                f"{host['name']}\t{state}\tслотов {host.get('slots', 1)}\tprincipal #{host['principal_id']}"
+            )
+        return 0
+    if args.host_cmd == "set-slots":
+        name = urllib.parse.quote(args.name, safe="")
+        result = _api(
+            "POST", f"/api/admin/executor-hosts/{name}/slots", {"slots": args.slots}
+        )
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+        print(
+            f"{result['name']}: слотов {result['slots']}, незакрытых заказов {result['open_orders']}."
+        )
         return 0
     name = urllib.parse.quote(args.name, safe="")
     if args.host_cmd == "disable":
@@ -134,7 +148,12 @@ def add_executor_host_parsers(sub: Any) -> None:
     p_dis = host_sub.add_parser("disable", help="Disable a host (human)")
     p_dis.add_argument("name")
     host_sub.add_parser("list", help="List registered hosts")
-    for each in (p_add, p_host):
+    p_slots = host_sub.add_parser(
+        "set-slots", help="Concurrent orders of a host, 1..4 (human)"
+    )
+    p_slots.add_argument("name")
+    p_slots.add_argument("slots", type=int)
+    for each in (p_add, p_slots, p_host):
         each.add_argument("--json", action="store_true", help="Print raw JSON")
     p_host.set_defaults(func=cmd_executor_host)
 

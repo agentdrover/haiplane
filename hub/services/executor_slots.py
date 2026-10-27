@@ -75,6 +75,14 @@ def dead_minutes_of(policy: dict[str, Any]) -> int:
 
 def format_occupancy(result: dict[str, Any]) -> list[str]:
     """Занятость каналов строками — общая для CLI и MCP."""
+    head: list[str] = []
+    for host in result.get("hosts") or []:  # #2107: ёмкость хоста по незакрытым заказам
+        tasks = ", ".join(f"#{t}" for t in host.get("task_ids") or [])
+        off = "" if host.get("enabled", True) else " (отключён)"
+        head.append(
+            f"хост {host.get('name')}{off}: {host.get('open', 0)}/{host.get('slots', 1)}"
+            + (f" — {tasks}" if tasks else "")
+        )
     lines: list[str] = []
     for row in result.get("tasks") or []:
         lines.append(
@@ -87,7 +95,10 @@ def format_occupancy(result: dict[str, Any]) -> list[str]:
             f"брошена: #{row.get('task_id')} {row.get('title', '')} — "
             f"{row.get('reason', '')}"
         )
-    return lines or ["Слоты свободны, задач в работе нет."]
+    if lines:
+        return head + lines
+    busy = any(int(h.get("open") or 0) for h in result.get("hosts") or [])
+    return head + ([] if busy else ["Слоты свободны, задач в работе нет."])
 
 
 async def _capture_session(
@@ -213,7 +224,34 @@ async def occupancy(db: aiosqlite.Connection) -> dict[str, Any]:
         "slots": [t for t in tasks if t["channel"] == CHANNEL_SLOT],
         "tasks": tasks,
         "abandoned": [dict(r) for r in dead],
+        "hosts": await host_capacity(db),
     }
+
+
+async def host_capacity(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """#2107: хост, его ``slots`` и незакрытые заказы (pending, delivered, waiting_memory, выкупленные)."""
+    rows = await fetchall(
+        db,
+        "SELECT h.name, h.enabled, h.slots, o.task_id FROM executor_hosts h "
+        "LEFT JOIN executor_orders o ON o.host = h.name AND o.state <> 'closed' "
+        "ORDER BY h.name, o.id",
+    )
+    hosts: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        h = hosts.setdefault(
+            str(r["name"]),
+            {
+                "name": str(r["name"]),
+                "enabled": bool(r["enabled"]),
+                "slots": int(r["slots"] or 1),
+                "open": 0,
+                "task_ids": [],
+            },
+        )
+        if r["task_id"] is not None:
+            h["open"] += 1
+            h["task_ids"].append(int(r["task_id"]))
+    return list(hosts.values())
 
 
 async def _close(
