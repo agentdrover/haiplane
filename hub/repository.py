@@ -6793,7 +6793,11 @@ async def mark_retirement_preview_applied(
 
 
 async def delivered_fix_shas(
-    db: aiosqlite.Connection, task_id: int, *, with_descendants: bool = False
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    with_descendants: bool = False,
+    delivery_projects: frozenset[int] | set[int] = frozenset(),
 ) -> list[str]:
     """Identity of the task's deliveries: every stamped fix sha that really deployed.
 
@@ -6812,4 +6816,17 @@ async def delivered_fix_shas(
         "ORDER BY sha",
         (task_id,),
     )
-    return [str(r["sha"]) for r in rows]
+    shas = [str(r["sha"]) for r in rows]
+    if delivery_projects:
+        marks = ",".join("?" for _ in delivery_projects)
+        merges = await fetchall(
+            db,
+            "SELECT DISTINCT LOWER(TRIM(pm.merge_sha)) AS sha "  # nosec B608
+            f"FROM ({tree}) AS tr JOIN pipeline_merges pm ON pm.task_id = tr.id "
+            "WHERE TRIM(COALESCE(pm.released_sha, '')) = '' "
+            "AND TRIM(COALESCE(pm.merge_sha, '')) != '' "
+            f"AND pm.project_id IN ({marks})",
+            (task_id, *sorted(delivery_projects)),
+        )
+        shas += [f"merge:{r['sha']}" for r in merges]
+    return sorted(shas)

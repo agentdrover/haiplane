@@ -480,3 +480,24 @@ async def test_redeploy_of_the_same_sha_keeps_the_context(db: aiosqlite.Connecti
     assert (await _counts(db))["retired_total"] == 1
     states = {r["task_id"]: r["state"] for r in await _history(db)}
     assert states[task_id] == "retired"
+
+
+async def test_merge_is_delivery_second_merge_is_new_context(
+    db: aiosqlite.Connection,
+):
+    """Codex P2: поставка проекта merge = delivery (без released_sha) тоже идентичность."""
+    from tests.test_outcome_status import _delivery_project, _merge
+
+    pid = await _delivery_project(db, "local-app", {"merge_is_delivery": True})
+    task_id = await _old(db, "Local fix")
+    await _merge(db, task_id, pid, days_ago=60)
+    prev = await _preview(db)
+    assert [c["task_id"] for c in prev["cohort"]] == [task_id]
+    await _apply(db, prev["token"])
+    assert (await _counts(db))["retired_total"] == 1
+
+    await _merge(db, task_id, pid, days_ago=70)  # earlier moment, new merge
+
+    assert (await _counts(db))["retired_total"] == 0
+    states = {r["task_id"]: r["state"] for r in await _history(db)}
+    assert states[task_id] == "context_changed"

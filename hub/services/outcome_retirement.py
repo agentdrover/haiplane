@@ -61,7 +61,10 @@ async def _fix_at(
         delivery_projects=delivery_projects,
     )
     shas = await repository.delivered_fix_shas(
-        db, int(row["id"]), with_descendants=descendants
+        db,
+        int(row["id"]),
+        with_descendants=descendants,
+        delivery_projects=delivery_projects,
     )
     return fix.at or "", shas
 
