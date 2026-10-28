@@ -494,3 +494,130 @@ async def test_state_approval_is_human_and_bound_to_generation(
     assert dict(await repo.get_task(db, cycle))["status"] == "review"
     final = await verdict(cycle, "human", "approved", expected_generation=2)
     assert final.status_code == 200 and final.json()["status"] == "completed"
+
+
+# ---- #2147: внешний вердикт не может назваться автоматикой ----
+
+
+async def _verdict_events(db, task_id: int) -> list[dict]:
+    from hub.db import fetchall
+
+    rows = await fetchall(
+        db,
+        "SELECT actor, payload FROM events "
+        "WHERE kind='review_verdict_recorded' AND task_id=? ORDER BY id",
+        (task_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+@pytest.mark.parametrize("name", ["policy", " Steward ", "HUB", "hub", "\tPolicy\n"])
+async def test_external_verdict_rejects_reserved_actor_names(
+    client: AsyncClient, db, name: str
+):
+    """AC-1: agent вида hub/policy/steward (после strip, без регистра) - 422.
+
+    Маршрут REST - единственный вход и для MCP hub_submit_review, и для CLI,
+    поэтому проверка здесь покрывает все три. Ничего не записано: ни вердикт,
+    ни событие, поколение не потрачено.
+    """
+    task_id = await _task_in_review(client)
+    before = (await client.get(f"/api/tasks/{task_id}")).json()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "changes_requested", "agent": name, "comments": "redo"},
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["reason"] == "reserved_actor_name", resp.text
+    after = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert after["status"] == "review"
+    assert after["latest_review"] is None
+    assert after["submission_generation"] == before["submission_generation"]
+    assert not await _review_updates(client, task_id)
+    assert await _verdict_events(db, task_id) == []
+
+
+async def test_internal_policy_and_steward_verdicts_keep_their_actor(
+    client: AsyncClient, db
+):
+    """AC-2: запрет стоит на маршруте, а не в модели и не в lifecycle.
+
+    Автополитика пишет agent=policy, применение стюарда - agent=steward прямо в
+    сервис; оба вердикта записываются, actor события - как раньше.
+    """
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services.lifecycle import record_review_verdict
+
+    policy_task = await _task_in_review(client, title="policy path")
+    await record_review_verdict(
+        db,
+        policy_task,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested, agent="policy", comments="redo"
+        ),
+        self_approved=False,
+        expected_generation=1,
+    )
+    steward_task = await _task_in_review(client, title="steward path")
+    await record_review_verdict(
+        db,
+        steward_task,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="steward",
+            comments="redo",
+        ),
+        self_approved=False,
+    )
+
+    assert [e["actor"] for e in await _verdict_events(db, policy_task)] == ["policy"]
+    assert [e["actor"] for e in await _verdict_events(db, steward_task)] == ["steward"]
+
+
+async def test_ordinary_human_return_still_counts_and_web_form_rejects_reserved(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-3: обычный возврат учитывается как человеческий; форма с именем
+    «Policy» отклонена без записи.
+    """
+    from hub import config
+    from hub.config import TokenIdentity
+    from hub.services.steward_exit import _human_returns
+
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "impl-token": TokenIdentity("dev", "agent", principal_id=7),
+            "denis-token": TokenIdentity("denis", "human", principal_id=8),
+            "policy-token": TokenIdentity("Policy", "human", principal_id=9),
+        },
+    )
+    impl = {"Authorization": "Bearer impl-token"}
+    task_id = await _task_in_review(
+        client, headers=impl, create_headers={"Authorization": "Bearer denis-token"}
+    )
+
+    rejected = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "changes_requested", "comments": "redo"},
+        headers={"Authorization": "Bearer policy-token"},
+        follow_redirects=False,
+    )
+    assert rejected.status_code in (303, 422), rejected.text
+    if rejected.status_code == 303:
+        assert "review_error=" in rejected.headers["location"], rejected.headers
+    assert await _verdict_events(db, task_id) == []
+    assert await _human_returns(db, task_id) == []
+
+    ok = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "changes_requested", "agent": "denis", "comments": "redo"},
+        headers={"Authorization": "Bearer denis-token"},
+    )
+    assert ok.status_code == 200, ok.text
+    assert [e["actor"] for e in await _verdict_events(db, task_id)] == ["denis"]
+    assert len(await _human_returns(db, task_id)) == 1

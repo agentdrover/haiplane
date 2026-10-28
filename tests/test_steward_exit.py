@@ -345,7 +345,7 @@ async def test_mark_on_a_standing_verdict_is_not_a_silent_repeat(
 async def test_counter_does_not_trust_the_display_name(
     db: aiosqlite.Connection, client, hdr
 ):
-    """Codex P-2: человек с именем agent=policy в счётчик входит."""
+    """Человек с именем agent=policy больше не пишет вердикт (#2147): 422, счётчик пуст."""
     from hub.services import steward_exit
 
     task_id = await _paired_review(client, db, hdr, "named")
@@ -354,8 +354,9 @@ async def test_counter_does_not_trust_the_display_name(
         json=_cr_body(agent="policy", pair_miss=False, pair_miss_note=NOTE),
         headers=hdr["human"],
     )
-    assert resp.status_code == 200, resp.text
-    assert await steward_exit.human_returns_not_pair_miss(db) == 1
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["reason"] == "reserved_actor_name"
+    assert await steward_exit.human_returns_not_pair_miss(db) == 0
 
 
 async def test_live_trigger_actor_list_equals_the_non_human_actors(

@@ -32,6 +32,27 @@ HUMAN_GATE_EVENT_KINDS: frozenset[str] = frozenset(
 # the human was.
 NON_HUMAN_GATE_ACTORS: frozenset[str] = frozenset({"hub", "policy", "steward"})
 
+
+def is_reserved_actor_name(name: str | None) -> bool:
+    """Имя автора, которым внешний вердикт не может назваться.
+
+    Нормализация та же, что даёт actor события (strip); регистр не важен.
+    Запрет ставят маршруты внешнего входа, не модель и не lifecycle: внутренние
+    пути пишут вердикт под этими именами по праву (#2147).
+    """
+    return (name or "").strip().lower() in NON_HUMAN_GATE_ACTORS
+
+
+def reserved_actor_detail(name: str | None) -> dict[str, str]:
+    """Тело 422 reserved_actor_name для маршрутов внешнего входа."""
+    return {
+        "reason": "reserved_actor_name",
+        "message": f"agent {(name or '').strip()!r} is reserved for hub automation",
+        "hint": "Use your own name in 'agent' (hub, policy and steward are "
+        "reserved for the hub's automatic verdicts); nothing was recorded.",
+    }
+
+
 DISPOSITION_RECORDED = "disposition_recorded"
 STEWARD_JUDGEMENT = "steward_judgement"
 STEWARD_APPLIED = "steward_applied"
