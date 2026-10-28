@@ -1379,7 +1379,7 @@ class TaskReviewVerdict(BaseModel):
     # заметкой; агент поле не пишет. Значение ложится в payload события вердикта.
     # Any, а не bool: pydantic привёл бы "false", 0, "no" к False и выключил
     # предохранитель; допустимость значения решает ensure_pair_miss_mark.
-    pair_miss: Any = None
+    pair_miss: Any = Field(None, json_schema_extra={"enum": [False, None]})
     pair_miss_note: str = Field("", max_length=2000)
 
 
