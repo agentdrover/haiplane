@@ -937,8 +937,8 @@ def _parse_claims(row: Any) -> tuple[dict[str, str], bool]:
 
     if row is None:
         return {}, True
-    raw = dict(row).get("closures")
     try:
+        raw = dict(row).get("closures")
         entries = json.loads(raw or "[]")
     except (TypeError, ValueError):
         return {}, False

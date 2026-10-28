@@ -693,4 +693,14 @@ async def test_closure_refusals_equal_develop_for_every_closures_value(
     monkeypatch.setattr(repo, "get_steward_judgement", _boom)
     with pytest.raises(RuntimeError):  # как на develop: ошибка чтения не маскируется
         await steward_apply.closure_refusals(db, case.task_id, packet)
+    # строка вердикта не разбирается как запись: как раньше - отказ, не исключение
+    real = repo.get_steward_judgement
+
+    async def _odd(*_a, **_kw):
+        return 42
+
+    monkeypatch.setattr(repo, "get_steward_judgement", _odd)
+    refusals = await steward_apply.closure_refusals(db, case.task_id, packet)
+    assert len(refusals) == 1 and "не закрыта ничем" in refusals[0][1]
+    assert real is not None
     monkeypatch.undo()
