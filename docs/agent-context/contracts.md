@@ -116,7 +116,7 @@ Host key (`slot_runner`), exactly six order routes of its OWN host (plus the two
 
 - `GET /api/executor-hosts/{name}/orders?wait=<=60` → `{orders: [{id, task_id,
   generation, executor_run_id, state, code_ciphertext, order_text, expires_at,
-  run_seconds}]}` (#1960: the run deadline snapshotted at issue):
+  run_seconds, project}]}` (#1960: the run deadline snapshotted at issue; #2122: `project` = slug of the project the order was issued under — the one `_chosen_task` matched to the task's owner — fixed in `executor_orders.project_slug` in the issuing INSERT and never recomputed, so a later rebinding of the task does not change it; `null` for orders issued before the migration, the host then checks the project after redeem as before; also present in `waiting_memory` orders; visible only to the addressee host):
   every unclosed unredeemed order, repeated until acked or closed (stable `id`,
   dedupe on it); the first delivery sets `delivered_at`.
 - `POST …/orders/{id}/redeem {code}` (#1825) → the `chat-pair/redeem` answer plus
