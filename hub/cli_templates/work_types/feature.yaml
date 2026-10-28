@@ -37,6 +37,17 @@ assumptions:
 technical_hints: |
   Suggested approach, references, links.
 
+# UI change? See skills/hub-task-prep/SKILL.md, «UI/UX-подготовка».
+# A new route or page template, or states of 2+ screens changed: a separate
+# spec task (work_type: docs, template docs/templates/ui-spec.md) is
+# delivered first and this task waits for it (depends_on).
+#   - spec:     docs/specs/<topic>-ux.md
+#   - mockup:   docs/specs/mockups/<topic>.html  (static, opens without a server)
+#   - states:   normal, empty, error, loading; 1280 and 375 px
+#   - before:   docs/specs/mockups/before/<topic>-1280.png (existing screen)
+# Put the mockup path in validation_commands:  - test -f docs/specs/mockups/<topic>.html
+# and add an AC: «deviations from the mockup are recorded in the spec».
+
 acceptance_criteria:
   - id: AC-1
     given: <preconditions>
