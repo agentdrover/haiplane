@@ -2504,41 +2504,6 @@ async def test_an_unfounded_advisor_concur_flows_as_an_objection_and_details_rea
     assert "risk_class (" not in text, "пустой detail скобок не даёт"
 
 
-async def _close_the_finding(db: aiosqlite.Connection, task_id: int) -> None:
-    """Находка отчёта закрыта решением человека: у заказа нет основания для пропуска."""
-    from hub.services.finding_identity import finding_uids
-
-    review = dict(
-        (
-            await fetchall(
-                db,
-                "SELECT id, findings_confirmed FROM machine_reviews "
-                "WHERE task_id=? ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            )
-        )[0]
-    )
-    uids = finding_uids(json.loads(review["findings_confirmed"]))
-    await repo.upsert_finding_disposition(
-        db,
-        review_id=int(review["id"]),
-        task_id=task_id,
-        submission_generation=1,
-        finding_index=0,
-        finding_title="real bug",
-        disposition="wont_fix",
-        note="x",
-        decided_by="denis",
-        finding_uid=uids[0],
-    )
-    closures = json.dumps([{"finding_uid": uids[0], "type": "human_disposition"}])
-    await db.execute(
-        "UPDATE steward_judgements SET closures=? WHERE task_id=? AND kind='verdict'",
-        (closures, task_id),
-    )
-    await db.commit()
-
-
 async def test_an_advisor_over_the_cap_hands_the_generation_to_the_owner_until_reset(
     client, db: aiosqlite.Connection, monkeypatch
 ):
@@ -2580,7 +2545,6 @@ async def test_an_advisor_over_the_cap_hands_the_generation_to_the_owner_until_r
     await repo.update_task(db, task_id, submission_model="claude-opus-5")
     await _judge_run(db, task_id, model="composer-2.5")
     await _judge(db, task_id)
-    await _close_the_finding(db, task_id)
     assert (await verdict_route(db, task_id)).code == "steward_act", "до отказа"
 
     async def _advisor_rows() -> list:

@@ -35,7 +35,6 @@ ladder
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -188,8 +187,7 @@ def read_precondition_refusals(packet: EvidencePacket) -> list[tuple[str, str]]:
 
     Те же правила, что у ``precondition_refusals`` (``_fact_refusal``), но факт,
     которого нет или который не прочитан (state != present), отказом не
-    считается: читателю, которому нужно знать «отказал бы по увиденному», текст
-    отказа разбирать не приходится.
+    считается. Чистая функция: запросов к БД нет, текст отказа не разбирается.
     """
     out: list[tuple[str, str]] = []
     for source in PRECONDITION_FACTS:
@@ -609,33 +607,9 @@ async def loud_refusals(
     return [(code, detail) for code, detail in pairs if detail]
 
 
-@dataclasses.dataclass(frozen=True)
-class ClosureFinding:
-    """Незакрытая находка: отказ привратника и признак, ПРОЧИТАНО ли её закрытие.
-
-    ``observed`` ложно, когда отказ вызван непрочитанным: заявленные закрытия
-    не разобрать (повреждённый JSON) или хаб не смог посмотреть правки.
-    """
-
-    uid: str
-    refusal: tuple[str, str]
-    observed: bool
-
-
 async def closure_refusals(
     db: aiosqlite.Connection, task_id: int, packet: EvidencePacket
 ) -> list[tuple[str, str]]:
-    """Каждая подтверждённая находка закрыта, и КАЖДОЕ закрытие проверено.
-
-    Правила и подробное обоснование - в ``closure_findings``; здесь только
-    отказы, без признака чтения.
-    """
-    return [f.refusal for f in await closure_findings(db, task_id, packet)]
-
-
-async def closure_findings(
-    db: aiosqlite.Connection, task_id: int, packet: EvidencePacket
-) -> list[ClosureFinding]:
     """Каждая подтверждённая находка закрыта, и КАЖДОЕ закрытие проверено.
 
     Грязный путь существует ради случая, когда ревью что-то нашло, а работа
@@ -686,7 +660,7 @@ async def closure_findings(
     человеку, который будет разбирать, нужен список, а не первая строка из
     него.
     """
-    from hub.services.finding_evidence import OUTCOME_UNKNOWN, evidence_for_report
+    from hub.services.finding_evidence import evidence_for_report
 
     report = packet.facts.get("machine_review_report")
     if report is None or report.state != "present":
@@ -710,12 +684,7 @@ async def closure_findings(
         return []
     confirmed = sections.get("confirmed") or []
 
-    from hub import repository as repo
-
-    # Одно чтение записи: словарь и признак «разобрано» выводятся из неё же.
-    claimed, claims_parsed = _parse_claims(
-        await repo.get_steward_judgement(db, task_id, packet.generation, "verdict")
-    )
+    claimed = await _claimed_closures(db, task_id, packet.generation)
 
     touched: dict[str, tuple[str, str]] = {}
     if any(
@@ -745,66 +714,42 @@ async def closure_findings(
             for uid, blob in evidence.items()
         }
 
-    out: list[ClosureFinding] = []
+    out: list[tuple[str, str]] = []
     for section, uid, finding in owed:
         noun = _SECTION_NOUN[section]
         title = str(finding.get("title") or uid)[:80]
         kind = claimed.get(uid)
         if kind is None:
-            out.append(
-                ClosureFinding(
-                    uid,
-                    (REFUSED_UNCLOSED, f"{noun} «{title}» ({uid}) не закрыта ничем"),
-                    claims_parsed,
-                )
-            )
+            out.append((REFUSED_UNCLOSED, f"{noun} «{title}» ({uid}) не закрыта ничем"))
             continue
         if kind not in CLOSURE_EVIDENCE:
             out.append(
-                ClosureFinding(
-                    uid,
-                    (
-                        REFUSED_UNCLOSED,
-                        f"{noun} «{title}» ({uid}): закрытие типа {kind!r} вне "
-                        f"словаря {sorted(CLOSURE_EVIDENCE)}",
-                    ),
-                    claims_parsed,
+                (
+                    REFUSED_UNCLOSED,
+                    f"{noun} «{title}» ({uid}): закрытие типа {kind!r} вне "
+                    f"словаря {sorted(CLOSURE_EVIDENCE)}",
                 )
             )
             continue
         if section not in CLOSURE_SECTIONS[kind]:
             out.append(
-                ClosureFinding(
-                    uid,
-                    (
-                        REFUSED_UNCLOSED,
-                        f"{noun} «{title}» ({uid}): закрытие типа {kind!r} применимо "
-                        f"только к разделам {sorted(CLOSURE_SECTIONS[kind])}, а эта "
-                        f"находка из раздела {section!r}",
-                    ),
-                    claims_parsed,
+                (
+                    REFUSED_UNCLOSED,
+                    f"{noun} «{title}» ({uid}): закрытие типа {kind!r} применимо "
+                    f"только к разделам {sorted(CLOSURE_SECTIONS[kind])}, а эта "
+                    f"находка из раздела {section!r}",
                 )
             )
             continue
         proven = await _closure_is_proven(db, task_id, packet, uid, kind, touched)
         if not proven:
-            seen = touched.get(uid)
             out.append(
-                ClosureFinding(
-                    uid,
-                    (
-                        REFUSED_UNCLOSED,
-                        f"{noun} «{title}» ({uid}): закрытие {kind} объявлено, но "
-                        f"хаб его не подтверждает — ожидалось, что "
-                        f"{CLOSURE_EVIDENCE[kind]}; "
-                        + await _what_the_hub_saw(db, task_id, kind, uid, seen),
-                    ),
-                    claims_parsed
-                    and not (
-                        kind == "fixed"
-                        and seen is not None
-                        and seen[0] == OUTCOME_UNKNOWN
-                    ),
+                (
+                    REFUSED_UNCLOSED,
+                    f"{noun} «{title}» ({uid}): закрытие {kind} объявлено, но "
+                    f"хаб его не подтверждает — ожидалось, что "
+                    f"{CLOSURE_EVIDENCE[kind]}; "
+                    + await _what_the_hub_saw(db, task_id, kind, uid, touched.get(uid)),
                 )
             )
     return out
@@ -919,37 +864,19 @@ async def _claimed_closures(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> dict[str, str]:
     """Что стюард ЗАЯВИЛ про каждую находку — по uid, а не по позиции (#1007)."""
+    import json
+
     from hub import repository as repo
 
     row = await repo.get_steward_judgement(db, task_id, generation, "verdict")
-    return _parse_claims(row)[0]
-
-
-def _parse_claims(row: Any) -> tuple[dict[str, str], bool]:
-    """``(заявленные закрытия, все ли элементы разобраны)`` из ОДНОГО прочитанного ряда.
-
-    Словарь - ровно то, что всегда читал привратник. Второй член нужен тем, кто
-    решает по отказу: пустое или нечитаемое значение, не список, элемент не
-    словарь, без ``finding_uid`` или с неизвестным ``type`` делают ВЕСЬ вердикт
-    непрочитанным - отказ «не закрыта» по нему не доказан.
-    """
-    import json
-
     if row is None:
-        return {}, True
+        return {}
     try:
-        raw = dict(row).get("closures")
-        entries = json.loads(raw or "[]")
+        entries = json.loads(dict(row).get("closures") or "[]")
     except (TypeError, ValueError):
-        return {}, False
+        return {}
     if not isinstance(entries, list):
-        return {}, False
-    complete = bool(raw) and all(
-        isinstance(e, dict)
-        and bool(e.get("finding_uid"))
-        and str(e.get("type")) in CLOSURE_EVIDENCE
-        for e in entries
-    )
+        return {}
     claimed: dict[str, str] = {}
     for e in entries:
         if not isinstance(e, dict) or not e.get("finding_uid"):
@@ -957,13 +884,15 @@ def _parse_claims(row: Any) -> tuple[dict[str, str], bool]:
         uid = str(e.get("finding_uid"))
         kind = str(e.get("type"))
         if uid in claimed and claimed[uid] != kind:
-            # Две разные записи про одну находку: сборка словарём молча
-            # оставляла последнюю, и порядок записей решал бы исход. Заявление,
-            # противоречащее самому себе, - не закрытие.
+            # Две разные записи про одну находку. Найдено кросс-модельным
+            # ревью: сборка словарём молча оставляла последнюю, то есть
+            # порядок записей решал, что считается закрытием. Заявление,
+            # противоречащее самому себе, — не закрытие, и выбирать за
+            # стюарда, какую его половину читать, хаб не должен.
             claimed[uid] = _CONTRADICTORY
             continue
         claimed.setdefault(uid, kind)
-    return claimed, complete
+    return claimed
 
 
 async def _closure_is_proven(

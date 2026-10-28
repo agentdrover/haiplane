@@ -8,7 +8,6 @@
   (#1986) для этого класса недостижимо;
 * вердикт этой сдачи уже передан человеку по терминальной причине (#2124);
 * пакет доказательств даёт отказ предусловия по ПРОЧИТАННОМУ факту (#2124);
-* подтверждённая находка однозначно не закрыта (#2124).
 
 Этот модуль — единственный читатель таких причин для ЗАКАЗА. Он намеренно не
 зовёт привратник применения ``steward_apply.apply_refusals``: тот спрашивает
@@ -50,7 +49,6 @@ CODE_CI_INTEGRITY = "ci_integrity"
 CODE_CLASS_CEILING = "class_above_policy_ceiling"
 CODE_VERDICT_HUMAN = "verdict_with_human"
 CODE_PRECONDITION = "precondition_failed"
-CODE_UNCLOSED = "unclosed_finding"
 #: Начало метки в строке ленты: события чистятся по сроку, лента живёт с задачей.
 MARK_PREFIX = "[пропуск-советника g="
 
@@ -140,12 +138,11 @@ def _with_human(task: dict) -> tuple[str, str] | None:
 async def _packet_reasons(
     db: aiosqlite.Connection, task: dict
 ) -> tuple[str, str] | None:
-    """Отказы привратника по пакету, читаемые ДО ответа советника (#2124).
+    """Отказ предусловия по ПРОЧИТАННОМУ факту пакета, до ответа советника (#2124).
 
-    Зовутся только структурные читатели привратника (``read_precondition_refusals``,
-    ``closure_findings``): остальное в ``apply_refusals`` ждёт советника или
-    двойную чистоту. Текст отказов не разбирается. Непрочитанное (факт absent,
-    нечитаемые закрытия, любая ошибка сборки) - не причина: заказ как раньше.
+    Зовётся только ``read_precondition_refusals``: остальное в ``apply_refusals``
+    ждёт советника или двойную чистоту. Факт absent и любая ошибка сборки пакета
+    - не причина: заказ как раньше.
     """
     from hub.services import steward_apply, steward_evidence
 
@@ -158,13 +155,6 @@ async def _packet_reasons(
     refused = [detail for _, detail in steward_apply.read_precondition_refusals(packet)]
     if refused:
         return CODE_PRECONDITION, "; ".join(refused)
-    closures = [
-        f.refusal[1]
-        for f in await steward_apply.closure_findings(db, int(task["id"]), packet)
-        if f.observed
-    ]
-    if closures:
-        return CODE_UNCLOSED, "; ".join(closures)
     return None
 
 

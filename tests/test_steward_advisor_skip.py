@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 
 import aiosqlite
-import pytest
 
 from hub import config
 from hub import repository as repo
@@ -492,48 +491,13 @@ async def grant_act_again(db, monkeypatch, case) -> None:
     await _mode(monkeypatch, "act")
 
 
-async def test_skip_on_unclosed_finding(db: aiosqlite.Connection, monkeypatch):
-    """AC-3: подтверждённая находка без закрытия - пропуск с кодом unclosed_finding."""
-    finding = {"title": "гонка", "severity": "high", "category": "correctness"}
-    case = await _scene(
-        db,
-        monkeypatch,
-        "unclosed",
-        main={"principal": 22, "confirmed": (finding,)},
-        extra={"principal": 21, "confirmed": (finding,)},
-    )
-    for _ in range(2):
-        assert await order_due_advisors(db) == 0
-    events = await _skips(db, case.task_id)
-    assert len(events) == 1
-    assert json.loads(events[0]["payload"])["code"] == "unclosed_finding"
-    assert await _advisor_rows(db, case.task_id) == []
-    await _no_approve(db, case.task_id)
-
-    # заголовок находки с фразой о нечитаемом закрытии отказа не отменяет
-    tricky = dict(finding, title="хаб посмотреть НЕ СМОГ: важный дефект")
-    quoted = await _scene(
-        db,
-        monkeypatch,
-        "unclosed-title",
-        main={"principal": 22, "confirmed": (tricky,)},
-        extra={"principal": 21, "confirmed": (tricky,)},
-    )
-    assert await order_due_advisors(db) == 0
-    assert len(await _skips(db, quoted.task_id)) == 1
-
-
 async def test_shadow_absent_fact_and_read_failure_keep_ordering(
     db: aiosqlite.Connection, monkeypatch
 ):
-    """AC-4: тень, absent-факт, сбой пакета и сбой чтения закрытия - заказ как раньше."""
-    from hub.services import finding_evidence, steward_evidence
+    """AC-4: тень, absent-факт, сбой пакета, находка без закрытия - заказ как раньше."""
+    from hub.services import steward_evidence
 
     finding = {"title": "гонка", "severity": "high", "category": "correctness"}
-    both = {
-        "main": {"principal": 22, "confirmed": (finding,)},
-        "extra": {"principal": 21, "confirmed": (finding,)},
-    }
 
     shadow = await _scene(db, monkeypatch, "o-shadow", mode="shadow")
     _wrap_packet(monkeypatch, _diff_outside)
@@ -563,144 +527,16 @@ async def test_shadow_absent_fact_and_read_failure_keep_ordering(
     assert len(await _advisor_rows(db, broken.task_id)) == 1
     monkeypatch.undo()
 
-    unread_closure = await _scene(db, monkeypatch, "o-closure", **both)
-    real_closure = finding_evidence.evidence_for_report
-
-    async def _failing(*_a, **_kw):
-        raise RuntimeError("закрытие не прочитано")
-
-    # без заявленного закрытия тип fixed не читается: заявим его и сломаем чтение
-    await _set_closures(db, unread_closure.task_id, [_claim(finding, "fixed")])
-    monkeypatch.setattr(finding_evidence, "evidence_for_report", _failing)
-    assert await order_due_advisors(db) == 1
-    assert len(await _advisor_rows(db, unread_closure.task_id)) == 1
-    assert real_closure is not None
-    monkeypatch.undo()
-
-    unknown = await _scene(db, monkeypatch, "o-unknown", **both)
-
-    async def _unknown(_db, _task_id, findings, **_kw):
-        from hub.services.finding_identity import finding_uids
-
-        return {
-            uid: {"outcome": finding_evidence.OUTCOME_UNKNOWN, "reason": "нет клона"}
-            for uid in finding_uids(list(findings))
-        }
-
-    await _set_closures(db, unknown.task_id, [_claim(finding, "fixed")])
-    monkeypatch.setattr(finding_evidence, "evidence_for_report", _unknown)
-    assert await order_due_advisors(db) == 1, "«посмотреть не смог» заказ не гасит"
-    assert len(await _advisor_rows(db, unknown.task_id)) == 1
-    assert await _skips(db, unknown.task_id) == []
-
-    # заявленное закрытие разобрано, но рядом битый элемент - вердикт непрочитан
-    mixed = await _scene(db, monkeypatch, "o-mixed", **both)
-    await _set_closures(db, mixed.task_id, [_claim(finding, "fixed"), None])
-
-    async def _untouched(_db, _task_id, findings, **_kw):
-        from hub.services.finding_identity import finding_uids
-
-        return {
-            uid: {"outcome": finding_evidence.OUTCOME_UNTOUCHED, "reason": ""}
-            for uid in finding_uids(list(findings))
-        }
-
-    monkeypatch.setattr(finding_evidence, "evidence_for_report", _untouched)
-    assert await order_due_advisors(db) == 1
-    assert await _skips(db, mixed.task_id) == []
-
-    # заявленные закрытия не разбираются: повреждённый JSON и неверный тип
-    for label, raw in (
-        ("malformed", "{malformed"),
-        ("wrongtype", '{"a": 1}'),
-        ("empty", ""),
-        ("null_item", "[null]"),
-        ("no_uid", '[{"type": "human_disposition"}]'),
-        ("unknown_type", '[{"finding_uid": "x", "type": "zzz"}]'),
-        ("one_bad_of_two", '[{"finding_uid": "x", "type": "fixed"}, null]'),
-    ):
-        monkeypatch.undo()
-        bad = await _scene(db, monkeypatch, f"o-{label}", **both)
-        await db.execute(
-            "UPDATE steward_judgements SET closures=? WHERE task_id=? "
-            "AND kind='verdict'",
-            (raw, bad.task_id),
-        )
-        await db.commit()
-        assert await order_due_advisors(db) == 1, label
-        assert len(await _advisor_rows(db, bad.task_id)) == 1
-        assert await _skips(db, bad.task_id) == []
-    assert await _skips(db, unread_closure.task_id) == []
-    for case in (shadow, absent, broken):
-        assert await _skips(db, case.task_id) == []
-
-
-def _claim(finding: dict, kind: str) -> dict:
-    from hub.services.finding_identity import finding_uids
-
-    return {"finding_uid": finding_uids([finding])[0], "type": kind}
-
-
-async def _set_closures(db: aiosqlite.Connection, task_id: int, items: list) -> None:
-    await db.execute(
-        "UPDATE steward_judgements SET closures=? WHERE task_id=? AND kind='verdict'",
-        (json.dumps(items), task_id),
-    )
-    await db.commit()
-
-
-async def test_closure_refusals_equal_develop_for_every_closures_value(
-    db: aiosqlite.Connection, monkeypatch
-):
-    """closure_refusals не отличается от прежней: значения closures и сбой чтения."""
-    from hub.services import steward_apply, steward_evidence
-
-    finding = {"title": "гонка", "severity": "high", "category": "correctness"}
-    case = await _scene(
+    # подтверждённая находка без закрытия причиной пропуска не служит
+    unclosed = await _scene(
         db,
         monkeypatch,
-        "equiv",
+        "o-unclosed",
         main={"principal": 22, "confirmed": (finding,)},
         extra={"principal": 21, "confirmed": (finding,)},
     )
-    packet = await steward_evidence.build_evidence_packet(db, case.task_id, 1)
-    uid = _claim(finding, "x")["finding_uid"]
-    plain = f"находка «гонка» ({uid}) не закрыта ничем"
-    wrong = f"находка «гонка» ({uid}): закрытие типа 'zzz' вне словаря"
-    for raw, expected in (
-        ("[]", plain),
-        ("", plain),
-        ("{malformed", plain),
-        ('{"a": 1}', plain),
-        ("[null]", plain),
-        ('[{"type": "human_disposition"}]', plain),
-        (json.dumps([{"finding_uid": uid, "type": "zzz"}]), wrong),
-    ):
-        await db.execute(
-            "UPDATE steward_judgements SET closures=? WHERE task_id=? "
-            "AND kind='verdict'",
-            (raw, case.task_id),
-        )
-        await db.commit()
-        refusals = await steward_apply.closure_refusals(db, case.task_id, packet)
-        assert [d.split(" — ")[0][: len(expected)] for _, d in refusals] == [
-            expected
-        ], raw
+    assert await order_due_advisors(db) == 1
+    assert len(await _advisor_rows(db, unclosed.task_id)) == 1
 
-    async def _boom(*_a, **_kw):
-        raise RuntimeError("чтение вердикта")
-
-    monkeypatch.setattr(repo, "get_steward_judgement", _boom)
-    with pytest.raises(RuntimeError):  # как на develop: ошибка чтения не маскируется
-        await steward_apply.closure_refusals(db, case.task_id, packet)
-    # строка вердикта не разбирается как запись: как раньше - отказ, не исключение
-    real = repo.get_steward_judgement
-
-    async def _odd(*_a, **_kw):
-        return 42
-
-    monkeypatch.setattr(repo, "get_steward_judgement", _odd)
-    refusals = await steward_apply.closure_refusals(db, case.task_id, packet)
-    assert len(refusals) == 1 and "не закрыта ничем" in refusals[0][1]
-    assert real is not None
-    monkeypatch.undo()
+    for case in (shadow, absent, broken, unclosed):
+        assert await _skips(db, case.task_id) == []
