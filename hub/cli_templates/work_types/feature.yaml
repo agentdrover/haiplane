@@ -37,16 +37,17 @@ assumptions:
 technical_hints: |
   Suggested approach, references, links.
 
-# UI change? See skills/hub-task-prep/SKILL.md, «UI/UX-подготовка».
+# UI change? Follow «UI/UX-подготовка» in the hub-task-prep skill (hub repo
+# agentdrover/haiplane, skills/hub-task-prep/SKILL.md); its spec template is
+# docs/templates/ui-spec.md in the same repo. Paths below are in YOUR project.
 # A new route or page template, or states of 2+ screens changed: a separate
-# spec task (work_type: docs, template docs/templates/ui-spec.md) is
-# delivered first and this task waits for it (depends_on).
+# spec task (work_type: docs) first. depends_on on it is advisory (#484):
+# do not approve this task until the spec is delivered and the owner's
+# decision is recorded on the spec task.
 #   - spec:     docs/specs/<topic>-ux.md
 #   - mockup:   docs/specs/mockups/<topic>.html  (static, opens without a server)
 #   - states:   normal, empty, error, loading; 1280 and 375 px
-#   - before:   docs/specs/mockups/before/<topic>-1280.png (existing screen)
-# Put the mockup path in validation_commands:  - test -f docs/specs/mockups/<topic>.html
-# and add an AC: «deviations from the mockup are recorded in the spec».
+# Mockup path in validation_commands:  - test -f docs/specs/mockups/<topic>.html
 
 acceptance_criteria:
   - id: AC-1
