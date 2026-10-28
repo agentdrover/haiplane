@@ -43,8 +43,9 @@ technical_hints: |
 # YOUR project.
 # A new route or page template, or states of 2+ screens changed: a separate
 # spec task (work_type: docs) first. depends_on on it is advisory (#484):
-# do not approve this task until the spec is delivered and the owner's
-# decision is recorded on the spec task.
+# do not approve this task until the spec is delivered and the owner has
+# recorded «принято» (accepted) on its current version; a list of changes
+# keeps this task closed.
 #   - spec:     docs/specs/<topic>-ux.md
 #   - mockup:   docs/specs/mockups/<topic>.html  (static, opens without a server)
 #   - states:   normal, empty, error, loading; 1280 and 375 px
