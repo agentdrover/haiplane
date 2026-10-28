@@ -182,6 +182,24 @@ def precondition_refusals(packet: EvidencePacket) -> list[tuple[str, str]]:
     return out
 
 
+def read_precondition_refusals(packet: EvidencePacket) -> list[tuple[str, str]]:
+    """``(источник, отказ)`` только по ПРОЧИТАННЫМ фактам пакета.
+
+    Те же правила, что у ``precondition_refusals`` (``_fact_refusal``), но факт,
+    которого нет или который не прочитан (state != present), отказом не
+    считается. Чистая функция: запросов к БД нет, текст отказа не разбирается.
+    """
+    out: list[tuple[str, str]] = []
+    for source in PRECONDITION_FACTS:
+        fact = packet.facts.get(source)
+        if fact is None or fact.state != "present":
+            continue
+        refusal = _fact_refusal(source, fact)
+        if refusal:
+            out.append((source, refusal))
+    return out
+
+
 def _class_of(raw: Any) -> RiskClass | None:
     try:
         return RiskClass(str(raw))

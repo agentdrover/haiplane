@@ -5,7 +5,9 @@
 
 * целостность CI этой сдачи не чиста: дифф прочитан и меняет входы CI;
 * класс задачи выше обычного потолка проекта, а исключение двойной чистоты
-  (#1986) для этого класса недостижимо.
+  (#1986) для этого класса недостижимо;
+* вердикт этой сдачи уже передан человеку по терминальной причине (#2124);
+* пакет доказательств даёт отказ предусловия по ПРОЧИТАННОМУ факту (#2124);
 
 Этот модуль — единственный читатель таких причин для ЗАКАЗА. Он намеренно не
 зовёт привратник применения ``steward_apply.apply_refusals``: тот спрашивает
@@ -45,6 +47,8 @@ log = logging.getLogger(__name__)
 EVENT_SKIPPED = "steward_advisor_skipped"
 CODE_CI_INTEGRITY = "ci_integrity"
 CODE_CLASS_CEILING = "class_above_policy_ceiling"
+CODE_VERDICT_HUMAN = "verdict_with_human"
+CODE_PRECONDITION = "precondition_failed"
 #: Начало метки в строке ленты: события чистятся по сроку, лента живёт с задачей.
 MARK_PREFIX = "[пропуск-советника g="
 
@@ -109,7 +113,49 @@ async def _reason(db: aiosqlite.Connection, task_id: int) -> tuple[str, str] | N
     if row is None:
         return None
     task = dict(row)
-    return await _integrity(db, task) or await _ceiling(db, task)
+    return (
+        await _integrity(db, task)
+        or await _ceiling(db, task)
+        or _with_human(task)
+        or await _packet_reasons(db, task)
+    )
+
+
+def _with_human(task: dict) -> tuple[str, str] | None:
+    """Вердикт текущей сдачи записан за человеком по терминальной причине (#2124).
+
+    Переходящая причина (суточный потолок, прежний пропуск) заказ не гасит: она
+    снимется сама, и тогда советник нужен.
+    """
+    owner, reason = verdict_owner.written_owner(task)
+    if owner != verdict_owner.OWNER_HUMAN or not reason.strip():
+        return None  # причина не названа: терминальность не подтверждена
+    if verdict_owner.is_temporary(reason):
+        return None
+    return CODE_VERDICT_HUMAN, f"вердикт передан человеку: {reason}"
+
+
+async def _packet_reasons(
+    db: aiosqlite.Connection, task: dict
+) -> tuple[str, str] | None:
+    """Отказ предусловия по ПРОЧИТАННОМУ факту пакета, до ответа советника (#2124).
+
+    Зовётся только ``read_precondition_refusals``: остальное в ``apply_refusals``
+    ждёт советника или двойную чистоту. Факт absent и любая ошибка сборки пакета
+    - не причина: заказ как раньше.
+    """
+    from hub.services import steward_apply, steward_evidence
+
+    generation = int(task.get("submission_generation") or 0)
+    packet = await steward_evidence.build_evidence_packet(
+        db, int(task["id"]), generation
+    )
+    if packet is None:
+        return None
+    refused = [detail for _, detail in steward_apply.read_precondition_refusals(packet)]
+    if refused:
+        return CODE_PRECONDITION, "; ".join(refused)
+    return None
 
 
 async def _integrity(db: aiosqlite.Connection, task: dict) -> tuple[str, str] | None:
@@ -162,13 +208,19 @@ async def record_skip(
     ``False`` — такая запись уже есть, ленту не повторяем.
     """
     project = await repo.resolve_project_for_task(db, task_id)
-    text = (
-        f"Советник не заказан для сдачи {generation}: {detail}. Одобрение стюардом "
-        "невозможно независимо от ответа советника (привратник применения "
-        "отказал бы по той же причине); пропуск не согласие, вердикт за "
-        "человеком. Если причина снимется, заказ восстановится сам. "
-        + mark_of(generation, code)
-    )
+    if code == CODE_VERDICT_HUMAN:
+        text = (
+            f"Советник не заказан для сдачи {generation}: {detail}. Заказ "
+            "ничего бы не решил; пропуск не согласие. " + mark_of(generation, code)
+        )
+    else:
+        text = (
+            f"Советник не заказан для сдачи {generation}: {detail}. Одобрение "
+            "стюардом невозможно независимо от ответа советника (привратник "
+            "применения отказал бы по той же причине); пропуск не согласие, "
+            "вердикт за человеком. Если причина снимется, заказ восстановится "
+            "сам. " + mark_of(generation, code)
+        )
     payload = json.dumps(
         {"generation": generation, "code": code, "detail": detail},
         ensure_ascii=False,
