@@ -1,6 +1,6 @@
 ---
 name: hub-submit-task
-description: Use before hub_submit_for_review on a Haiplane Hub pair task - payload shape (prevention.ref, mutations, finding_outcomes), what a resubmission does to the generation and the verdict, what to check after a transport error, and what must be pushed and green before the submission.
+description: Use before hub_submit_for_review on a Haiplane Hub pair task - payload shape (prevention.ref, mutations, finding_outcomes), what a resubmission does to the generation and the verdict, what to check after a transport error, and what must be pushed and green before the submission, and the after-screenshots a UI layout task built to a mockup carries.
 ---
 
 # Hub Submit Task
@@ -161,10 +161,13 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
 спеки, на 1280 и 375 px. Без них AC `ui_check` ревьюер проверяет на глаз,
 без эталона.
 
-- Снимки кладутся в ветку задачи: `docs/specs/mockups/after/<тема>-<состояние>-<ширина>.png`.
-  Пути перечисляются в `summary` сдачи; файлы в теле сдачи хаб не принимает.
-- 375 px снимается эмуляцией окна 375×812 (viewport устройства в браузере),
-  а не скриншотом headless-окна по ширине: такое окно уже 500 px не
-  ставится, и снимок выходит срезанным (`docs/specs/project-card-ux.md`, §1).
+- Снимки кладутся в ветку задачи: `docs/specs/mockups/after/<тема>-<состояние>-<ширина>.png`,
+  состояние — `normal`, `empty`, `error`, `loading` (или имя из таблицы
+  состояний спеки латиницей), ширина — `1280` или `375`. Пути
+  перечисляются в `summary` сдачи; файлов в теле сдачи хаб не принимает.
+  Снимки остаются рядом со спекой как запись сделанного.
+- 375 px снимается эмуляцией viewport 375×812 (в том числе в headless-браузере,
+  например viewport Playwright), а не уменьшением окна: headless-окно уже
+  500 px не ставится, и снимок выходит срезанным (`docs/specs/project-card-ux.md`, §1).
 - Один PNG на состояние и ширину, до ~300 КБ.
 - Состояние из макета не снято — назовите его в `summary` и причину.
