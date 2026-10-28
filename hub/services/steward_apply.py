@@ -645,7 +645,7 @@ async def _claims_unreadable(
     if row is None:
         return False
     try:
-        return not isinstance(json.loads(dict(row).get("closures")), list)
+        return not isinstance(json.loads(str(dict(row).get("closures"))), list)
     except (TypeError, ValueError):
         return True  # в том числе пусто и NULL: пустое не равно пустому списку
 
