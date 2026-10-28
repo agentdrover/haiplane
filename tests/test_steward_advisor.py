@@ -31,6 +31,7 @@ from hub.db import fetchall
 from hub.integrations import cursor_cloud, local_reviewer
 from hub.models import StewardJudgementSubmit
 from hub.services import chat_pair
+from hub.services import steward_advisor_skip as advisor_skip
 from hub.services import steward_shadow as sh
 from hub.services.refusal_reason import CAP_HANDOFF
 from hub.services.steward_advisor import (
@@ -2520,6 +2521,13 @@ async def test_an_advisor_over_the_cap_hands_the_generation_to_the_owner_until_r
 
     _steward_on(monkeypatch, "act")
     monkeypatch.setattr(config, "STEWARD_ADVISOR_WAIT_MAX", 60)
+
+    async def _no_skip(*_a, **_kw):
+        return (
+            None  # #2124: находка без закрытия гасила бы заказ раньше отказа по потолку
+        )
+
+    monkeypatch.setattr(advisor_skip, "unapprovable_reason", _no_skip)
     real_mode = steward_shadow.mode_report
 
     async def _act_mode(_db):
