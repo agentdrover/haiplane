@@ -511,7 +511,9 @@ async def _verdict_events(db, task_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-@pytest.mark.parametrize("name", ["policy", " Steward ", "HUB", "hub", "\tPolicy\n"])
+@pytest.mark.parametrize(
+    "name", ["policy", " Steward ", "HUB", "hub", "\tPolicy\n", "ſteward"]
+)
 async def test_external_verdict_rejects_reserved_actor_names(
     client: AsyncClient, db, name: str
 ):

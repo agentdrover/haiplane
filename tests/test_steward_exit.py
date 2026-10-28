@@ -359,6 +359,33 @@ async def test_counter_does_not_trust_the_display_name(
     assert await steward_exit.human_returns_not_pair_miss(db) == 0
 
 
+async def test_counter_keeps_historical_events_named_after_automation(
+    db: aiosqlite.Connection, client, hdr
+):
+    """История не переписывается (#2147): человеческий возврат с actor=policy,
+    записанный до запрета, остаётся в счётчике pair_miss=false.
+    """
+    from hub.services import steward_exit
+
+    task_id = await _paired_review(client, db, hdr, "historic")
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={
+            "verdict": "changes_requested",
+            "submission_generation": 1,
+            "human": True,
+            "pair_miss": False,
+            "pair_miss_note": NOTE,
+        },
+    )
+    await db.commit()
+
+    assert await steward_exit.human_returns_not_pair_miss(db) == 1
+
+
 async def test_live_trigger_actor_list_equals_the_non_human_actors(
     db: aiosqlite.Connection,
 ):

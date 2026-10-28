@@ -40,7 +40,7 @@ def is_reserved_actor_name(name: str | None) -> bool:
     Запрет ставят маршруты внешнего входа, не модель и не lifecycle: внутренние
     пути пишут вердикт под этими именами по праву (#2147).
     """
-    return (name or "").strip().lower() in NON_HUMAN_GATE_ACTORS
+    return (name or "").strip().casefold() in NON_HUMAN_GATE_ACTORS
 
 
 def reserved_actor_detail(name: str | None) -> dict[str, str]:
