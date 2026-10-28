@@ -448,6 +448,11 @@ async def test_skip_when_verdict_already_with_human(
     assert len(await _advisor_rows(db, temp.task_id)) == 1
     assert await _skips(db, temp.task_id) == []
 
+    nameless = await _scene(db, monkeypatch, "human-nameless")
+    await verdict_owner.hand_to_human(db, nameless.task_id, "", generation=1)
+    await db.commit()
+    assert await order_due_advisors(db) == 1, "без названной причины заказ идёт"
+
 
 async def test_skip_on_failed_precondition_and_reorder_after_fix(
     db: aiosqlite.Connection, monkeypatch
@@ -503,6 +508,18 @@ async def test_skip_on_unclosed_finding(db: aiosqlite.Connection, monkeypatch):
     assert json.loads(events[0]["payload"])["code"] == "unclosed_finding"
     assert await _advisor_rows(db, case.task_id) == []
     await _no_approve(db, case.task_id)
+
+    # заголовок находки с фразой о нечитаемом закрытии отказа не отменяет
+    tricky = dict(finding, title="хаб посмотреть НЕ СМОГ: важный дефект")
+    quoted = await _scene(
+        db,
+        monkeypatch,
+        "unclosed-title",
+        main={"principal": 22, "confirmed": (tricky,)},
+        extra={"principal": 21, "confirmed": (tricky,)},
+    )
+    assert await order_due_advisors(db) == 0
+    assert len(await _skips(db, quoted.task_id)) == 1
 
 
 async def test_shadow_absent_fact_and_read_failure_keep_ordering(

@@ -51,11 +51,12 @@ CODE_CLASS_CEILING = "class_above_policy_ceiling"
 CODE_VERDICT_HUMAN = "verdict_with_human"
 CODE_PRECONDITION = "precondition_failed"
 CODE_UNCLOSED = "unclosed_finding"
-#: Подстрока отказа привратника, когда закрытие не удалось ПРОЧИТАТЬ (не «правки
-#: не было», а «посмотреть не смог»): такое чтение заказ не гасит.
-_UNREAD_CLOSURE = "хаб посмотреть НЕ СМОГ"
 #: Начало метки в строке ленты: события чистятся по сроку, лента живёт с задачей.
 MARK_PREFIX = "[пропуск-советника g="
+#: Хвост отказа привратника, когда закрытие не удалось ПРОЧИТАТЬ (не «правки не
+#: было», а «посмотреть не смог»). Ищется в КОНЦЕ текста: заголовок находки стоит
+#: в начале и хвостом стать не может.
+_UNREAD_CLOSURE_TAIL = "это не «правки не было», это отсутствие наблюдения"
 
 
 #: Строка ленты, написанная самим хабом: комментарий человека с тем же текстом
@@ -133,9 +134,11 @@ def _with_human(task: dict) -> tuple[str, str] | None:
     снимется сама, и тогда советник нужен.
     """
     owner, reason = verdict_owner.written_owner(task)
-    if owner != verdict_owner.OWNER_HUMAN or verdict_owner.is_temporary(reason):
+    if owner != verdict_owner.OWNER_HUMAN or not reason.strip():
+        return None  # причина не названа: терминальность не подтверждена
+    if verdict_owner.is_temporary(reason):
         return None
-    return CODE_VERDICT_HUMAN, f"вердикт передан человеку: {reason or 'без причины'}"
+    return CODE_VERDICT_HUMAN, f"вердикт передан человеку: {reason}"
 
 
 async def _packet_reasons(
@@ -174,7 +177,7 @@ async def _packet_reasons(
         for _, detail in await steward_apply.closure_refusals(
             db, int(task["id"]), packet
         )
-        if _UNREAD_CLOSURE not in detail
+        if not detail.endswith(_UNREAD_CLOSURE_TAIL)
     ]
     if closures:
         return CODE_UNCLOSED, "; ".join(closures)
