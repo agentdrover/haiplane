@@ -34,6 +34,7 @@ from hub.services.steward_advisor import (
     order_due_advisors,
 )
 from tests.steward_double_clean_support import (
+    add_report,
     SHA,
     build_case,
     judge_and_advise,
@@ -58,14 +59,21 @@ async def _mode(monkeypatch, effective: str) -> None:
 
 
 async def _scene(
-    db, monkeypatch, slug: str, *, risk: str = "R1", policy=None, mode="act"
+    db, monkeypatch, slug: str, *, risk: str = "R1", policy=None, mode="act", **case_kw
 ):
     """Сдача с approve судьи и БЕЗ заказа советника; режим ``mode`` выдан.
 
     ``mode=None`` - выдача настоящая: act запрошен настройкой, пар в выборке нет.
     """
     case = await build_case(
-        db, monkeypatch, slug, risk=risk, policy=policy, pair=True, order=False
+        db,
+        monkeypatch,
+        slug,
+        risk=risk,
+        policy=policy,
+        pair=True,
+        order=False,
+        **case_kw,
     )
     await judge_and_advise(db, case.task_id, concur=None)
     if mode is None:
@@ -364,3 +372,171 @@ async def _route_names_the_human(db: aiosqlite.Connection, case) -> None:
     route = await verdict_route._steward_route(db, task, project, stance)
     assert (route.decider, route.final) == ("human", "human"), route
     assert route.code == verdict_route.CODE_ADVISOR_SKIPPED
+
+
+# ---------------------------------------------------------------------------
+# #2124: вердикт у человека, прочитанный отказ предусловия, незакрытая находка
+# ---------------------------------------------------------------------------
+
+
+def _wrap_packet(monkeypatch, change) -> None:
+    """Пакет заказа с подменой: ``change(facts)`` правит факты, может бросить."""
+    import dataclasses
+
+    from hub.services import steward_evidence
+
+    real = steward_evidence.build_evidence_packet
+
+    async def build(db, task_id, generation=None):
+        packet = await real(db, task_id, generation)
+        if packet is None:
+            return None
+        facts = dict(packet.facts)
+        change(facts)
+        return dataclasses.replace(packet, facts=facts)
+
+    monkeypatch.setattr(steward_evidence, "build_evidence_packet", build)
+
+
+def _diff_outside(facts: dict) -> None:
+    from hub.services.steward_evidence import present
+
+    facts["diff_vs_areas"] = present(
+        "diff_vs_areas",
+        "дифф вне заявленного",
+        paths=["hub/other.py"],
+        undeclared=["hub/other.py"],
+        within_declared=False,
+    )
+
+
+async def test_skip_when_verdict_already_with_human(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1: терминальная передача человеку - заказа нет; временная - заказ идёт."""
+    from hub.services import verdict_owner
+
+    terminal = await _scene(db, monkeypatch, "human-terminal")
+    await verdict_owner.hand_to_human(
+        db, terminal.task_id, "autopilot_escalated: security", generation=1
+    )
+    await db.commit()
+    for _ in range(3):
+        assert await order_due_advisors(db) == 0
+    assert await _advisor_rows(db, terminal.task_id) == []
+    events = await _skips(db, terminal.task_id)
+    assert len(events) == 1
+    assert json.loads(events[0]["payload"])["code"] == "verdict_with_human"
+    lines = await _skip_lines(db, terminal.task_id)
+    assert len(lines) == 1 and "вердикт передан человеку" in lines[0], lines
+    assert "autopilot_escalated" in lines[0]
+    assert "привратник" not in lines[0], "отказа привратника здесь не утверждаем"
+    row = dict(await repo.get_task(db, terminal.task_id))
+    assert verdict_owner.written_owner(row) == (
+        "human",
+        "autopilot_escalated: security",
+    ), "терминальная причина не затёрта временной"
+    await _no_approve(db, terminal.task_id)
+
+    temp = await _scene(db, monkeypatch, "human-temporary")
+    await verdict_owner.hand_to_human(
+        db, temp.task_id, "steward_daily_cap: сутки", generation=1
+    )
+    await db.commit()
+    assert await order_due_advisors(db) == 1, "временная причина заказ не гасит"
+    assert await order_due_advisors(db) == 0
+    assert len(await _advisor_rows(db, temp.task_id)) == 1
+    assert await _skips(db, temp.task_id) == []
+
+    nameless = await _scene(db, monkeypatch, "human-nameless")
+    await verdict_owner.hand_to_human(db, nameless.task_id, "", generation=1)
+    await db.commit()
+    assert await order_due_advisors(db) == 1, "без названной причины заказ идёт"
+
+
+async def test_skip_on_failed_precondition_and_reorder_after_fix(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2: прочитанный дифф вне областей - пропуск; после пересдачи - один заказ."""
+    case = await _scene(db, monkeypatch, "precondition")
+    _wrap_packet(monkeypatch, _diff_outside)
+    for _ in range(2):
+        assert await order_due_advisors(db) == 0
+    events = await _skips(db, case.task_id)
+    assert len(events) == 1
+    assert json.loads(events[0]["payload"])["code"] == "precondition_failed"
+    assert "diff_vs_areas" in json.loads(events[0]["payload"])["detail"]
+    assert await _advisor_rows(db, case.task_id) == []
+    await _no_approve(db, case.task_id)
+
+    monkeypatch.undo()  # пересдача: дифф в границах (чистый пакет), режим выдан
+    await grant_act_again(db, monkeypatch, case)
+    await repo.update_task(db, case.task_id, submission_generation=2)
+    await db.commit()
+    for principal in (22, 21):
+        await add_report(db, case.task_id, principal, generation=2)
+    await judge_and_advise(db, case.task_id, concur=None, generation=2)
+    assert await order_due_advisors(db) == 1
+    assert await order_due_advisors(db) == 0
+    rows = await _advisor_rows(db, case.task_id)
+    assert [dict(r)["generation"] for r in rows] == [2]
+    assert len(await _skips(db, case.task_id)) == 1
+
+
+async def grant_act_again(db, monkeypatch, case) -> None:
+    from tests.steward_double_clean_support import clean_packets, grant_act
+
+    await grant_act(monkeypatch)
+    clean_packets(monkeypatch, stored="R1", recomputed="R1")
+    await _mode(monkeypatch, "act")
+
+
+async def test_shadow_absent_fact_and_read_failure_keep_ordering(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4: тень, absent-факт, сбой пакета, находка без закрытия - заказ как раньше."""
+    from hub.services import steward_evidence
+
+    finding = {"title": "гонка", "severity": "high", "category": "correctness"}
+
+    shadow = await _scene(db, monkeypatch, "o-shadow", mode="shadow")
+    _wrap_packet(monkeypatch, _diff_outside)
+    assert await order_due_advisors(db) == 1
+    assert len(await _advisor_rows(db, shadow.task_id)) == 1
+    monkeypatch.undo()
+
+    absent = await _scene(db, monkeypatch, "o-absent")
+
+    def _unread(facts: dict) -> None:
+        facts["diff_vs_areas"] = steward_evidence.absent(
+            "diff_vs_areas", "unreadable", "дифф не прочитан"
+        )
+
+    _wrap_packet(monkeypatch, _unread)
+    assert await order_due_advisors(db) == 1
+    assert len(await _advisor_rows(db, absent.task_id)) == 1
+    monkeypatch.undo()
+
+    broken = await _scene(db, monkeypatch, "o-broken")
+
+    def _boom(_facts: dict) -> None:
+        raise RuntimeError("пакет не собран")
+
+    _wrap_packet(monkeypatch, _boom)
+    assert await order_due_advisors(db) == 1
+    assert len(await _advisor_rows(db, broken.task_id)) == 1
+    monkeypatch.undo()
+
+    # подтверждённая находка без закрытия причиной пропуска не служит
+    unclosed = await _scene(
+        db,
+        monkeypatch,
+        "o-unclosed",
+        main={"principal": 22, "confirmed": (finding,)},
+        extra={"principal": 21, "confirmed": (finding,)},
+    )
+    assert await order_due_advisors(db) == 1
+    assert len(await _advisor_rows(db, unclosed.task_id)) == 1
+
+    for case in (shadow, absent, broken, unclosed):
+        assert await _skips(db, case.task_id) == []
