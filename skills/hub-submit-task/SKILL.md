@@ -1,12 +1,12 @@
 ---
 name: hub-submit-task
-description: Use before hub_submit_for_review on a Haiplane Hub pair task - payload shape (prevention.ref, mutations, finding_outcomes), what a resubmission does to the generation and the verdict, what to check after a transport error, and what must be pushed and green before the submission.
+description: Use before hub_submit_for_review on a Haiplane Hub pair task - payload shape (prevention.ref, mutations, finding_outcomes), what a resubmission does to the generation and the verdict, what to check after a transport error, and what must be pushed and green before the submission, and the after-screenshots a UI layout task built to a mockup carries.
 ---
 
 # Hub Submit Task
 
 Каждая сдача с новым sha открывает новое поколение и покупает ревью. Этот skill
-перечисляет шесть правил, которые держат число сдач и отказов по форме
+перечисляет семь правил, которые держат число сдач и отказов по форме
 минимальными. Парный skill для чтения отчёта после сдачи:
 `skills/hub-review-report-reading/`. Общий цикл pair-задачи и дисциплина
 исполнителя — skill `executor-pair-discipline` в библиотеке хаба; здесь он не
@@ -152,3 +152,37 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
 - `pyproject.toml`, `[project.scripts]`: `hp-hub = "hub.cli:main"`. Скрипта
   `oc-hub` в этой базе нет. Сдача из командной строки: `hp-hub submit-review <id>`
   с `--prevention '<json>'` (`hub.cli.cmd_submit_review`).
+
+## 7. Вёрстка по макету сдаётся со снимками «после»
+
+Задача вёрстки по принятому макету (UI-спека в `docs/specs/`, макет в
+`docs/specs/mockups/`) сдаётся со снимками тех же состояний и ширин, что в
+макете: норма, пусто, ошибка, загрузка и остальные из таблицы состояний
+спеки, на 1280 и 375 px. Без них AC `ui_check` ревьюер проверяет на глаз,
+без эталона.
+
+- Снимки кладутся в ветку задачи: `docs/specs/mockups/after/<тема>-<состояние>-<ширина>.png`,
+  состояние — `normal`, `empty`, `error`, `loading` (или имя из таблицы
+  состояний спеки латиницей), ширина — `1280` или `375`. Пути
+  перечисляются в `summary` сдачи; файлов в теле сдачи хаб не принимает.
+  Снимки остаются рядом со спекой как запись сделанного.
+- 375 px снимается при viewport 375×812 (эмуляция устройства в браузере,
+  в том числе headless, например `viewport` в Playwright). Проверьте
+  фактическую ширину файла: 375 px (или 750/1125 при `deviceScaleFactor` 2/3
+  — тогда назовите множитель в `summary`). Снимок нужной ширины без проверки
+  не считается. Частный случай из #1471: headless-Chrome не ставил размер
+  окна уже 500 px, и снимок выходил срезанным
+  (`docs/specs/project-card-ux.md`, §1) — поэтому задаётся viewport, а не
+  размер окна.
+- Снимок — на всю страницу (full-page, например `page.screenshot(full_page=True)`),
+  а не первый экран: при 375×812 первый экран показывает только верх.
+- Один PNG на состояние и ширину, ориентир до ~300 КБ. Не уложились — сожмите
+  без потери читаемости (палитра PNG, например `pngquant`); всё равно больше —
+  разрежьте страницу по высоте на части `<тема>-<состояние>-<ширина>-1.png`,
+  `-2.png` и т. д. Часть страницы не выбрасывается ради размера.
+- Состояние из таблицы спеки не снято — это один из двух случаев, и в
+  `summary` назовите какой:
+  - **неприменимо по спеке**: спека сама отмечает, что состояния у экрана нет;
+    дайте ссылку на строку таблицы состояний спеки;
+  - **применимо, но не снято**: доказательство неполное. Назовите состояние,
+    ширину и причину явно; ревьюер решает по AC, достаточно ли сданного.
