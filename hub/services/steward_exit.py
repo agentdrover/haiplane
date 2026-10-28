@@ -610,18 +610,18 @@ async def human_returns_not_pair_miss(
     """Человеческие возвраты с пометкой pair_miss=false за окно (#2139).
 
     Неблокирующий счётчик по событиям: в false_approve и false_approve_events_14d
-    не входит. Тот же список акторов автоматики, что у триггера.
+    не входит. Автор не фильтруется: ``actor`` - имя из запроса, а пометку
+    принимает только человек (``ensure_pair_miss_mark``), поэтому её наличие
+    в payload и есть доказательство.
     """
-    placeholders, actors = sql_in(NON_HUMAN_GATE_ACTORS)
     rows = await fetchall(
         db,
-        "SELECT COUNT(*) AS n FROM events "  # nosec B608 - placeholders from module constants
+        "SELECT COUNT(*) AS n FROM events "
         "WHERE kind='review_verdict_recorded' "
-        f"AND actor NOT IN ({placeholders}) "
         "AND json_extract(payload, '$.verdict')='changes_requested' "
         "AND COALESCE(json_type(payload, '$.pair_miss'), '')='false' "
         "AND created_at >= datetime('now', ?)",
-        (*actors, f"-{int(since_days)} days"),
+        (f"-{int(since_days)} days",),
     )
     return int(rows[0]["n"]) if rows else 0
 

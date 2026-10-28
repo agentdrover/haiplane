@@ -313,3 +313,44 @@ def test_cli_sends_the_not_pair_miss_mark(monkeypatch, capsys):
     sent.clear()
     assert rv.cmd_review_verdict(args) == 0
     assert "pair_miss" not in sent
+
+
+async def test_mark_on_a_standing_verdict_is_not_a_silent_repeat(
+    db: aiosqlite.Connection, client, hdr
+):
+    """Codex P-1: повтор стоящего возврата с пометкой не отвечает успехом молча."""
+    from hub.services import steward_exit
+
+    task_id = await _paired_review(client, db, hdr, "standing")
+    first = await client.post(
+        f"/api/tasks/{task_id}/review-verdict", json=_cr_body(), headers=hdr["human"]
+    )
+    assert first.status_code == 200, first.text
+    before = await _verdict_payloads(db, task_id)
+    again = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json=_cr_body(pair_miss=False, pair_miss_note=NOTE),
+        headers=hdr["human"],
+    )
+    after = await _verdict_payloads(db, task_id)
+    # либо пометка легла новым событием, либо отказ; "успех без записи" недопустим
+    assert again.status_code != 200 or len(after) == len(before) + 1, again.text
+    assert await steward_exit.human_returns_not_pair_miss(db) == len(
+        [p for p in after if p.get("pair_miss") is False]
+    )
+
+
+async def test_counter_does_not_trust_the_display_name(
+    db: aiosqlite.Connection, client, hdr
+):
+    """Codex P-2: человек с именем agent=policy в счётчик входит."""
+    from hub.services import steward_exit
+
+    task_id = await _paired_review(client, db, hdr, "named")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json=_cr_body(agent="policy", pair_miss=False, pair_miss_note=NOTE),
+        headers=hdr["human"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert await steward_exit.human_returns_not_pair_miss(db) == 1

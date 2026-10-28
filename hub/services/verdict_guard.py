@@ -58,12 +58,18 @@ def verdict_digest(body: TaskReviewVerdict) -> str:
         (f.model_dump(exclude_none=True, mode="json") for f in body.findings),
         key=lambda f: json.dumps(f, sort_keys=True, ensure_ascii=False),
     )
+    parts: dict[str, Any] = {
+        "verdict": body.verdict.value,
+        "comments": body.comments.strip(),
+        "findings": findings,
+    }
+    if body.pair_miss is not None or body.pair_miss_note:
+        # #2139: пометка меняет смысл вердикта; без неё повтор с пометкой
+        # считался бы тем же вердиктом и отвечал успехом, ничего не записав.
+        # Только при наличии пометки: отпечатки прежних вердиктов не меняются.
+        parts["pair_miss"] = [body.pair_miss, body.pair_miss_note.strip()]
     packed = json.dumps(
-        {
-            "verdict": body.verdict.value,
-            "comments": body.comments.strip(),
-            "findings": findings,
-        },
+        parts,
         sort_keys=True,
         ensure_ascii=False,
     )

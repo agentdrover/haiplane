@@ -768,6 +768,8 @@ async def test_a_failed_unchecked_record_is_said_on_the_next_tick(
 # (бюджет размера файла тестов); имена те же, что в test_ref критериев.
 from tests.steward_pair_miss_cases import (  # noqa: E402,F401
     hdr,
+    test_counter_does_not_trust_the_display_name,
+    test_mark_on_a_standing_verdict_is_not_a_silent_repeat,
     test_cli_sends_the_not_pair_miss_mark,
     test_human_return_marked_not_pair_miss_keeps_act,
     test_human_return_without_valid_mark_is_pair_miss,
