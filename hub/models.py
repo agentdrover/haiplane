@@ -1374,6 +1374,13 @@ class TaskReviewVerdict(BaseModel):
     # #1706: замена стоящего вердикта commit-задачи — только человеком и только
     # с ревизией, которую он видел; без поля стоящий вердикт не заменяется.
     supersedes_revision: int | None = Field(None, ge=0)
+    # #2139: человек помечает возврат «не ошибка пары» (правка формулировок,
+    # не дефект, который пара должна была поймать). Только false и только с
+    # заметкой; агент поле не пишет. Значение ложится в payload события вердикта.
+    # Any, а не bool: pydantic привёл бы "false", 0, "no" к False и выключил
+    # предохранитель; допустимость значения решает ensure_pair_miss_mark.
+    pair_miss: Any = Field(None, json_schema_extra={"enum": [False, None]})
+    pair_miss_note: str = Field("", max_length=2000)
 
 
 class LatestReview(BaseModel):

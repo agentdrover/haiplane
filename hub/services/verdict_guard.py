@@ -58,12 +58,18 @@ def verdict_digest(body: TaskReviewVerdict) -> str:
         (f.model_dump(exclude_none=True, mode="json") for f in body.findings),
         key=lambda f: json.dumps(f, sort_keys=True, ensure_ascii=False),
     )
+    parts: dict[str, Any] = {
+        "verdict": body.verdict.value,
+        "comments": body.comments.strip(),
+        "findings": findings,
+    }
+    if body.pair_miss is not None or body.pair_miss_note:
+        # #2139: пометка меняет смысл вердикта; без неё повтор с пометкой
+        # считался бы тем же вердиктом и отвечал успехом, ничего не записав.
+        # Только при наличии пометки: отпечатки прежних вердиктов не меняются.
+        parts["pair_miss"] = [body.pair_miss, body.pair_miss_note.strip()]
     packed = json.dumps(
-        {
-            "verdict": body.verdict.value,
-            "comments": body.comments.strip(),
-            "findings": findings,
-        },
+        parts,
         sort_keys=True,
         ensure_ascii=False,
     )
@@ -163,6 +169,42 @@ def ensure_approval_is_human(
         "вердикт за человеком: сдайте отчёт ревью (hub_submit_machine_review) "
         "или CHANGES_REQUESTED; одобрит владелец.",
     )
+
+
+def ensure_pair_miss_mark(body: TaskReviewVerdict, *, human_caller: bool) -> None:
+    """Пометка «не ошибка пары» (#2139): только человек, только false, только с заметкой.
+
+    Агент (и любой вызов без личности человека) получает 403 и ничего не
+    записывает: поле не отбрасывается молча, иначе агент не узнал бы, что
+    пометка не легла. Человек без заметки, с pair_miss=true, с пометкой на
+    approved или с заметкой без пометки - 422. Ничего не пишет.
+    """
+    if body.pair_miss is None and not body.pair_miss_note:
+        return
+    if not human_caller:
+        raise _refusal(
+            403,
+            "pair_miss_human_only",
+            "Пометку pair_miss ставит только человек; вердикт агента её не "
+            "несёт. Ничего не записано.",
+            "уберите pair_miss и pair_miss_note из вердикта.",
+        )
+    problem = ""
+    if body.pair_miss is not False:
+        problem = (
+            "pair_miss принимает только false (по умолчанию возврат - ошибка пары)"
+        )
+    elif body.verdict.value != "changes_requested":
+        problem = "пометка относится к возврату (changes_requested)"
+    elif not body.pair_miss_note.strip():
+        problem = "pair_miss=false требует непустой pair_miss_note"
+    if problem:
+        raise _refusal(
+            422,
+            "pair_miss_invalid",
+            f"{problem}. Ничего не записано.",
+            "pair_miss=false вместе с pair_miss_note: почему это не ошибка пары.",
+        )
 
 
 async def decide(
