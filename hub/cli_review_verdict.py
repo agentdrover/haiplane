@@ -32,6 +32,17 @@ def _add_state_verdict_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--not-pair-miss",
+        dest="not_pair_miss",
+        metavar="NOTE",
+        default=None,
+        help=(
+            "Human only (#2139): mark this return as NOT a miss of the steward "
+            "pair (wording, not a defect the pair should have caught); NOTE "
+            "says why. The return then does not put the steward in shadow"
+        ),
+    )
+    parser.add_argument(
         "--supersedes-revision",
         dest="supersedes_revision",
         type=int,
@@ -117,6 +128,9 @@ def cmd_review_verdict(args: argparse.Namespace) -> int:
     body["expected_generation"] = args.expected_generation
     if getattr(args, "supersedes_revision", None) is not None:
         body["supersedes_revision"] = args.supersedes_revision
+    if getattr(args, "not_pair_miss", None) is not None:
+        body["pair_miss"] = False
+        body["pair_miss_note"] = args.not_pair_miss
     result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
     if getattr(args, "json", False) or not isinstance(result, dict):
         print(json.dumps(result, ensure_ascii=False, indent=2))
