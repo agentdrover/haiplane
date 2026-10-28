@@ -60,6 +60,10 @@
   `docs/agent-context/mcp-catalog-budget.json` — the one refill policy (#1241);
   do not raise the budget with `--update`.
 - Prefer focused validation:
+  - `make check-fast` before a push (#2000): all the static checks of
+    `make check` plus the tests the diff makes worth running (your own, the
+    tree guards, readers of the files you changed). The full suite is CI's job
+    (dispatch it before submitting); a miss costs one CI cycle.
   - `uv run ruff check hub tests`
   - `uv run ruff format hub tests`
   - `uv run pytest -q`

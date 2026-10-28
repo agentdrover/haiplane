@@ -294,3 +294,47 @@ def test_a_test_part_is_what_make_test_runs() -> None:
         "--durations=30",
     ]
     assert ci_tokens[0].startswith("HAIPLANE_TEST_SHARD=")
+
+
+def _prerequisites(makefile_text: str, target: str) -> list[str]:
+    """The prerequisites on the ``<target>:`` line (flat, no recursion)."""
+    line = next(ln for ln in makefile_text.splitlines() if ln.startswith(f"{target}:"))
+    return line.split(":", 1)[1].split()
+
+
+def _static_part(makefile_text: str, target: str, tests_target: str) -> set[str]:
+    return set(_prerequisites(makefile_text, target)) - {tests_target}
+
+
+def test_check_fast_has_the_same_static_part_as_check() -> None:
+    """#2000: ``check-fast`` swaps ONLY the tests for the targeted ones.
+
+    A static target added to ``check`` and forgotten in ``check-fast`` would make
+    the fast check green on what CI turns red. ``_make_check_body`` reads only the
+    ``check:`` line (the line ``check-fast:`` does not start with ``check:``), so
+    the coverage of CI steps stays proven by ``check`` alone.
+    """
+    text = MAKEFILE.read_text(encoding="utf-8")
+    full = _static_part(text, "check", "test")
+    fast = _static_part(text, "check-fast", "test-changed")
+    assert {"lint", "types", "budget", "layers", "migration-steps", "security"} <= full
+    assert fast == full, (sorted(full - fast), sorted(fast - full))
+    assert "test-changed" in _prerequisites(text, "check-fast")
+    assert "test" not in _prerequisites(text, "check-fast")
+    body = _target_body(text.splitlines(), "test-changed")
+    assert "scripts/changed_tests.py" in body
+
+
+def test_a_static_target_added_to_check_alone_breaks_the_equality() -> None:
+    """The equality test must be able to fail: synthetic Makefiles."""
+    text = MAKEFILE.read_text(encoding="utf-8")
+    drifted = text.replace("check: lint types", "check: lint newstatic types", 1)
+    assert drifted != text
+    assert _static_part(drifted, "check", "test") != _static_part(
+        drifted, "check-fast", "test-changed"
+    )
+    dropped = text.replace("check-fast: lint types budget", "check-fast: lint types", 1)
+    assert dropped != text
+    assert _static_part(dropped, "check", "test") != _static_part(
+        dropped, "check-fast", "test-changed"
+    )

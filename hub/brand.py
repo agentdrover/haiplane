@@ -15,6 +15,9 @@ ENV_PREFIX = "HAIPLANE_"
 RETIRED_ENV_PREFIXES: tuple[str, ...] = (("open" + "claw").upper() + "_",)
 GIT_BASE_BRANCH_KEY = "haiplane.baseBranch"
 GIT_RELEASE_BRANCH_KEY = "haiplane.releaseBranch"
+# #2000: the command a clone agreed to run before a push (set by `make hooks`).
+# The hub never writes it: it must not run a branch's code on its own host.
+GIT_PRE_PUSH_CHECK_KEY = "haiplane.prePushCheck"
 COOKIE_NAME = "haiplane_hub_session"
 CSRF_COOKIE_NAME = "haiplane_csrf"
 SEEDED_CI = "haiplane-ci.yml"

@@ -11,7 +11,7 @@
 
 REPO ?= .
 
-.PHONY: setup hooks doctor test gui-test lint format types budget layers migration-steps security check
+.PHONY: setup hooks doctor test test-changed gui-test lint format types budget layers migration-steps security check check-fast
 
 # The first command in a fresh clone. Idempotent: safe to re-run.
 setup:
@@ -23,8 +23,12 @@ setup:
 
 # Arm the pre-push hook in REPO (default: this clone). Split out so the
 # bootstrap step itself can be exercised by a test rather than trusted.
+# #2000: the same step records that THIS clone agrees to run `make check-fast`
+# before a push (haiplane.prePushCheck). Only a person or agent arming their own
+# clone sets it; the hub never writes it into the clones it prepares on its host.
 hooks:
 	uv run hp-git-policy activate $(REPO)
+	git -C $(REPO) config haiplane.prePushCheck "make check-fast"
 
 # Is a push from this clone actually checked? Non-zero when it is not.
 doctor:
@@ -40,6 +44,12 @@ doctor:
 # словарь, то есть not_found на каждом AC при зелёном CI.
 test:
 	uv run pytest -q -n auto
+
+# #2000: тесты, которые стоит прогнать для этого диффа (свои, сторожа дерева,
+# читающие изменённые не-py файлы). Не заменяет `test`: полный набор — это CI.
+# Сводка по замерам и причины выбора — в scripts/changed_tests.py.
+test-changed:
+	uv run python scripts/changed_tests.py
 
 # #1996: браузерные сценарии карточки задачи (Playwright, настоящий хаб в режиме
 # CSRF require). Вне `test` и `check`: им нужен Chromium (CI ставит его в job
@@ -86,3 +96,8 @@ security:
 # tests/test_local_checks_match_ci.py — новый шаг в CI без цели здесь красит
 # тесты, а не проходит незамеченным (#1080).
 check: lint types budget layers migration-steps security test
+
+# #2000: то же, что `check`, но вместо полного набора — целевые тесты. Статическая
+# часть обязана совпадать с `check` (держит tests/test_local_checks_match_ci.py).
+# Перед пушем запускается хуком, если клон согласился (haiplane.prePushCheck).
+check-fast: lint types budget layers migration-steps security test-changed
