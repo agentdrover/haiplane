@@ -1374,6 +1374,11 @@ class TaskReviewVerdict(BaseModel):
     # #1706: замена стоящего вердикта commit-задачи — только человеком и только
     # с ревизией, которую он видел; без поля стоящий вердикт не заменяется.
     supersedes_revision: int | None = Field(None, ge=0)
+    # #2139: человек помечает возврат «не ошибка пары» (правка формулировок,
+    # не дефект, который пара должна была поймать). Только false и только с
+    # заметкой; агент поле не пишет. Значение ложится в payload события вердикта.
+    pair_miss: bool | None = None
+    pair_miss_note: str = Field("", max_length=2000)
 
 
 class LatestReview(BaseModel):

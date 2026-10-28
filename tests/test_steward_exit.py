@@ -762,3 +762,15 @@ async def test_a_failed_unchecked_record_is_said_on_the_next_tick(
         db, "SELECT id FROM events WHERE kind=?", (steward_breaker.EVENT_UNCHECKED,)
     )
     assert len(events) == 1
+
+
+# #2139: тесты пометки «не ошибка пары» вынесены в tests/steward_pair_miss_cases.py
+# (бюджет размера файла тестов); имена те же, что в test_ref критериев.
+from tests.steward_pair_miss_cases import (  # noqa: E402,F401
+    hdr,
+    test_cli_sends_the_not_pair_miss_mark,
+    test_human_return_marked_not_pair_miss_keeps_act,
+    test_human_return_without_valid_mark_is_pair_miss,
+    test_migration_keeps_other_sources_and_existing_rows,
+    test_only_human_with_note_can_mark_not_pair_miss,
+)

@@ -4799,6 +4799,8 @@ async def record_review_verdict(
         human_caller=human_caller,
         self_approved=self_approved,
     )
+    # #2139: пометка «не ошибка пары» - до маршрутов, как и правило выше.
+    verdict_guard.ensure_pair_miss_mark(body, human_caller=human_caller)
     task = dict(row)
     if is_state(task):
         # #1647: вердикт по задаче-состоянию — только с поколением, APPROVED
@@ -4962,6 +4964,10 @@ def _verdict_event_payload(
     }
     if ghost_generation is not None:
         payload["ghost_generation"] = ghost_generation
+    if state.body.pair_miss is False:
+        # #2139: неизменяемая пометка человека; читают триггер и опрос.
+        payload["pair_miss"] = False
+        payload["pair_miss_note"] = state.body.pair_miss_note.strip()
     if state.applied_by_steward:
         payload["source"] = STEWARD_APPLIED_SOURCE
         payload.update(double_clean_payload(state.task_id))  # #1986
