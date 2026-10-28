@@ -356,3 +356,31 @@ async def test_counter_does_not_trust_the_display_name(
     )
     assert resp.status_code == 200, resp.text
     assert await steward_exit.human_returns_not_pair_miss(db) == 1
+
+
+async def test_live_trigger_actor_list_equals_the_non_human_actors(
+    db: aiosqlite.Connection,
+):
+    """Список акторов в ДЕЙСТВУЮЩЕМ триггере и в шаге #2139 равен NON_HUMAN_GATE_ACTORS.
+
+    Старый сторож читает исходную миграцию, а триггер пересоздан шагом: сверка
+    идёт по тому, что реально стоит в базе, и по SQL самого шага.
+    """
+    import re
+
+    from hub.migrations.steps import load_steps
+    from hub.services.gate_events import NON_HUMAN_GATE_ACTORS
+
+    live = await fetchall(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='trg_false_approve_human_return'",
+    )
+    step = dict(load_steps())[
+        "create_trigger_false_approve_human_return_pair_miss_2139"
+    ]
+    for label, sql in (("live", dict(live[0])["sql"]), ("step", step)):
+        found = re.findall(r"actor NOT IN \(([^)]*)\)", sql)
+        assert len(found) == 1, label
+        listed = {a.strip().strip("'") for a in found[0].split(",")}
+        assert listed == set(NON_HUMAN_GATE_ACTORS), label
