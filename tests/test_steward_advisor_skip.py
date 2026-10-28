@@ -603,6 +603,20 @@ async def test_shadow_absent_fact_and_read_failure_keep_ordering(
     assert await order_due_advisors(db) == 1, "«посмотреть не смог» заказ не гасит"
     assert len(await _advisor_rows(db, unknown.task_id)) == 1
     assert await _skips(db, unknown.task_id) == []
+
+    # заявленные закрытия не разбираются: повреждённый JSON и неверный тип
+    for label, raw in (("malformed", "{malformed"), ("wrongtype", '{"a": 1}')):
+        monkeypatch.undo()
+        bad = await _scene(db, monkeypatch, f"o-{label}", **both)
+        await db.execute(
+            "UPDATE steward_judgements SET closures=? WHERE task_id=? "
+            "AND kind='verdict'",
+            (raw, bad.task_id),
+        )
+        await db.commit()
+        assert await order_due_advisors(db) == 1, label
+        assert len(await _advisor_rows(db, bad.task_id)) == 1
+        assert await _skips(db, bad.task_id) == []
     assert await _skips(db, unread_closure.task_id) == []
     for case in (shadow, absent, broken):
         assert await _skips(db, case.task_id) == []

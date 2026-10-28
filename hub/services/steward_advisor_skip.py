@@ -53,10 +53,6 @@ CODE_PRECONDITION = "precondition_failed"
 CODE_UNCLOSED = "unclosed_finding"
 #: Начало метки в строке ленты: события чистятся по сроку, лента живёт с задачей.
 MARK_PREFIX = "[пропуск-советника g="
-#: Хвост отказа привратника, когда закрытие не удалось ПРОЧИТАТЬ (не «правки не
-#: было», а «посмотреть не смог»). Ищется в КОНЦЕ текста: заголовок находки стоит
-#: в начале и хвостом стать не может.
-_UNREAD_CLOSURE_TAIL = "это не «правки не было», это отсутствие наблюдения"
 
 
 #: Строка ленты, написанная самим хабом: комментарий человека с тем же текстом
@@ -146,10 +142,10 @@ async def _packet_reasons(
 ) -> tuple[str, str] | None:
     """Отказы привратника по пакету, читаемые ДО ответа советника (#2124).
 
-    Зовутся только ``precondition_refusals`` и ``closure_refusals``: остальное
-    в ``apply_refusals`` ждёт советника или двойную чистоту. Факт, которого нет
-    (absent), и любая ошибка сборки - не причина: бросок уходит наверх и даёт
-    заказ как раньше.
+    Зовутся только структурные читатели привратника (``read_precondition_refusals``,
+    ``closure_findings``): остальное в ``apply_refusals`` ждёт советника или
+    двойную чистоту. Текст отказов не разбирается. Непрочитанное (факт absent,
+    нечитаемые закрытия, любая ошибка сборки) - не причина: заказ как раньше.
     """
     from hub.services import steward_apply, steward_evidence
 
@@ -159,25 +155,13 @@ async def _packet_reasons(
     )
     if packet is None:
         return None
-    read = {
-        source
-        for source in steward_apply.PRECONDITION_FACTS
-        if (fact := packet.facts.get(source)) is not None and fact.state == "present"
-    }
-    # «источник: подробность» - отказ по непрочитанному источнику отбрасываем
-    refused = [
-        detail
-        for _, detail in steward_apply.precondition_refusals(packet)
-        if detail.split(":", 1)[0] in read
-    ]
+    refused = [detail for _, detail in steward_apply.read_precondition_refusals(packet)]
     if refused:
         return CODE_PRECONDITION, "; ".join(refused)
     closures = [
-        detail
-        for _, detail in await steward_apply.closure_refusals(
-            db, int(task["id"]), packet
-        )
-        if not detail.endswith(_UNREAD_CLOSURE_TAIL)
+        f.refusal[1]
+        for f in await steward_apply.closure_findings(db, int(task["id"]), packet)
+        if f.observed
     ]
     if closures:
         return CODE_UNCLOSED, "; ".join(closures)
