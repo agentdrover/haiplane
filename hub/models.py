@@ -1377,7 +1377,9 @@ class TaskReviewVerdict(BaseModel):
     # #2139: человек помечает возврат «не ошибка пары» (правка формулировок,
     # не дефект, который пара должна была поймать). Только false и только с
     # заметкой; агент поле не пишет. Значение ложится в payload события вердикта.
-    pair_miss: bool | None = None
+    # Any, а не bool: pydantic привёл бы "false", 0, "no" к False и выключил
+    # предохранитель; допустимость значения решает ensure_pair_miss_mark.
+    pair_miss: Any = None
     pair_miss_note: str = Field("", max_length=2000)
 
 
