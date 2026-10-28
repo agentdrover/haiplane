@@ -605,7 +605,11 @@ async def test_shadow_absent_fact_and_read_failure_keep_ordering(
     assert await _skips(db, unknown.task_id) == []
 
     # заявленные закрытия не разбираются: повреждённый JSON и неверный тип
-    for label, raw in (("malformed", "{malformed"), ("wrongtype", '{"a": 1}')):
+    for label, raw in (
+        ("malformed", "{malformed"),
+        ("wrongtype", '{"a": 1}'),
+        ("empty", ""),
+    ):
         monkeypatch.undo()
         bad = await _scene(db, monkeypatch, f"o-{label}", **both)
         await db.execute(
