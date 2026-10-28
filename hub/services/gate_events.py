@@ -47,7 +47,8 @@ def reserved_actor_detail(name: str | None) -> dict[str, str]:
     """Тело 422 reserved_actor_name для маршрутов внешнего входа."""
     return {
         "reason": "reserved_actor_name",
-        "message": f"agent {(name or '').strip()!r} is reserved for hub automation",
+        "message": "reserved_actor_name: agent "
+        f"{(name or '').strip()!r} is reserved for hub automation",
         "hint": "Use your own name in 'agent' (hub, policy and steward are "
         "reserved for the hub's automatic verdicts); nothing was recorded.",
     }

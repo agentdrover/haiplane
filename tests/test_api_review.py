@@ -610,6 +610,7 @@ async def test_ordinary_human_return_still_counts_and_web_form_rejects_reserved(
     assert rejected.status_code in (303, 422), rejected.text
     if rejected.status_code == 303:
         assert "review_error=" in rejected.headers["location"], rejected.headers
+        assert "reserved_actor_name" in rejected.headers["location"]
     assert await _verdict_events(db, task_id) == []
     assert await _human_returns(db, task_id) == []
 
