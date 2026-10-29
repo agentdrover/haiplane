@@ -5748,6 +5748,10 @@ async def return_to_work(
     task = dict(row)
     from_status = task["status"]
     state_task = is_state(task)
+    if body.manual_claim_recovery and (from_status != "running" or state_task):
+        raise HTTPException(
+            409, "Ручное освобождение возможно только для commit-задачи в running"
+        )
     # #1647: the state task is returned from running after a refusing verdict, from needs_info
     # and from open (left by the session registry); without this door a frozen statement could
     # not be edited.

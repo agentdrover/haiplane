@@ -144,7 +144,12 @@ async def _close_stale_wait(
 
 
 async def apply_return_to_open(
-    db: aiosqlite.Connection, task: dict[str, Any], *, actor: str, reason: str
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    *,
+    actor: str,
+    reason: str,
+    manual_verification: str = "",
 ) -> None:
     """Возврат running → open в транзакции вызывающего; без коммита (#1783).
 
@@ -193,6 +198,9 @@ async def apply_return_to_open(
         "decision",
         lifecycle._return_to_work_note(
             task, actor=actor, reason=reason, from_status="running"
+        )
+        + (
+            f" Проверка владельца: {manual_verification}" if manual_verification else ""
         ),
     )
     await repo.insert_event(
@@ -208,6 +216,11 @@ async def apply_return_to_open(
             "previous_principal_id": task.get("implementer_principal_id"),
             "closed_verdict_generation": closed_generation,
             "abandoned_jobs": [],
+            **(
+                {"manual_verification": manual_verification}
+                if manual_verification
+                else {}
+            ),
         },
     )
     await log_activity(
@@ -236,10 +249,67 @@ async def return_running_to_open(
                 f"Task #{task_id} moved from running to {task['status']} "
                 "while being returned to work; nothing was changed",
             )
+        recovery = body.manual_claim_recovery
+        if recovery:
+            updates = await repo.get_task_updates(db, task_id)
+            last_update_id = updates[-1]["id"] if updates else 0
+            mismatches = [
+                name
+                for name, expected, current in (
+                    (
+                        "история задачи",
+                        recovery.expected_last_update_id,
+                        last_update_id,
+                    ),
+                    ("статус", recovery.expected_status, task["status"]),
+                    (
+                        "держатель",
+                        recovery.expected_holder,
+                        task.get("claimed_by") or "",
+                    ),
+                    (
+                        "сессия",
+                        recovery.expected_session,
+                        task.get("claim_session_id") or "",
+                    ),
+                    (
+                        "время захвата",
+                        recovery.expected_claimed_at,
+                        task.get("claimed_at") or "",
+                    ),
+                )
+                if expected != current
+            ]
+            if mismatches:
+                raise HTTPException(
+                    409, "Снимок захвата изменился: " + ", ".join(mismatches)
+                )
+            if task.get("result_kind") == "state":
+                raise HTTPException(
+                    409, "Ручное освобождение недоступно для задачи-состояния"
+                )
+            if task.get("executor_run_id") is not None:
+                raise HTTPException(
+                    409,
+                    "Захват принадлежит прогону хаба (executor_run_id); ручное освобождение недоступно",
+                )
+            if task.get("claim_nonce") is not None:
+                raise HTTPException(
+                    409,
+                    "Захват имеет метку сессии (claim_nonce); ручное освобождение недоступно",
+                )
         signs = await work_signs(db, task)
+        if recovery:
+            signs = [sign for sign in signs if sign["sign"] != "claimed_by"]
         if signs:
             raise HTTPException(409, detail=return_running_has_work_detail(signs))
-        await apply_return_to_open(db, task, actor=actor, reason=body.reason)
+        await apply_return_to_open(
+            db,
+            task,
+            actor=actor,
+            reason=body.reason,
+            manual_verification=recovery.verification if recovery else "",
+        )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return lifecycle.row_to_task(row, updates=updates)  # type: ignore[arg-type]

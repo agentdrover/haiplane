@@ -2306,6 +2306,31 @@ class TaskDecide(BaseModel):
     )
 
 
+class ManualClaimRecovery(BaseModel):
+    """Human-supplied snapshot and observation for a manual claim recovery."""
+
+    expected_status: str = Field(..., min_length=1, max_length=32)
+    expected_holder: str = Field(..., min_length=1, max_length=200)
+    expected_session: str = Field(..., min_length=1, max_length=200)
+    expected_claimed_at: str = Field(..., min_length=1, max_length=100)
+    expected_last_update_id: int = Field(..., ge=0)
+    confirmed_process_stopped: Literal[True]
+    verification: str = Field(..., min_length=1, max_length=5000)
+
+    @field_validator(
+        "expected_status",
+        "expected_holder",
+        "expected_session",
+        "expected_claimed_at",
+        "verification",
+    )
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("field must not be blank")
+        return value.strip()
+
+
 class TaskReturnToWork(BaseModel):
     """Human return of an abandoned submission to ``open`` (#1356).
 
@@ -2318,6 +2343,7 @@ class TaskReturnToWork(BaseModel):
     # "running" in the registry forever. Without this the return is a 409 that
     # names the job; with it the job is dropped from the task (not killed).
     abandon_active_job: bool = False
+    manual_claim_recovery: ManualClaimRecovery | None = None
 
     @field_validator("reason")
     @classmethod
