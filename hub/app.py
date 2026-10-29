@@ -162,6 +162,7 @@ from hub.mcp_catalog import (
     load_budget,
     load_measured,
 )
+from hub.services.gate_events import is_reserved_actor_name, reserved_actor_detail
 from hub.services import accepted_delivery_retry
 from hub.services import admin as admin_svc
 from hub.services import chat_pair, rework_launch
@@ -2911,6 +2912,8 @@ async def api_review_verdict(
     DRAFT follow-up task for each unlinked out-of-scope finding and stamps
     its id into the stored finding; idempotent on resubmit.
     """
+    if is_reserved_actor_name(body.agent):
+        raise HTTPException(422, detail=reserved_actor_detail(body.agent))
     db = _db(request)
     row = await repo.get_task(db, task_id)
     self_approved = False
