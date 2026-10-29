@@ -2870,6 +2870,8 @@ async def _web_task_detail_page(
     status_code: int = 200,
 ) -> HTMLResponse:
     db = _db(request)
+    snapshot_updates = await repo.get_task_updates(db, task_id)
+    last_update_id = snapshot_updates[-1]["id"] if snapshot_updates else 0
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -2968,8 +2970,12 @@ async def _web_task_detail_page(
             "steward_judgement": steward_judgement,
             "decision_brief": decision_brief,
             "card_c2": c2_view,
+            "last_update_id": last_update_id,
             "card_actions": card_actions.for_page(
-                dict(row), c2_view, machine_review, decision_brief
+                {**dict(row), "last_update_id": last_update_id},
+                c2_view,
+                machine_review,
+                decision_brief,
             ),
             "executor_runs": executor_runs,
             "repair_offered": repair_offered,
@@ -3769,11 +3775,33 @@ async def web_return_to_work(
     request: Request,
     reason: str = Form(""),
     abandon_active_job: bool = Form(False),
+    manual_recover: bool = Form(False),
+    expected_holder: str = Form(""),
+    expected_session: str = Form(""),
+    expected_claimed_at: str = Form(""),
+    expected_last_update_id: int | None = Form(None),
+    confirmed_process_stopped: bool = Form(False),
+    verification: str = Form(""),
 ):
     """The task page's "return to work" button (#1356): same service as REST."""
     _require_human_web(request)
     try:
-        body = TaskReturnToWork(reason=reason, abandon_active_job=abandon_active_job)
+        recovery = None
+        if manual_recover:
+            recovery = {
+                "expected_status": "running",
+                "expected_holder": expected_holder,
+                "expected_session": expected_session,
+                "expected_claimed_at": expected_claimed_at,
+                "expected_last_update_id": expected_last_update_id,
+                "confirmed_process_stopped": confirmed_process_stopped,
+                "verification": verification,
+            }
+        body = TaskReturnToWork(
+            reason=reason,
+            abandon_active_job=abandon_active_job,
+            manual_claim_recovery=recovery,
+        )
     except ValidationError as exc:
         # #1995: тип отказа поля (missing/blank/too_long) в лог, значения нет.
         log_field_refusals(request, exc.errors(), (await request.form()).keys())

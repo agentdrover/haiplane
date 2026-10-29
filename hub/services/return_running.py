@@ -144,7 +144,12 @@ async def _close_stale_wait(
 
 
 async def apply_return_to_open(
-    db: aiosqlite.Connection, task: dict[str, Any], *, actor: str, reason: str
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    *,
+    actor: str,
+    reason: str,
+    manual_verification: str = "",
 ) -> None:
     """Возврат running → open в транзакции вызывающего; без коммита (#1783).
 
@@ -193,6 +198,9 @@ async def apply_return_to_open(
         "decision",
         lifecycle._return_to_work_note(
             task, actor=actor, reason=reason, from_status="running"
+        )
+        + (
+            f" Проверка владельца: {manual_verification}" if manual_verification else ""
         ),
     )
     await repo.insert_event(
@@ -208,6 +216,11 @@ async def apply_return_to_open(
             "previous_principal_id": task.get("implementer_principal_id"),
             "closed_verdict_generation": closed_generation,
             "abandoned_jobs": [],
+            **(
+                {"manual_verification": manual_verification}
+                if manual_verification
+                else {}
+            ),
         },
     )
     await log_activity(
@@ -236,10 +249,35 @@ async def return_running_to_open(
                 f"Task #{task_id} moved from running to {task['status']} "
                 "while being returned to work; nothing was changed",
             )
+        recovery = body.manual_claim_recovery
+        if recovery:
+            updates = await repo.get_task_updates(db, task_id)
+            last_update_id = updates[-1]["id"] if updates else 0
+            if (
+                recovery.expected_last_update_id != last_update_id
+                or recovery.expected_status != task["status"]
+                or recovery.expected_holder != (task.get("claimed_by") or "")
+                or recovery.expected_session != (task.get("claim_session_id") or "")
+                or recovery.expected_claimed_at != (task.get("claimed_at") or "")
+                or task.get("result_kind") == "state"
+                or task.get("executor_run_id") is not None
+                or task.get("claim_nonce") is not None
+            ):
+                raise HTTPException(
+                    409, "Снимок захвата изменился или захват не является ручным"
+                )
         signs = await work_signs(db, task)
+        if recovery:
+            signs = [sign for sign in signs if sign["sign"] != "claimed_by"]
         if signs:
             raise HTTPException(409, detail=return_running_has_work_detail(signs))
-        await apply_return_to_open(db, task, actor=actor, reason=body.reason)
+        await apply_return_to_open(
+            db,
+            task,
+            actor=actor,
+            reason=body.reason,
+            manual_verification=recovery.verification if recovery else "",
+        )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return lifecycle.row_to_task(row, updates=updates)  # type: ignore[arg-type]
