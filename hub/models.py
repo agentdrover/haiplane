@@ -1374,6 +1374,13 @@ class TaskReviewVerdict(BaseModel):
     # #1706: замена стоящего вердикта commit-задачи — только человеком и только
     # с ревизией, которую он видел; без поля стоящий вердикт не заменяется.
     supersedes_revision: int | None = Field(None, ge=0)
+    # #2139: человек помечает возврат «не ошибка пары» (правка формулировок,
+    # не дефект, который пара должна была поймать). Только false и только с
+    # заметкой; агент поле не пишет. Значение ложится в payload события вердикта.
+    # Any, а не bool: pydantic привёл бы "false", 0, "no" к False и выключил
+    # предохранитель; допустимость значения решает ensure_pair_miss_mark.
+    pair_miss: Any = Field(None, json_schema_extra={"enum": [False, None]})
+    pair_miss_note: str = Field("", max_length=2000)
 
 
 class LatestReview(BaseModel):
@@ -2299,6 +2306,31 @@ class TaskDecide(BaseModel):
     )
 
 
+class ManualClaimRecovery(BaseModel):
+    """Human-supplied snapshot and observation for a manual claim recovery."""
+
+    expected_status: str = Field(..., min_length=1, max_length=32)
+    expected_holder: str = Field(..., min_length=1, max_length=200)
+    expected_session: str = Field(..., min_length=1, max_length=200)
+    expected_claimed_at: str = Field(..., min_length=1, max_length=100)
+    expected_last_update_id: int = Field(..., ge=0)
+    confirmed_process_stopped: Literal[True]
+    verification: str = Field(..., min_length=1, max_length=5000)
+
+    @field_validator(
+        "expected_status",
+        "expected_holder",
+        "expected_session",
+        "expected_claimed_at",
+        "verification",
+    )
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("field must not be blank")
+        return value.strip()
+
+
 class TaskReturnToWork(BaseModel):
     """Human return of an abandoned submission to ``open`` (#1356).
 
@@ -2311,6 +2343,7 @@ class TaskReturnToWork(BaseModel):
     # "running" in the registry forever. Without this the return is a 409 that
     # names the job; with it the job is dropped from the task (not killed).
     abandon_active_job: bool = False
+    manual_claim_recovery: ManualClaimRecovery | None = None
 
     @field_validator("reason")
     @classmethod

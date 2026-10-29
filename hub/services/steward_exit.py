@@ -326,6 +326,10 @@ async def _human_returns(
         except ValueError:
             continue
         generation = int(payload.get("submission_generation") or 0)
+        # #2139: тот же предикат, что в триггере - не ошибка пары ТОЛЬКО при
+        # JSON false; всё прочее (нет поля, null, строка, число) - возврат.
+        if payload.get("pair_miss") is False:
+            continue
         if generation and payload.get("verdict") == "changes_requested":
             out.append((int(item["id"]), generation, str(item.get("created_at") or "")))
     return out
@@ -600,6 +604,28 @@ async def false_approve_events(
     return {str(r["source"]): int(r["n"]) for r in rows}
 
 
+async def human_returns_not_pair_miss(
+    db: aiosqlite.Connection, since_days: int = FALSE_APPROVE_EVENTS_WINDOW_DAYS
+) -> int:
+    """Человеческие возвраты с пометкой pair_miss=false за окно (#2139).
+
+    Неблокирующий счётчик по событиям: в false_approve и false_approve_events_14d
+    не входит. Автор не фильтруется: ``actor`` - имя из запроса, а пометку
+    принимает только человек (``ensure_pair_miss_mark``), поэтому её наличие
+    в payload и есть доказательство.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM events "
+        "WHERE kind='review_verdict_recorded' "
+        "AND json_extract(payload, '$.verdict')='changes_requested' "
+        "AND COALESCE(json_type(payload, '$.pair_miss'), '')='false' "
+        "AND created_at >= datetime('now', ?)",
+        (f"-{int(since_days)} days",),
+    )
+    return int(rows[0]["n"]) if rows else 0
+
+
 async def contour_report(db: aiosqlite.Connection) -> dict[str, Any]:
     """Сводка нового контура для practice_metrics и сводки политики. Чтение."""
     counts = await contour_counts(db)
@@ -626,6 +652,7 @@ async def contour_report(db: aiosqlite.Connection) -> dict[str, Any]:
         "min_pairs": ACT_MIN_PAIRS,
         "false_approve": len({f.task_id for f in false_approves}),
         "false_approve_events_14d": await false_approve_events(db),
+        "human_returns_not_pair_miss_14d": await human_returns_not_pair_miss(db),
         "false_approve_tasks": [
             {
                 "task_id": f.task_id,

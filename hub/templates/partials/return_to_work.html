@@ -13,6 +13,17 @@
     <p class="task-action-help">Задача уйдёт в open: захват снимется, одобрение текущей сдачи закроется, ветка, PR и находки останутся.</p>
     {% if from_running %}
     <p class="task-action-help">Из running задача возвращается, только если у неё нет ни одного признака работы: держателя, job, открытого слота, живого прогона или сессии исполнителя, действующего ожидания. Иначе хаб ответит 409 и назовёт признак.</p>
+    {% if task.claimed_by and task.claim_session_id and task.claimed_at %}
+    <label class="task-action-checkbox"><input type="checkbox" name="manual_recover" value="true"> Освободить ручной захват {{ task.claimed_by }} / {{ task.claim_session_id }} от {{ task.claimed_at }} после моей проверки</label>
+    <input type="hidden" name="expected_holder" value="{{ task.claimed_by }}">
+    <input type="hidden" name="expected_session" value="{{ task.claim_session_id }}">
+    <input type="hidden" name="expected_claimed_at" value="{{ task.claimed_at }}">
+    <input type="hidden" name="expected_last_update_id" value="{{ last_update_id }}">
+    <label class="task-action-checkbox"><input type="checkbox" name="confirmed_process_stopped" value="true"> Подтверждаю, что проверил остановку внешнего процесса</label>
+    <label for="task-claim-verification">Как вы проверили остановку внешнего процесса?</label>
+    <textarea id="task-claim-verification" name="verification" class="task-action-control task-action-textarea"></textarea>
+    <p class="task-action-help">Отсутствие сигнала сессии не доказывает остановку процесса. Укажите проверенный хост и способ проверки; при сомнении не освобождайте захват.</p>
+    {% endif %}
     {% if task.job_id or task.review_job_id %}
     <p class="task-action-help">Блокирует возврат: {{ 'job ' ~ task.job_id if task.job_id }}{{ ' ' if task.job_id and task.review_job_id }}{{ 'review job ' ~ task.review_job_id if task.review_job_id }}. Галочка «бросить job» для running не действует: непустой job отказ не обходит.</p>
     {% endif %}

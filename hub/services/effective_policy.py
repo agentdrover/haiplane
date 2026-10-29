@@ -638,6 +638,11 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
             "  false_approve_events_14d: "
             + (", ".join(f"{k} {v}" for k, v in events.items()) or "none")
         )
+        # #2139: возвраты человека с пометкой «не ошибка пары»; не блокируют.
+        lines.append(
+            "  human_returns_not_pair_miss_14d: "
+            f"{contour.get('human_returns_not_pair_miss_14d') or 0}"
+        )
     lines.extend(_daily_cap_lines(steward.get("daily_cap")))
     lines.extend(_readiness_lines(steward.get("readiness")))
     server = data["server"]
