@@ -19,6 +19,7 @@
         "hub.web",
         "hub.web_*",
         "hub.cli",
+        "hub.cli_manual_recovery",
         "hub.cli_task_fields",
         "hub.cli_owner_minutes",
         "hub.cli_outcome_retire",

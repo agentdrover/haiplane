@@ -1164,9 +1164,12 @@ def cmd_decide(args: argparse.Namespace) -> int:
 
 def cmd_return_to_work(args: argparse.Namespace) -> int:
     """Human-only: return an abandoned review/fix_requested task to open (#1356)."""
+    from hub.cli_manual_recovery import recovery_body
+
     body: dict[str, Any] = {"reason": args.reason}
     if getattr(args, "abandon_active_job", False):
         body["abandon_active_job"] = True
+    body.update(recovery_body(args))
     result = _api("POST", f"/api/tasks/{args.task_id}/return-to-work", body)
     _print_json(result)
     return 0
@@ -2877,6 +2880,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_return.add_argument("task_id", type=int)
+    from hub.cli_manual_recovery import add_arguments
+
+    add_arguments(p_return)
     p_return.add_argument(
         "--reason", required=True, help="Why the task goes back to work (recorded)"
     )

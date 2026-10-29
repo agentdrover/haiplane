@@ -2166,11 +2166,13 @@ async def _enforce_reader_key(request: Request, db, task_id: int) -> None:
 @app.get("/api/tasks/{task_id}", response_model=TaskView)
 async def api_get_task(task_id: int, request: Request):
     db = _db(request)
+    # Pin history before the task row: a concurrent re-claim must leave an
+    # older update ID in this response, so manual recovery fails closed.
+    updates = await repo.get_task_updates(db, task_id)
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
     await _enforce_reader_key(request, db, task_id)
-    updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     return await services.enrich_task_view(db, task_view)
 

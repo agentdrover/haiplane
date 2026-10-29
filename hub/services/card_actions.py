@@ -291,6 +291,28 @@ def _return_sheet(t: dict[str, Any]) -> dict[str, Any]:
     status = str(t.get("status") or "")
     fields = [_text("reason", "Почему сдачу забирают у держателя", required=True)]
     has_job = t.get("job_id") or t.get("review_job_id")
+    manual = (
+        status == "running"
+        and t.get("claimed_by")
+        and t.get("claim_session_id")
+        and t.get("claimed_at")
+    )
+    if manual:
+        fields.append(
+            _check(
+                "manual_recover",
+                f"Освободить захват {t['claimed_by']} / {t['claim_session_id']} от {t['claimed_at']} после моей проверки",
+            )
+        )
+        fields.append(
+            _check(
+                "confirmed_process_stopped",
+                "Подтверждаю, что проверил остановку внешнего процесса",
+            )
+        )
+        fields.append(
+            _text("verification", "Как и на каком хосте проверена остановка процесса?")
+        )
     if has_job and status != "running":
         fields.append(_check("abandon_active_job", "Бросить активный job"))
     holder = f" (сейчас держит {t['claimed_by']})" if t.get("claimed_by") else ""
@@ -306,6 +328,16 @@ def _return_sheet(t: dict[str, Any]) -> dict[str, Any]:
         hidden={
             "expected_status": status,
             "expected_submission_generation": str(t.get("submission_generation") or 0),
+            **(
+                {
+                    "expected_holder": str(t["claimed_by"]),
+                    "expected_session": str(t["claim_session_id"]),
+                    "expected_claimed_at": str(t["claimed_at"]),
+                    "expected_last_update_id": str(t.get("last_update_id", 0)),
+                }
+                if manual
+                else {}
+            ),
         },
         fields=fields,
         tone="warning",
