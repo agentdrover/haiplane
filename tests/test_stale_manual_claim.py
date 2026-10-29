@@ -376,3 +376,146 @@ async def test_web_refuses_missing_history_snapshot(client, db):
     )
     assert response.status_code == 422
     assert dict(await repo.get_task(db, tid))["claimed_by"] == "agent-a"
+
+
+@pytest.mark.parametrize(
+    "override,field,kind",
+    [
+        ({"verification": "   "}, "verification", "blank"),
+        (
+            {"confirmed_process_stopped": "false"},
+            "confirmed_process_stopped",
+            "literal_error",
+        ),
+    ],
+)
+async def test_web_explains_manual_recovery_refusal(
+    client, db, caplog, override, field, kind
+):
+    tid = await _held(client, db)
+    form = {
+        "reason": "перевзять",
+        "manual_recover": "true",
+        "expected_holder": "agent-a",
+        "expected_session": "session-a",
+        "expected_claimed_at": "2026-10-28T17:54:00+00:00",
+        "expected_last_update_id": "0",
+        "confirmed_process_stopped": "true",
+        "verification": "Проверен хост",
+    }
+    form.update(override)
+    response = await client.post(f"/tasks/{tid}/web-return-to-work", data=form)
+    assert response.status_code == 422
+    assert field in response.text and "manual_claim_recovery" not in response.text
+    assert ("Опишите" if field == "verification" else "Подтвердите") in response.text
+    assert f"field={field} kind={kind}" in caplog.text
+    assert dict(await repo.get_task(db, tid))["claimed_by"] == "agent-a"
+
+
+@pytest.mark.parametrize(
+    "field,value,detail",
+    [
+        ("executor_run_id", 7, "executor_run_id"),
+        ("claim_nonce", "sensitive-nonce", "claim_nonce"),
+    ],
+)
+async def test_recovery_names_nonmanual_claim_reason(client, db, field, value, detail):
+    tid = await _held(client, db)
+    await repo.update_task(db, tid, **{field: value})
+    await db.commit()
+    response = await client.post(f"/api/tasks/{tid}/return-to-work", json=_body())
+    assert response.status_code == 409
+    assert detail in response.text and "sensitive-nonce" not in response.text
+    assert dict(await repo.get_task(db, tid))["claimed_by"] == "agent-a"
+
+
+@pytest.mark.parametrize(
+    "field,value,label",
+    [
+        ("expected_last_update_id", 123, "история задачи"),
+        ("expected_holder", "old", "держатель"),
+        ("expected_session", "old", "сессия"),
+        ("expected_claimed_at", "old", "время захвата"),
+    ],
+)
+async def test_recovery_names_changed_snapshot_fact(client, db, field, value, label):
+    tid = await _held(client, db)
+    response = await client.post(
+        f"/api/tasks/{tid}/return-to-work", json=_body(**{field: value})
+    )
+    assert response.status_code == 409 and label in response.text
+    assert dict(await repo.get_task(db, tid))["claimed_by"] == "agent-a"
+
+
+async def test_sheet_explains_missing_process_confirmation(client, db, caplog):
+    from tests.card_sheet_support import SHEET_HEADERS, sheet_form
+
+    tid = await _held(client, db)
+    page = (await client.get(f"/tasks/{tid}")).text
+    form, data = sheet_form(page, "sh-return")
+    data.update(
+        {"reason": "перевзять", "manual_recover": "1", "verification": "Проверен хост"}
+    )
+    data.pop("confirmed_process_stopped", None)
+    response = await client.post(form.attrs["action"], data=data, headers=SHEET_HEADERS)
+    assert response.status_code == 422
+    assert (
+        "confirmed_process_stopped" in response.text
+        and "manual_claim_recovery" not in response.text
+    )
+    assert "Подтвердите" in response.text
+    assert "field=confirmed_process_stopped kind=missing" in caplog.text
+    assert dict(await repo.get_task(db, tid))["claimed_by"] == "agent-a"
+
+
+async def test_web_explains_overlong_verification(client, db):
+    tid = await _held(client, db)
+    form = {
+        "reason": "перевзять",
+        "manual_recover": "true",
+        "expected_holder": "agent-a",
+        "expected_session": "session-a",
+        "expected_claimed_at": "2026-10-28T17:54:00+00:00",
+        "expected_last_update_id": "0",
+        "confirmed_process_stopped": "true",
+        "verification": "а" * 5001,
+    }
+    response = await client.post(f"/tasks/{tid}/web-return-to-work", data=form)
+    assert (
+        response.status_code == 422
+        and "5000" in response.text
+        and "verification" in response.text
+    )
+    assert dict(await repo.get_task(db, tid))["claimed_by"] == "agent-a"
+
+
+async def test_web_explains_overlong_reason(client, db):
+    tid = await _held(client, db)
+    response = await client.post(
+        f"/tasks/{tid}/web-return-to-work", data={"reason": "а" * 5001}
+    )
+    assert response.status_code == 422 and "Сократите причину возврата" in response.text
+    assert (
+        "5000" in response.text
+        and dict(await repo.get_task(db, tid))["claimed_by"] == "agent-a"
+    )
+
+
+async def test_web_explains_invalid_history_version(client, db):
+    tid = await _held(client, db)
+    form = {
+        "reason": "перевзять",
+        "manual_recover": "true",
+        "expected_holder": "agent-a",
+        "expected_session": "session-a",
+        "expected_claimed_at": "2026-10-28T17:54:00+00:00",
+        "expected_last_update_id": "-1",
+        "confirmed_process_stopped": "true",
+        "verification": "Проверен хост",
+    }
+    response = await client.post(f"/tasks/{tid}/web-return-to-work", data=form)
+    assert (
+        response.status_code == 422
+        and "версия истории отсутствует или некорректна" in response.text
+    )
+    assert dict(await repo.get_task(db, tid))["claimed_by"] == "agent-a"

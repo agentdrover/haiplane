@@ -63,7 +63,11 @@ from hub.services import verdict_evidence
 from hub.version import get_app_version
 from hub.services import launch_feedback
 from hub.web_executor_slot import card_capacity, card_hosts
-from hub.web_refusals import WebRefusalRoute, log_field_refusals
+from hub.web_refusals import (
+    WebRefusalRoute,
+    log_field_refusals,
+    manual_recovery_validation_detail,
+)
 from hub.models import (
     DeliveryAcknowledgement,
     DEFAULT_FORGE,
@@ -3803,9 +3807,15 @@ async def web_return_to_work(
             manual_claim_recovery=recovery,
         )
     except ValidationError as exc:
-        # #1995: тип отказа поля (missing/blank/too_long) в лог, значения нет.
-        log_field_refusals(request, exc.errors(), (await request.form()).keys())
-        raise HTTPException(422, _invalid_fields_detail(exc)) from exc
+        # The nested recovery model represents flat form fields. Strip only
+        # that model prefix so both the response and log name the actual field.
+        errors = exc.errors()
+        for error in errors:
+            loc = error.get("loc", ())
+            if len(loc) > 1 and loc[0] == "manual_claim_recovery":
+                error["loc"] = loc[1:]
+        log_field_refusals(request, errors, (await request.form()).keys())
+        raise HTTPException(422, manual_recovery_validation_detail(errors)) from exc
     await services.return_to_work(
         _db(request), task_id, body, actor=current_identity(request).username
     )

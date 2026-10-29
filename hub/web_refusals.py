@@ -107,6 +107,36 @@ def log_field_refusals(
         )
 
 
+def manual_recovery_validation_detail(errors: Iterable[Any]) -> str:
+    """Explain the missing facts on the recovery form without logging values."""
+    messages = []
+    labels = {
+        "reason": "Укажите причину возврата",
+        "confirmed_process_stopped": "Подтвердите, что проверили остановку внешнего процесса",
+        "verification": "Опишите, как и на каком хосте проверена остановка процесса",
+        "expected_holder": "Обновите карточку: ожидаемый держатель отсутствует или некорректен",
+        "expected_session": "Обновите карточку: ожидаемая сессия отсутствует или некорректна",
+        "expected_claimed_at": "Обновите карточку: время захвата отсутствует или некорректно",
+        "expected_last_update_id": "Обновите карточку: версия истории отсутствует или некорректна",
+    }
+    for error in errors:
+        loc = error.get("loc", ())
+        field = str(loc[0]) if loc else "?"
+        if field in ("verification", "reason") and "too_long" in str(
+            error.get("type", "")
+        ):
+            subject = (
+                "описание проверки" if field == "verification" else "причину возврата"
+            )
+            message = f"Сократите {subject}: максимум 5000 символов"
+        else:
+            message = labels.get(field, "Проверьте поле формы")
+        line = f"{message} ({field})"
+        if line not in messages:
+            messages.append(line)
+    return "; ".join(messages)
+
+
 async def _form_keys(request: Request) -> list[str]:
     try:
         return list((await request.form()).keys())

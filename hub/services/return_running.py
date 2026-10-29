@@ -253,18 +253,50 @@ async def return_running_to_open(
         if recovery:
             updates = await repo.get_task_updates(db, task_id)
             last_update_id = updates[-1]["id"] if updates else 0
-            if (
-                recovery.expected_last_update_id != last_update_id
-                or recovery.expected_status != task["status"]
-                or recovery.expected_holder != (task.get("claimed_by") or "")
-                or recovery.expected_session != (task.get("claim_session_id") or "")
-                or recovery.expected_claimed_at != (task.get("claimed_at") or "")
-                or task.get("result_kind") == "state"
-                or task.get("executor_run_id") is not None
-                or task.get("claim_nonce") is not None
-            ):
+            mismatches = [
+                name
+                for name, expected, current in (
+                    (
+                        "история задачи",
+                        recovery.expected_last_update_id,
+                        last_update_id,
+                    ),
+                    ("статус", recovery.expected_status, task["status"]),
+                    (
+                        "держатель",
+                        recovery.expected_holder,
+                        task.get("claimed_by") or "",
+                    ),
+                    (
+                        "сессия",
+                        recovery.expected_session,
+                        task.get("claim_session_id") or "",
+                    ),
+                    (
+                        "время захвата",
+                        recovery.expected_claimed_at,
+                        task.get("claimed_at") or "",
+                    ),
+                )
+                if expected != current
+            ]
+            if mismatches:
                 raise HTTPException(
-                    409, "Снимок захвата изменился или захват не является ручным"
+                    409, "Снимок захвата изменился: " + ", ".join(mismatches)
+                )
+            if task.get("result_kind") == "state":
+                raise HTTPException(
+                    409, "Ручное освобождение недоступно для задачи-состояния"
+                )
+            if task.get("executor_run_id") is not None:
+                raise HTTPException(
+                    409,
+                    "Захват принадлежит прогону хаба (executor_run_id); ручное освобождение недоступно",
+                )
+            if task.get("claim_nonce") is not None:
+                raise HTTPException(
+                    409,
+                    "Захват имеет метку сессии (claim_nonce); ручное освобождение недоступно",
                 )
         signs = await work_signs(db, task)
         if recovery:
