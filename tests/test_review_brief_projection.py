@@ -784,9 +784,9 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # #1985: machine_review получил reviewed_sha и pin_verified (REST-бриф; пакет стюарда и packet_hash проверяются ниже).
 # #2026: блок ci_evidence получил поле expectation, ProfileDowngradeView — rules: REST-бриф и payload пакета стюарда; packet_hash прежний.
 # #1933: machine_review получил поле ac_tests_unread ([] у этой задачи): REST-бриф и payload пакета стюарда; packet_hash прежний.
-# #2090: REST-бриф получил поле outcome_ownership (null у этой задачи: без метрики): переснят REST-бриф и payload пакета стюарда; packet_hash прежний.
-GOLDEN_REST_BRIEF = "57f8f14cc22417f9e2df81abae11337332f034dc09419594388480a4d489dfa1"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "751786f606ea18a17fa38739f929e347ba5260ea67cc47cc9a83029bc9d74b9e"  # pragma: allowlist secret
+# #2208: блок prepass получил validation_declared/validation_status/validation_reason (у этой задачи команд нет): переснят REST-бриф и payload пакета стюарда; packet_hash прежний.
+GOLDEN_REST_BRIEF = "ebf12b705283b98c1497ee527b02a700c0fe766845d2be845d715c81259b4224"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "d0503ae872044baf5aaa3028c919fa953db851e221f9868d7ac270b5d7686a92"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 
