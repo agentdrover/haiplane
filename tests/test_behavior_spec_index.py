@@ -20,6 +20,7 @@ import pytest
 
 from hub import repository as repo
 from hub import repository_spec_index as store
+from hub.integrations import git_spec
 from hub.integrations.git_ops import GitOpsIntegration
 from hub.integrations.registry import plugins
 from hub.services import spec_index
@@ -358,3 +359,76 @@ def test_parser_normalizes_whitespace_so_layout_does_not_age_a_requirement():
     spaced = "## REQ-1\nObligation:   a  long\n   obligation\n"
     tight = "## REQ-1\nObligation: a long obligation\n"
     assert parse_spec_file(spaced) == parse_spec_file(tight)
+
+
+def test_parser_refuses_an_unknown_field_instead_of_gluing_it_to_the_previous_one():
+    """``Note:`` под полем не приписывается к его значению молча."""
+    text = (
+        "## REQ-1\nObligation: x\n\n### Scenario\n- Given: a\n- When: b\n"
+        "- Then: c\n- Verifiable by: test\n- Test ref: tests/t.py::t\n"
+        "Note: reviewed by the team\n"
+    )
+    with pytest.raises(SpecParseError, match="unknown field"):
+        parse_spec_file(text)
+    with pytest.raises(SpecParseError, match="unexpected text"):
+        parse_spec_file("## REQ-1\nObligation: x\nstray words\n")
+
+
+def test_parser_joins_an_indented_continuation_into_the_value():
+    text = "## REQ-1\nObligation: refuses\n  an empty password\n"
+    assert parse_spec_file(text)[0].obligation == "refuses an empty password"
+
+
+async def test_an_oversized_spec_file_is_refused_unread(
+    db, origin, project_id, monkeypatch
+):
+    origin.publish({"specs/auth/spec.md": AUTH_SPEC})
+    monkeypatch.setattr(git_spec, "MAX_SPEC_BYTES", len(AUTH_SPEC) - 1)
+    blob_reads: list[str] = []
+    real = git_spec.proc.run_capped
+
+    async def spy(*cmd, **kw):
+        if "cat-file" in cmd:
+            blob_reads.append(cmd[-1])
+        return await real(*cmd, **kw)
+
+    monkeypatch.setattr(git_spec.proc, "run_capped", spy)
+
+    result = await spec_index.index_project(db, project_id)
+
+    assert result.state == "refused"
+    assert [i.file for i in result.issues] == ["specs/auth/spec.md"]
+    assert "larger than" in result.detail
+    assert blob_reads == [], "the size comes from the tree: no read of a too-big file"
+
+
+async def test_too_many_spec_files_is_unreadable_not_a_partial_index(
+    db, origin, project_id, monkeypatch
+):
+    origin.publish(
+        {"specs/auth/spec.md": AUTH_SPEC, "specs/billing/spec.md": BILLING_SPEC}
+    )
+    monkeypatch.setattr(git_spec, "MAX_SPEC_FILES", 1)
+
+    result = await spec_index.index_project(db, project_id)
+
+    assert result.state == "unreadable"
+    assert "more than 1 spec files" in result.detail
+    assert await spec_index.index_state(db, project_id) is None
+
+
+async def test_a_git_timeout_is_named_a_failure_not_a_missing_ref(
+    db, origin, project_id, monkeypatch
+):
+    origin.publish({"specs/auth/spec.md": AUTH_SPEC})
+
+    async def timed_out(*cmd, **kw):
+        return git_spec.proc.TIMEOUT_RC, "", "timed out after 30s: git -C rev-parse"
+
+    monkeypatch.setattr(git_spec.proc, "run", timed_out)
+
+    result = await spec_index.index_project(db, project_id)
+
+    assert result.state == "unreadable"
+    assert "timed out" in result.detail
+    assert "is not readable" not in result.detail

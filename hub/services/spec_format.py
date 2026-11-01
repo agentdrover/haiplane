@@ -13,10 +13,11 @@
     - Verifiable by: test
     - Test ref: tests/test_auth.py::test_empty_password_refused
 
-Значение поля - до конца строки; непустые строки сразу под ним без своего поля
-продолжают его (склеиваются через пробел). Любое иное содержимое внутри
-требования - ошибка: молча пропущенная строка даёт индекс, в котором нет того,
-что написал автор. Текст до первого требования (заголовок, пояснения) не
+Значение поля - до конца строки; строки сразу под ним с отступом и без своего
+поля продолжают его (склеиваются через пробел). Любое иное содержимое внутри
+требования - в том числе строка без отступа с неизвестным ключом вроде
+``Note: ...`` - ошибка: молча приписанная или пропущенная строка даёт индекс, в
+котором не то, что написал автор. Текст до первого требования (заголовок, пояснения) не
 разбирается.
 
 Ревизия требования считается по НОРМАЛИЗОВАННОМУ блоку (пробелы схлопнуты,
@@ -82,14 +83,13 @@ class _Parser:
         field = _FIELD.match(line)
         if field and self._field(lineno, _field_key(field.group(1)), field.group(2)):
             return
-        if self.last is not None:
+        if self.last is not None and line[0] in " \t":
             target, key = self.last
             target[key] = _norm(f"{target[key]} {line}")
             return
         if self.req is not None:
-            raise SpecParseError(
-                f"line {lineno}: unexpected text {line.strip()[:60]!r}"
-            )
+            what = "unknown field" if field else "unexpected text"
+            raise SpecParseError(f"line {lineno}: {what} {line.strip()[:60]!r}")
 
     def _heading(self, lineno: int, line: str) -> bool:
         match = _REQ_HEADING.match(line)
@@ -126,7 +126,12 @@ class _Parser:
         self.last = None
 
     def _field(self, lineno: int, key: str, value: str) -> bool:
-        """True когда строка - поле; False - это текст (продолжение или ошибка)."""
+        """True когда строка - поле; False - это текст (продолжение или ошибка).
+
+        Неизвестный ключ не поле: ``feed`` примет такую строку только как
+        продолжение с отступом, иначе откажет. Молча приписать ``Note: ...``
+        к предыдущему значению значило бы исказить то, что написал автор.
+        """
         if key in _REQ_FIELDS:
             target = self.req
             if target is None or self.scenario is not None:
