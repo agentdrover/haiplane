@@ -53,6 +53,8 @@ VALIDATION_UNKNOWN = "unknown"
 _UNCHECKED_VALIDATION_WORDS = {
     "fail": "validation_commands: fail",
     VALIDATION_UNKNOWN: "validation_commands: неизвестно",
+    # #2208: an answer exists, but for another command list.
+    "stale": ("validation_commands: результат получен для других validation_commands"),
 }
 
 
@@ -84,8 +86,8 @@ def _recorded_validation(prepass) -> tuple[str, str]:
     why = str(getattr(prepass, "validation_reason", "") or "").strip()
     if status == "pass":
         return "pass", ""
-    if status == "fail":
-        return "fail", why
+    if status in ("fail", "stale"):
+        return status, why
     return VALIDATION_UNKNOWN, why or "отчёт CI не назвал итог validation_commands"
 
 

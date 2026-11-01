@@ -181,6 +181,26 @@ async def test_covered_prepass_with_failed_validation_is_not_passed(
     steward = dict(s["steward"]).get("checks_ran_on_the_submitted_commit", "")
     assert "validation_commands" in steward
 
+    # A pass recorded for ANOTHER command list is not a pass for this card
+    # (#2208 round 2, finding 904733d690d68a7b): the brief said "прошли" about
+    # a result the current list never ran.
+    from hub.services import validation_run
+
+    await _prepass(
+        db,
+        task_id,
+        {"lint": "pass", "tests": "pass"},
+        validation_status="pass",
+        validation_log=validation_run.log_with_commands_fingerprint(
+            "$ uv run pytest -q\nok", ["uv run pytest -q"]
+        ),
+    )
+    s = await _surfaces(client, db, task_id)
+    assert s["brief"].state != "passed"
+    assert s["brief"].verified is False
+    assert "других validation_commands" in s["brief"].headline
+    assert "validation_commands: прошли" not in s["brief"].headline
+
     # "Unknown" is not a pass either: the report named no outcome to stand on.
     await _prepass(
         db,

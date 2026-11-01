@@ -68,6 +68,32 @@ def log_with_commands_fingerprint(
     return f"{body}\n{mark}" if body else mark
 
 
+#: Одна причина на все места: результат получен для другого списка команд.
+STALE_COMMANDS_REASON = (
+    "validation_commands: результат получен для других "
+    "validation_commands — нужен отчёт с отпечатком текущего списка"
+)
+
+
+def stale_commands_reason(commands: Any, log_tail: str) -> str | None:
+    """Почему результат из ``log_tail`` не покрывает ``commands`` (#2208).
+
+    ``None``, когда лог не называет списка: запись до отпечатка читается как
+    раньше (AC-2), а не как устаревшая. ``commands`` — список или JSON карточки.
+    """
+    _, recorded = split_commands_fingerprint(log_tail or "")
+    if not recorded:
+        return None
+    if isinstance(commands, str):
+        try:
+            commands = json.loads(commands or "[]")
+        except ValueError:
+            commands = []
+    if recorded == ci_contract.validation_commands_fingerprint(commands):
+        return None
+    return STALE_COMMANDS_REASON
+
+
 def split_commands_fingerprint(log_tail: str) -> tuple[str, str]:
     """``(log without the marker, fingerprint)`` — fingerprint is "" when unnamed."""
     text = log_tail or ""
@@ -433,10 +459,7 @@ def validation_gap(task: dict) -> str | None:
     if recorded and not recorded == ci_contract.validation_commands_fingerprint(
         commands
     ):
-        return (
-            "validation_commands: результат получен для других "
-            "validation_commands — нужен отчёт с отпечатком текущего списка"
-        )
+        return STALE_COMMANDS_REASON
     if task.get("validation_status") != PASS:
         return f"validation_commands не прошли: статус {task.get('validation_status')}"
     return None

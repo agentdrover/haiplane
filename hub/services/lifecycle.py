@@ -6261,7 +6261,7 @@ async def _validation_gap_of_the_work(
     report decides; when it is, the validation written on the task must come
     from an attempt of that very commit.
     """
-    from hub.services.validation_run import validation_gap
+    from hub.services.validation_run import stale_commands_reason, validation_gap
 
     fresh = dict(await repo.get_task(db, int(task["id"])) or task)
     # Nothing is declared to validate: nothing to cover, whatever commit it is.
@@ -6296,6 +6296,15 @@ async def _validation_gap_of_the_work(
                 f"{pinned[:12]}; подтверждённая validation вершины: "
                 f"{status or 'нет'}, нужен pass успешного прогона"
             )
+        # #2208: a tip's pass proves the list THAT run executed, not the card as
+        # it reads now. Without this the edited card inherited the old verdict
+        # exactly where the tip differs from the pinned commit.
+        stale = stale_commands_reason(
+            fresh.get("validation_commands"),
+            str(dict(report).get("validation_log") or ""),
+        )
+        if stale:
+            return stale
         return None
     if gap or not sha:
         return gap

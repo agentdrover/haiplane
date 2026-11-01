@@ -605,6 +605,13 @@ async def _validation_of_report(
             commands = []
     status = str(report.get("validation_status") or "").strip()
     reason = str(report.get("reason") or "").strip()
+    # #2208: the report's own marker names the list it ran. A pass obtained for
+    # another list is not a pass for this card, however green the report is.
+    from hub.services.validation_run import stale_commands_reason
+
+    stale = stale_commands_reason(commands, str(report.get("validation_log") or ""))
+    if stale and commands:
+        status, reason = "stale", stale
     if not reason:
         tail = [
             line
