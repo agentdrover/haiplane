@@ -5349,6 +5349,63 @@ class StewardJudgementView(BaseModel):
         return v
 
 
+# --- Behavior spec index (#2214) ---
+
+
+class SpecScenario(BaseModel):
+    """Scenario of a requirement as written in ``specs/<capability>/spec.md``."""
+
+    given: str
+    when: str
+    then: str
+    verifiable_by: str
+    test_ref: str = ""
+
+
+class SpecRequirement(BaseModel):
+    """Requirement block: the unit whose revision is hashed (``{id, obligation, scenarios}``)."""
+
+    id: str = Field(pattern=r"^REQ-[0-9]+$")
+    obligation: str
+    scenarios: list[SpecScenario] = Field(default_factory=list)
+
+
+class IndexedRequirement(SpecRequirement):
+    """A requirement as the index stores it: its block plus both revisions.
+
+    ``file_revision`` is the git blob SHA of the file on the default branch,
+    ``revision`` the sha256 of the canonical JSON of the block alone, so editing
+    one requirement ages its own revision and the file's, not its neighbours'.
+    """
+
+    path: str
+    capability: str
+    file_revision: str
+    revision: str
+
+
+class SpecIndexIssue(BaseModel):
+    file: str
+    reason: str
+
+
+class SpecIndexResult(BaseModel):
+    """Outcome of indexing a project's spec files by the default-branch ref.
+
+    ``refused`` (a duplicate id or a file that does not parse) and
+    ``unreadable`` (git could not answer) both leave the previous index
+    untouched; they are kept apart because the second says nothing about the files.
+    """
+
+    state: Literal["indexed", "refused", "unreadable"]
+    ref: str = ""
+    commit: str = ""
+    files: int = 0
+    requirements: int = 0
+    issues: list[SpecIndexIssue] = Field(default_factory=list)
+    detail: str = ""
+
+
 # --- Deprecated aliases for backward compatibility ---
 
 ProposalStatus = TaskStatus
