@@ -1605,7 +1605,7 @@ class CIEvidenceState(BaseModel):
 
 
 class PrepassState(BaseModel):
-    """Which deterministic checks already ran on the code under review (#875).
+    """What deterministic evidence a CI run left on the code under review (#875).
 
     ``state`` is ``covered`` (at least one check ran and passed on the pinned
     commit), ``failed`` (a check ran and did NOT pass) or ``unknown`` (no report
@@ -1616,6 +1616,12 @@ class PrepassState(BaseModel):
     the sole basis on which the reviewer is told not to spend its pass on a
     class — a list built from anything else would be a promise the run cannot
     keep.
+
+    ``validation_*`` (#2208) is the card's own validation_commands as the SAME
+    report recorded them: checks and validation are two facts about one commit,
+    and a green check never stood in for a red validation. ``declared`` keeps
+    "the card names commands" apart from "there is nothing to prove" — an
+    unknown outcome blocks "checked", an absent list does not.
     """
 
     state: str = "unknown"
@@ -1624,14 +1630,20 @@ class PrepassState(BaseModel):
     failed: list[str] = Field(default_factory=list)
     skipped: list[str] = Field(default_factory=list)
     head_sha: str = ""
+    validation_declared: bool = False
+    validation_status: str = ""
+    validation_reason: str = ""
 
 
 class ValidationStanding(BaseModel):
     """Whether a submission is checked — by the prepass, not by its text (#1246).
 
-    ``state`` is ``passed``, ``failed`` or ``not_run``: three, never two. Only
-    ``passed`` makes ``verified`` true. ``author_run_lines`` are the lines of
-    the submission text that talk about runs — quoted as the author's word,
+    ``state`` is ``passed``, ``failed``, ``not_run`` or ``unknown``: one answer
+    per case, never two. Only ``passed`` makes ``verified`` true. ``unknown``
+    (#2208) is the answer the first three could not give: the checks ran and
+    passed, but the card's own validation_commands reported no outcome — it is
+    neither a pass nor a failure of the work. ``author_run_lines`` are the lines
+    of the submission text that talk about runs — quoted as the author's word,
     never judged for meaning and never a basis. ``needs_human_compare`` is
     true only where the prepass failed and such lines exist: the hub cannot
     tell whether they agree with the failure, so a human compares.

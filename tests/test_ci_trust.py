@@ -951,6 +951,7 @@ async def test_the_steward_packet_asks_before_it_builds_the_brief(db, monkeypatc
 
 async def test_a_run_that_failed_is_not_a_checked_submission(db):
     from hub.services import review_evidence
+    from hub.services.validation_standing import VALIDATION_FAILED, validation_standing
 
     task_id = await _task(db)
     await _post(
@@ -962,9 +963,9 @@ async def test_a_run_that_failed_is_not_a_checked_submission(db):
     prepass = await review_evidence.prepass_state(db, task)
     assert prepass.state == "failed" and "прогон" in prepass.failed
     assert prepass.passed == ["format", "lint", "tests", "types"], "steps stay listed"
-    standing = review_evidence.validation_standing(prepass, "")
+    standing = validation_standing(prepass, "")
     assert standing.verified is False
-    assert standing.state == review_evidence.VALIDATION_FAILED
+    assert standing.state == VALIDATION_FAILED
 
     ok = await _task(db)
     await _post(db, ok, GH.attempt(ok, SHA))
