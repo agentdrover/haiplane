@@ -46,6 +46,7 @@ from hub.db import fetchall, write_transaction
 from hub.integrations.registry import plugins
 from hub.services import ci_artifact, ci_contract
 from hub.services.ci_contract import CiContract
+from hub.services import validation_run
 from hub.services.ac_tests import record_ac_test_results
 from hub.services.validation_run import record_validation_result
 
@@ -689,13 +690,19 @@ async def write_evidence(
     recorded = await record_ac_test_results(db, task_id, ac, generation, source=key)
     status = str(row["validation_status"] or "").strip()
     if status == "fail" or (status == "pass" and green):
+        # #2208: the result is bound to the command list the RUN executed — the
+        # marker the collector left in the log, never the card as it reads now.
+        log_tail, commands_fp = validation_run.split_commands_fingerprint(
+            str(row["validation_log"] or "")
+        )
         await record_validation_result(
             db,
             task_id,
             generation=generation,
             status=status,
-            log_tail=row["validation_log"] or "",
+            log_tail=log_tail,
             source=key,
+            commands_fingerprint=commands_fp,
         )
     return recorded
 

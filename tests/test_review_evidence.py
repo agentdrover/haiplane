@@ -15,10 +15,13 @@ the author's word.
 
 from __future__ import annotations
 
+import json
+
 from httpx import AsyncClient
 
 from hub import repository as repo
 from hub.services import review_evidence
+from hub.services.validation_standing import author_run_lines
 
 # #1168's commit prefix, split so the secret scanner does not read a key.
 _PINNED_SHA = "1f047c" + "b7a91f" + "0" * 28
@@ -47,7 +50,7 @@ async def _submitted(client: AsyncClient, db, title: str, summary: str) -> int:
     return task_id
 
 
-async def _prepass(db, task_id: int, checks: dict) -> None:
+async def _prepass(db, task_id: int, checks: dict, **extra) -> None:
     from tests.ci_trust_support import accept_backed
 
     await accept_backed(
@@ -57,6 +60,7 @@ async def _prepass(db, task_id: int, checks: dict) -> None:
         ac_results={},
         checks=checks,
         reported_by="github-actions",
+        **extra,
     )
 
 
@@ -140,6 +144,76 @@ async def test_a_passing_prepass_needs_no_words(client: AsyncClient, db):
 
     tally = review_evidence.run_lines_tally([standing])
     assert tally == {**tally, "failed_with_run_lines": 0, "sample": 1}
+
+
+async def test_covered_prepass_with_failed_validation_is_not_passed(
+    client: AsyncClient, db
+):
+    # AC-1 (#2208): checks green is not "checked" while the card's
+    # validation_commands on the SAME commit failed. Measured on #2203: the
+    # brief said "Validation [passed] verified=True" beside its own "CI: fail",
+    # and the human at the gate read the first line as proof.
+    task_id = await _submitted(client, db, "Checks green, validation red", "Сделано.")
+    await repo.update_task(
+        db, task_id, validation_commands=json.dumps(["uv run ruff check ."])
+    )
+    await db.commit()
+    await _prepass(
+        db,
+        task_id,
+        {"lint": "pass", "tests": "pass"},
+        validation_status="fail",
+        validation_log="$ uv run ruff check .\nNo module named ruff",
+        reason="команда упала: uv run ruff check .",
+    )
+
+    s = await _surfaces(client, db, task_id)
+
+    standing = s["brief"]
+    assert standing.state != "passed"
+    assert standing.verified is False
+    # Both halves are named, and the checks' success is not thrown away with it.
+    assert "checks прошли: lint, tests" in standing.headline
+    assert "validation_commands: fail" in standing.headline
+    assert "команда упала: uv run ruff check ." in standing.headline
+    assert "Сдача НЕ проверена" in s["reviewer_prompt"]
+    assert "validation_commands: fail" in s["card"]
+    steward = dict(s["steward"]).get("checks_ran_on_the_submitted_commit", "")
+    assert "validation_commands" in steward
+
+    # A pass recorded for ANOTHER command list is not a pass for this card
+    # (#2208 round 2, finding 904733d690d68a7b): the brief said "прошли" about
+    # a result the current list never ran.
+    from hub.services import validation_run
+
+    await _prepass(
+        db,
+        task_id,
+        {"lint": "pass", "tests": "pass"},
+        validation_status="pass",
+        validation_log=validation_run.log_with_commands_fingerprint(
+            "$ uv run pytest -q\nok", ["uv run pytest -q"]
+        ),
+    )
+    s = await _surfaces(client, db, task_id)
+    assert s["brief"].state != "passed"
+    assert s["brief"].verified is False
+    assert "других validation_commands" in s["brief"].headline
+    assert "validation_commands: прошли" not in s["brief"].headline
+
+    # "Unknown" is not a pass either: the report named no outcome to stand on.
+    await _prepass(
+        db,
+        task_id,
+        {"lint": "pass", "tests": "pass"},
+        validation_status="unknown",
+        reason="исполнено и прошло 0 из 1; не являются командами (1)",
+    )
+    s = await _surfaces(client, db, task_id)
+    assert s["brief"].state not in {"passed", "failed"}
+    assert s["brief"].verified is False
+    assert "checks прошли: lint, tests" in s["brief"].headline
+    assert "validation_commands: неизвестно" in s["brief"].headline
 
 
 async def test_not_run_is_its_own_state(client: AsyncClient, db):
@@ -284,15 +358,14 @@ _RUN_LINES = (
 
 
 def test_every_line_about_a_run_is_quoted_and_nothing_else():
-    missed = [t for t in _RUN_LINES if review_evidence.author_run_lines(t) != [t]]
+    missed = [t for t in _RUN_LINES if author_run_lines(t) != [t]]
     assert not missed, f"lines about a run that were not quoted: {missed}"
     assert (
-        review_evidence.author_run_lines(
-            "Сделано. Поправил шаблон карточки; обновил документацию"
-        )
+        author_run_lines("Сделано. Поправил шаблон карточки; обновил документацию")
         == []
     )
     # One clause per line, several lines from one text.
-    assert review_evidence.author_run_lines(
-        "ruff: All checks passed; pytest: 0 passed, 3 failed"
-    ) == ["ruff: All checks passed", "pytest: 0 passed, 3 failed"]
+    assert author_run_lines("ruff: All checks passed; pytest: 0 passed, 3 failed") == [
+        "ruff: All checks passed",
+        "pytest: 0 passed, 3 failed",
+    ]

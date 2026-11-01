@@ -60,6 +60,7 @@ provenance — run id, URL, event, time — written inside each evidence block).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -273,18 +274,37 @@ def _command_head(entry: str) -> str | None:
     return entry[match.end() :].strip() or None
 
 
-def is_command(entry: str) -> bool:
-    """True when ``entry`` looks like something a shell can execute."""
+# #2208: why an entry was not executed. Two causes, two different fixes: prose
+# is written for a human, while a missing executable is a command whose runner
+# is not in this PATH (a project prefix such as `uv run` is missing). Reporting
+# both as "not a command" read, on #2203, as if `ruff check .` had been a note.
+_PROSE = "prose"
+_NOT_FOUND = "not_found"
+_NOT_FOUND_NOTE = (
+    "исполняемый файл не найден в PATH (возможно, нужен префикс раннера "
+    "проекта, например uv run)"
+)
+
+
+def command_problem(entry: str) -> str | None:
+    """``None`` when ``entry`` names a runnable executable, else why it does not."""
     entry = entry.strip()
     if not entry:
-        return False
+        return _PROSE
     head = _command_head(entry)
     if head is None:
-        return False
+        return _PROSE
     first = head.split()[0]
     if not COMMAND_TOKEN.match(first):
-        return False
-    return shutil.which(first) is not None
+        return _PROSE
+    if shutil.which(first) is None:
+        return _NOT_FOUND
+    return None
+
+
+def is_command(entry: str) -> bool:
+    """True when ``entry`` looks like something a shell can execute."""
+    return command_problem(entry) is None
 
 
 def ac_runner() -> list[str]:
@@ -619,6 +639,7 @@ def run_validation(
     ran = ran or {}
     logs: list[str] = []
     not_commands: list[str] = []
+    missing: list[str] = []
     executed = 0
     for cmd in commands:
         # #1103: judged ENTRY BY ENTRY. Prose still never reaches a shell —
@@ -629,10 +650,16 @@ def run_validation(
         # so one note written for a human suppressed every real command beside
         # it — measured on #1077, whose two entries begin with a real `gh` and
         # continue in prose: the step took 2s and nothing ran at all.
-        if not is_command(cmd):
-            not_commands.append(cmd)
-            logs.append(f"$ {cmd}\n[не команда: не исполнялась]")
-            log(f"validation {cmd[:120]!r}: not a command — not executed")
+        problem = command_problem(cmd)
+        if problem is not None:
+            if problem == _NOT_FOUND:
+                missing.append(cmd)
+                logs.append(f"$ {cmd}\n[не исполнялась: {_NOT_FOUND_NOTE}]")
+                log(f"validation {cmd[:120]!r}: {_NOT_FOUND_NOTE}")
+            else:
+                not_commands.append(cmd)
+                logs.append(f"$ {cmd}\n[не команда: не исполнялась]")
+                log(f"validation {cmd[:120]!r}: not a command — not executed")
             continue
         proven = already_proven(cmd, ran)
         if proven is not None:
@@ -684,22 +711,42 @@ def run_validation(
         logs.append(f"$ {cmd}\n{proc.stdout}{proc.stderr}")
         if proc.returncode != 0:
             return "fail", "\n".join(logs)[-_LOG_TAIL:], f"команда упала: {cmd}"
-    if not_commands:
+    if not_commands or missing:
         # Partial execution is NOT a pass. The vocabulary the hub accepts is
         # pass | fail | unknown | skipped, and `unknown` is the only honest
         # member here: some entries were never checked, so the list as a whole
         # proves nothing — even though everything runnable in it passed. The
         # reason says both halves, because "unknown" alone would hide that the
         # real commands did run and did pass.
-        shown = ", ".join(repr(c[:80]) for c in not_commands[:3])
-        more = f" и ещё {len(not_commands) - 3}" if len(not_commands) > 3 else ""
         return (
             "unknown",
             "\n".join(logs)[-_LOG_TAIL:],
-            f"исполнено и прошло {executed} из {len(commands)}; "
-            f"не являются командами ({len(not_commands)}): {shown}{more}",
+            _unchecked_reason(commands, executed, not_commands, missing),
         )
     return "pass", "\n".join(logs)[-_LOG_TAIL:], ""
+
+
+def _named(entries: list[str]) -> str:
+    shown = ", ".join(repr(c[:80]) for c in entries[:3])
+    return f"{shown} и ещё {len(entries) - 3}" if len(entries) > 3 else shown
+
+
+def _unchecked_reason(
+    commands: list[str], executed: int, not_commands: list[str], missing: list[str]
+) -> str:
+    """Why a partly checked list is not a pass, the two causes named apart (#2208)."""
+    parts: list[str] = []
+    if not_commands:
+        parts.append(
+            f"не являются командами ({len(not_commands)}): {_named(not_commands)}"
+        )
+    if missing:
+        parts.append(
+            f"исполняемый файл не найден в PATH ({len(missing)}): "
+            f"{_named(missing)} — возможно, нужен префикс раннера проекта, "
+            "например uv run"
+        )
+    return f"исполнено и прошло {executed} из {len(commands)}; " + "; ".join(parts)
 
 
 # The hub refuses a mutation report above 32 000 chars (#1270). Survivors are
@@ -885,6 +932,43 @@ RESULTS_SCHEMA = 1
 RESULTS_FILE = "results.json"
 
 
+def commands_fingerprint(commands: list[str]) -> str:
+    """The list this run executed, as a sha256 the hub can compare (#2208).
+
+    Canonical JSON, sort_keys, compact separators — the same shape the hub's
+    ci_contract.fingerprint_json produces from the same list. Order is part of
+    it: the commands run in order and stop at the first failure, so a reorder
+    proves something else. Without this the hub could only bind a result to
+    whatever the card says when the report arrives, which is not what ran.
+    """
+    canonical = json.dumps(
+        [str(c) for c in commands], sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+#: Same marker the hub parses out of validation_log (#2208). It is INSIDE the
+#: log because the trusted reporter runs from the default branch and refuses a
+#: results.json with an unknown top-level key (#1919): a key of our own would
+#: cost the whole report, marker and all.
+_COMMANDS_FP_MARK = "[validation-commands: {}]"
+REPORT_LOG_MAX = 4000
+
+
+def with_commands_fingerprint(
+    log_tail: str, commands: list[str], *, limit: int = REPORT_LOG_MAX
+) -> str:
+    """The log with the marker LAST, so the tail truncation cannot cut it.
+
+    The room the marker takes comes off the START of the tail, where the oldest
+    output already was; the total stays inside the hub's 4000-char field.
+    """
+    mark = _COMMANDS_FP_MARK.format(commands_fingerprint(commands))
+    room = max(0, limit - len(mark) - 1)
+    body = log_tail[-room:].strip("\n") if room and log_tail else ""
+    return f"{body}\n{mark}" if body else mark
+
+
 def build_results(task: dict, head_sha: str) -> dict:
     """Run the task's AC tests and validation; the report body."""
     nodeid_by_ac: dict[str, str] = {}
@@ -900,15 +984,14 @@ def build_results(task: dict, head_sha: str) -> dict:
         for ac_id, nodeid in nodeid_by_ac.items()
     }
 
+    commands = task.get("validation_commands") or []
     ran_commands = parse_ran_commands(env_get("HUB_CI_RAN"))
     if ran_commands:
         log(
             f"this job already ran {len(ran_commands)} command(s); "
             "their outcomes can be reused"
         )
-    v_status, v_log, v_reason = run_validation(
-        task.get("validation_commands") or [], ran_commands
-    )
+    v_status, v_log, v_reason = run_validation(commands, ran_commands)
 
     checks = parse_checks(env_get("HUB_CI_CHECKS"))
     if checks:
@@ -918,7 +1001,7 @@ def build_results(task: dict, head_sha: str) -> dict:
         "head_sha": head_sha,
         "ac_results": ac_results,
         "validation_status": v_status,
-        "validation_log": v_log,
+        "validation_log": with_commands_fingerprint(v_log, commands),
         "reason": v_reason,
         "reported_by": "github-actions",
         "checks": checks,

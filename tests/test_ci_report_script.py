@@ -133,6 +133,28 @@ def test_only_resolvable_executables_count_as_commands(script):
     assert script.is_command("&& echo hi") is False
 
 
+def test_missing_executable_is_not_called_prose(script, monkeypatch):
+    """AC-3 (#2208): "not a command" and "not found here" are different answers.
+
+    #2203 read `ruff check .` as prose, and `python -m pytest -q` ran a system
+    interpreter without pytest: both surfaced as the same shrug. A reader of
+    that log cannot tell a sentence from a command the RUNNER lacks — and the
+    second is fixed by a prefix (`uv run`), not by a new commit.
+    """
+    _only_executable_t(monkeypatch, script, names=("uv",))
+    prose = "Проверка на живом PR: смотри бриф"
+    status, log_tail, reason = script.run_validation(["ruff check .", prose])
+
+    assert status == "unknown", "a partly checked list still proves nothing"
+    assert "$ ruff check .\n[не команда" not in log_tail
+    assert "исполняемый файл не найден в PATH" in log_tail
+    assert "uv run" in log_tail, "name the fix, not only the symptom"
+    assert f"$ {prose}\n[не команда: не исполнялась]" in log_tail
+    assert "не являются командами (1)" in reason
+    assert "исполняемый файл не найден в PATH" in reason
+    assert "uv run" in reason
+
+
 def _only_executable_t(monkeypatch, script, names=("T", "ruff", "uv")):
     """Resolve only ``names`` as executables, whatever the real PATH holds."""
     monkeypatch.setattr(
@@ -795,6 +817,63 @@ def _capture_payload(script, monkeypatch) -> dict:
     monkeypatch.setattr(script, "hub_request", fake_request)
     assert script.main() == 0
     return seen
+
+
+def test_the_report_names_the_command_list_its_validation_came_from(
+    script, trusted, monkeypatch
+):
+    """#2208: the run says WHICH list it proved, and the reporter carries it.
+
+    The hub cannot bind a result to a list it only learns at intake — the card
+    may be edited between the run and the report. The list therefore travels as
+    a sha256 marker INSIDE validation_log: a key of its own would be refused by
+    the reporter that runs from the default branch (#1919), and the log is
+    compared with the artifact, so the marker is checked, not just forwarded.
+    """
+    from hub.services import ci_contract, validation_run
+
+    commands = ["uv run ruff check .", "uv run pytest -q"]
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("GITHUB_HEAD_REF", "task-2208/x")
+    monkeypatch.setenv("HEAD_SHA", "sha-head")
+    monkeypatch.setattr(
+        script, "run_validation", lambda cmds, ran=None: ("pass", "", "")
+    )
+    seen: dict = {}
+
+    def fake_request(url, token, payload=None):
+        if payload is None:
+            return {"acceptance_criteria": [], "validation_commands": commands}
+        seen.update(payload)
+        return {"applied": True, "reason": "ok"}
+
+    monkeypatch.setattr(script, "hub_request", fake_request)
+    assert script.main() == 0
+
+    clean, fingerprint = validation_run.split_commands_fingerprint(
+        seen["validation_log"]
+    )
+    assert fingerprint == ci_contract.validation_commands_fingerprint(commands)
+    assert fingerprint != ci_contract.validation_commands_fingerprint([]), (
+        "the list is part of what the result proves"
+    )
+    assert clean == "", "the marker rides inside the log the hub already reads"
+
+    # The reporter that ships from the default branch knows no such key: the
+    # marker must not make results.json unreadable for it.
+    facts = {"head_sha": SHA, "run_id": "9001", "event": "pull_request"}
+    body = trusted.parse_results(
+        json.dumps(
+            _results(validation_log=seen["validation_log"], head_sha=SHA)
+        ).encode(),
+        facts,
+        1686,
+        trusted.block_provenance(facts, "https://github.com", REPO),
+    )
+    assert validation_run.split_commands_fingerprint(body["validation_log"])[1] == (
+        fingerprint
+    )
 
 
 def test_the_mutation_report_is_sent_under_its_own_key(script, monkeypatch, tmp_path):

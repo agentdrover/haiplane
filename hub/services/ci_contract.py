@@ -36,6 +36,8 @@ CHECK_VOCABULARY: tuple[str, ...] = ("lint", "format", "types", "tests")
 #: Только файл прямо в каталоге workflow: подкаталог и ``..`` не пускаем.
 _WORKFLOW_RE = re.compile(r"^\.github/workflows/[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$")
 _FIELDS = frozenset({"workflow_path", "required_checks"})
+#: Сохранённый отпечаток — sha256 в hex. null/'' — записи, которых он не знает.
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
 #: Проект default (репозиторий самого хаба): контракт хаба не ослабляется.
 HUB_SLUG = "default"
 #: Отпечаток отсутствует: претензия ещё не проверена (или контракт неизвестен).
@@ -60,14 +62,32 @@ class CiContract:
         return tuple(n for n in CHECK_VOCABULARY if n in self.required_checks)
 
 
+def fingerprint_json(value: Any) -> str:
+    """sha256 канонического JSON: один формат отпечатка на весь хаб (#2208)."""
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def fingerprint_of(workflow_path: str, required_checks: Any) -> str:
     """sha256 канонического JSON ``{workflow_path, required_checks (sorted)}``."""
-    canonical = json.dumps(
-        {"workflow_path": workflow_path, "required_checks": sorted(required_checks)},
-        sort_keys=True,
-        separators=(",", ":"),
+    return fingerprint_json(
+        {"workflow_path": workflow_path, "required_checks": sorted(required_checks)}
     )
-    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def validation_commands_fingerprint(commands: Any) -> str:
+    """sha256 списка validation_commands — порядок входит в отпечаток (#2208).
+
+    Команды исполняются по порядку и останавливаются на первой ошибке, поэтому
+    перестановка меняет то, что доказано. Пустой список — отпечаток пустого
+    списка; «отпечатка нет» — это только NULL/'' у записей до #2208.
+    """
+    return fingerprint_json([str(c) for c in (commands or [])])
+
+
+def is_fingerprint(value: Any) -> bool:
+    """``value`` — сохранённый отпечаток (64 hex): тот, которого ждёт читатель."""
+    return isinstance(value, str) and _HEX64.match(value) is not None
 
 
 HUB_CONTRACT = CiContract(".github/workflows/ci.yml", tuple(sorted(CHECK_VOCABULARY)))
