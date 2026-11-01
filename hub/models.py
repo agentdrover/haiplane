@@ -284,6 +284,27 @@ class AgentFit(str, Enum):
     agentic = "agentic"
 
 
+class BehaviorDeltaMark(str, Enum):
+    """What the author said about changing product behavior (#2217).
+
+    unspecified — nothing said. The stored default; an empty or omitted value
+        is this, never ``no_delta``, so a bare card cannot pass for a decision.
+    delta — the author declares a behavior delta (its record is #2218).
+    no_delta — the author explicitly states the behavior does not change.
+    """
+
+    unspecified = "unspecified"
+    delta = "delta"
+    no_delta = "no_delta"
+
+
+def blank_is_unspecified(value: Any) -> Any:
+    """An explicit null or empty string is "nothing said", not a choice."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return BehaviorDeltaMark.unspecified
+    return value
+
+
 class RiskClass(str, Enum):
     """Blast-radius class of a task, R0 (harmless) to R5 (irreversible) (#581).
 
@@ -2539,6 +2560,9 @@ class TaskRefine(PlainSummaryInput):
     # ложится текст из карточки, а исполняет его служба с ключами, — это не
     # поле, а канал исполнения. "" очищает объявление.
     live_probe: str | None = Field(default=None, max_length=64)
+    # #2217: omitted = untouched (not in model_fields_set, so never written); an
+    # explicit null or "" is written as ``unspecified``, never as ``no_delta``.
+    behavior_delta: BehaviorDeltaMark | None = None
     # #1647: результат работы и способ отката. result_kind меняется только в
     # draft; после сдачи state-задачи rollback и AC заморожены до возврата в
     # работу (refinement._guard_state_statement).
@@ -2556,6 +2580,11 @@ class TaskRefine(PlainSummaryInput):
     prepared_at: str | None = Field(default=None, max_length=100)
     human_owner: str | None = Field(default=None, max_length=100)
     human_reviewer: str | None = Field(default=None, max_length=100)
+
+    @field_validator("behavior_delta", mode="before")
+    @classmethod
+    def _blank_behavior_delta(cls, v: Any) -> Any:
+        return blank_is_unspecified(v)
 
     @field_validator("risks")
     @classmethod
@@ -3310,6 +3339,14 @@ class TaskView(PlainSummaryView):
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
+    # #2217: stored default is ``unspecified``; a row without the column too.
+    behavior_delta: BehaviorDeltaMark = BehaviorDeltaMark.unspecified
+
+    @field_validator("behavior_delta", mode="before")
+    @classmethod
+    def _blank_behavior_delta(cls, v: Any) -> Any:
+        return blank_is_unspecified(v)
+
     # Shadow-mode risk class (#581): read-only surface, None = "not
     # computed" and is NOT the same thing as RiskClass.r0.
     risk_class: RiskClass | None = None

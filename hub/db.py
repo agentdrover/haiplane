@@ -216,6 +216,9 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "redesign_decision",
     "redesign_rationale",
     "agent_fit",
+    # #2217: what the author said about changing behavior; the column defaults
+    # to 'unspecified', and it is written by refine only.
+    "behavior_delta",
     # Risk class (#581) is read-path only: it is listed here so
     # structured_fields_from_row / TaskView surface it, but it is
     # deliberately absent from TaskCreate and TaskRefine — the class is

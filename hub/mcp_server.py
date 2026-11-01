@@ -5963,7 +5963,6 @@ async def hub_refine_task(
     Args:
         task_id: Task to refine.
         description: Statement text; "" clears it.
-        work_type: Kind of work.
         due_date: ISO date (fixed_date).
         user_story: As a / I want / so that.
         problem_statement: What is broken.
@@ -5978,17 +5977,15 @@ async def hub_refine_task(
         cause_kind: Defect cause class.
         technical_hints: Approach hints.
         scope_in: In scope.
-        scope_out: Out of scope.
         constraints: Hard limits.
         affected_areas: Paths hit.
         validation_commands: Proof commands.
         live_probe: Post-delivery probe name.
+        behavior_delta: unspecified|delta|no_delta.
         result_kind: Draft only.
         rollback: State undo.
         out_of_scope_for_review: Reviewer skips.
         review_checklist: Reviewer verifies.
-        human_owner: Who is accountable.
-        human_reviewer: Who accepts.
         freeze_rationale: Freeze admission reason.
         acceptance_criteria: Full AC replacement.
         risks: Full replacement.
