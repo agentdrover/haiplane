@@ -785,8 +785,8 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # #2026: блок ci_evidence получил поле expectation, ProfileDowngradeView — rules: REST-бриф и payload пакета стюарда; packet_hash прежний.
 # #1933: machine_review получил поле ac_tests_unread ([] у этой задачи): REST-бриф и payload пакета стюарда; packet_hash прежний.
 # #2208: блок prepass получил validation_declared/validation_status/validation_reason (у этой задачи команд нет): переснят REST-бриф и payload пакета стюарда; packet_hash прежний.
-GOLDEN_REST_BRIEF = "ebf12b705283b98c1497ee527b02a700c0fe766845d2be845d715c81259b4224"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "d0503ae872044baf5aaa3028c919fa953db851e221f9868d7ac270b5d7686a92"  # pragma: allowlist secret
+GOLDEN_REST_BRIEF = "90c1a164d7f89ebf5311bc6cf022db1bf26ab59168826d897211f1709134d985"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "c95335969e7a70d830ce2b363febeabba5703f28cd2b6b28a5549ec59a82698a"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 
@@ -1290,6 +1290,15 @@ _BAD: dict[str, tuple[str, Any]] = {
     "submission_generation": ("submission_generation", 9),
     "review_verdict_revision": ("review_verdict_revision", 9),
     "submission_sha": ("submission_sha", "f" * 40),
+    "behavior_snapshot": (
+        "behavior_snapshot",
+        {
+            "generation": 2,
+            "head_sha": "b" * 40,
+            "records": [],
+            "explicit_no_delta": True,
+        },
+    ),
     "current_branch_tip": ("current_branch_tip", "e" * 40),
     "sha_check": ("sha_check", "diverged"),
     "sha_check_reason": ("sha_check_reason", "другая причина"),

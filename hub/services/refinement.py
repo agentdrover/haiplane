@@ -34,7 +34,7 @@ from hub.models import (
     TaskRisk,
 )
 from hub.db import write_transaction, deserialize_str_list, fetchall, serialize_str_list
-from hub.services import cause_kind
+from hub.services import behavior_snapshot, cause_kind
 from hub.services.dor_snapshot import load_dor_snapshot
 from hub.services.readiness import parse_risks_from_row
 from hub.services.recommendations import calculate_readiness_with_recommendations
@@ -87,9 +87,6 @@ STATEMENT_FIELDS = frozenset(
         "validation_commands",
         "out_of_scope_for_review",
         "review_checklist",
-        # #2215: какие требования индекса задача показывает — часть того, что
-        # она утверждает. Правка списка пере-штампует дату постановки.
-        "requirement_ids",
         # #1236: какое поведение наблюдать после доставки — это часть того, что
         # задача утверждает, а не бухгалтерия вокруг неё. Правка объявления
         # пере-штампует дату постановки по той же причине, что и правка
@@ -555,6 +552,10 @@ async def _apply_refine_writes(
         risk_class=risk.value if risk is not None else None,
         risk_class_reasons=serialize_str_list(reasons),
     )
+    # #2218: черновик дельты или области после снимка не переписывает снимок,
+    # но старое одобрение задачу больше не завершает.
+    if {"behavior_delta", "affected_areas"} & set(updated_columns):
+        await behavior_snapshot.void_if_diverged(db, task_id)
 
     return updated_columns, ac_count
 

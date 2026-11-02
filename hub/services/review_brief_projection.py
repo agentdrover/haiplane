@@ -939,6 +939,18 @@ def _block_lines(blocks: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _snapshot_line(snap: Any) -> list[str]:
+    """Одна строка снимка в тексте брифа: поколение, head и число записей."""
+    if not isinstance(snap, dict) or not snap.get("head_sha"):
+        return []
+    mark = " explicit_no_delta" if snap.get("explicit_no_delta") else ""
+    count = len(snap.get("records") or [])
+    return [
+        f"BEHAVIOR SNAPSHOT gen {snap.get('generation')} "
+        f"head {snap['head_sha']} records {count}{mark}"
+    ]
+
+
 def _projection_summary(proj: dict[str, Any], exceeded: bool) -> str:
     warning = proj["self_review_warning"]
     lines: list[str] = []
@@ -948,6 +960,7 @@ def _projection_summary(proj: dict[str, Any], exceeded: bool) -> str:
             f"{warning.get('message', '')}\n{warning.get('hint', '')}\n"
         )
     lines.extend(_head_lines(proj))
+    lines.extend(_snapshot_line(proj.get("behavior_snapshot")))
     lines.extend(_verdict_lines(proj))
     lines.extend(_machine_lines(proj["machine_review"]))
     if proj["profile_downgrade"]:

@@ -77,6 +77,7 @@
     "models": {
       "modules": [
         "hub.models",
+        "hub.behavior_delta",
         "hub.plain_summary",
         "hub.cause_task_view",
         "hub.owner_minutes_view",

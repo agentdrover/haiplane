@@ -54,6 +54,7 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
     "submission_generation": (MANDATORY, ""),
     "review_verdict_revision": (MANDATORY, ""),
     "submission_sha": (MANDATORY, ""),
+    "behavior_snapshot": (MANDATORY, ""),
     "current_branch_tip": (MANDATORY, ""),
     "sha_check": (MANDATORY, ""),
     "sha_check_reason": (MANDATORY, ""),

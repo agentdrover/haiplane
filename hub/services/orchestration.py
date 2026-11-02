@@ -30,6 +30,7 @@ from hub.db import (
     log_activity,
     write_transaction,
 )
+from hub.services.behavior_snapshot import refusal_for_moved_head
 from hub.services.prevention_gate import hold_completion
 from hub.services.result_kind import automation_not_applicable
 from hub.services.resubmission_guard import commit_tail_work, stop_empty_done
@@ -3103,6 +3104,9 @@ def review_approved_for_current_submission(task: dict[str, Any]) -> bool:
     human decision closed does not count either (#1286) — the single
     predicate above owns both ways of ceasing to apply.
     """
+    if int(task.get("behavior_approval_void") or 0):
+        # #2218: черновик следующей дельты не даёт старому одобрению завершить задачу.
+        return False
     generation = task.get("submission_generation") or 0
     return (
         generation > 0
@@ -3162,6 +3166,10 @@ async def _approved_code_check(
             f"Сверка кода с одобрением НЕ проводилась: {tip_reason}. "
             f"Одобрен коммит {pinned[:12]}."
         )
+    # #2218: у сдачи со снимком новый head не оставляют исключением слияния базы.
+    moved = await refusal_for_moved_head(db, task, current_tip, pr_num)
+    if moved:
+        return moved, ""
     if current_tip != pinned:
         # #1233: вершина сдвинулась — но ЧЕМ? Если в ветку приехала только база,
         # авторская работа та же, и второй человеческий вердикт за неё — плата

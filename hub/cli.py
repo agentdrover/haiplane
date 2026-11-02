@@ -1263,7 +1263,6 @@ _REFINE_LIST_FIELDS: tuple[tuple[str, str], ...] = (
     ("assumption", "assumptions"),
     ("out_of_scope_review", "out_of_scope_for_review"),
     ("review_check", "review_checklist"),
-    ("requirement_id", "requirement_ids"),
 )
 
 
@@ -3054,12 +3053,6 @@ def build_parser() -> argparse.ArgumentParser:
         dest="affected_area",
         action="append",
         help="Affected area / module (repeatable)",
-    )
-    p_refine.add_argument(
-        "--requirement-id",
-        dest="requirement_id",
-        action="append",
-        help="Requirement id the task context should show (repeatable)",
     )
     p_refine.add_argument(
         "--validation",
