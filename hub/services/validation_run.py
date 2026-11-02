@@ -14,10 +14,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from typing import Any, Awaitable, Callable
 
 from hub import repository as repo
+from hub.services import ci_contract
 from hub.services.orchestration import project_git_context
 from hub.process_kill import kill_process_group
 
@@ -36,6 +38,70 @@ _LOG_TAIL = 4000
 # can emit gigabytes inside the timeout window and OOM the whole hub process,
 # not just its own task. Read up to the cap, drain the rest without keeping it.
 _MAX_OUTPUT = 1_000_000
+
+#: Where the collector records WHICH validation_commands list its result is
+#: about (#2208). It travels inside ``validation_log`` rather than as a key of
+#: its own: the artifact's key set is fixed by the trusted reporter that runs
+#: from the DEFAULT branch (#1919), so a new top-level key is refused before the
+#: hub ever sees the report. The log is compared with the artifact verbatim, so
+#: the marker is tamper-evident, not merely forwarded.
+_COMMANDS_FP_MARK = "[validation-commands: {}]"
+_COMMANDS_FP_RE = re.compile(r"\[validation-commands: ([0-9a-f]{64})\]\s*$")
+#: hub/models CIRunReportSubmit.validation_log — the marker must fit inside it.
+REPORT_LOG_MAX = 4000
+
+
+def log_with_commands_fingerprint(
+    log_tail: str, commands: Any, *, limit: int = REPORT_LOG_MAX
+) -> str:
+    """The log with the marker of the list it proves, kept inside ``limit``.
+
+    The marker goes LAST: both ends keep the tail, so the end is what survives.
+    The room it takes is cut from the START of the tail, where the oldest output
+    already was.
+    """
+    mark = _COMMANDS_FP_MARK.format(
+        ci_contract.validation_commands_fingerprint(commands)
+    )
+    room = max(0, limit - len(mark) - 1)
+    body = (log_tail or "")[-room:].strip("\n") if room else ""
+    return f"{body}\n{mark}" if body else mark
+
+
+#: Одна причина на все места: результат получен для другого списка команд.
+STALE_COMMANDS_REASON = (
+    "validation_commands: результат получен для других "
+    "validation_commands — нужен отчёт с отпечатком текущего списка"
+)
+
+
+def stale_commands_reason(commands: Any, log_tail: str) -> str | None:
+    """Почему результат из ``log_tail`` не покрывает ``commands`` (#2208).
+
+    ``None``, когда лог не называет списка: запись до отпечатка читается как
+    раньше (AC-2), а не как устаревшая. ``commands`` — список или JSON карточки.
+    """
+    _, recorded = split_commands_fingerprint(log_tail or "")
+    if not recorded:
+        return None
+    if isinstance(commands, str):
+        try:
+            commands = json.loads(commands or "[]")
+        except ValueError:
+            commands = []
+    if recorded == ci_contract.validation_commands_fingerprint(commands):
+        return None
+    return STALE_COMMANDS_REASON
+
+
+def split_commands_fingerprint(log_tail: str) -> tuple[str, str]:
+    """``(log without the marker, fingerprint)`` — fingerprint is "" when unnamed."""
+    text = log_tail or ""
+    match = _COMMANDS_FP_RE.search(text)
+    if match is None:
+        return text, ""
+    return text[: match.start()].strip("\n"), match.group(1)
+
 
 # runner(commands, repo_path) -> (returncode, log_tail) or None if it could not run.
 ValidationRunner = Callable[[list[str], str | None], Awaitable[tuple[int, str] | None]]
@@ -303,12 +369,18 @@ async def record_validation_result(
     status: str,
     log_tail: str = "",
     source: str = "manual",
+    commands_fingerprint: str = "",
 ) -> dict:
     """Write the validation outcome for ``generation``. Does NOT commit (#546).
 
     The one write path for validation results, shared by the local runner
     (#509) and the CI report intake (#546). Callers own the transaction so the
     submission path can land these fields inside its own write lock.
+
+    ``commands_fingerprint`` (#2208) is the list this result was obtained for:
+    ``validation_gap`` compares it with the card's current commands, so a pass
+    does not survive an edit of the very commands it proves. Empty = a result
+    that names no list (written before #2208); it reads as before.
     """
     await repo.update_task(
         db,
@@ -317,6 +389,7 @@ async def record_validation_result(
         validation_status=status,
         validation_log=log_tail,
         validation_source=source,
+        validation_commands_fp=commands_fingerprint or None,
     )
     return {"status": status, "generation": generation}
 
@@ -351,7 +424,12 @@ async def run_validation_commands(
         rc, log_tail = result
         status = PASS if rc == 0 else FAIL
     out = await record_validation_result(
-        db, task_id, generation=generation, status=status, log_tail=log_tail
+        db,
+        task_id,
+        generation=generation,
+        status=status,
+        log_tail=log_tail,
+        commands_fingerprint=ci_contract.validation_commands_fingerprint(commands),
     )
     await db.commit()
     return out
@@ -361,7 +439,8 @@ def validation_gap(task: dict) -> str | None:
     """None when the current validation result is green; else a reason (#510).
 
     A gap exists when the task has validation_commands but the recorded result
-    is missing / stale (wrong generation) / not ``pass``. No commands ⇒ no gap.
+    is missing / stale (wrong generation) / obtained for OTHER commands / not
+    ``pass``. No commands ⇒ no gap.
     """
     commands = task.get("validation_commands")
     if isinstance(commands, str):
@@ -373,6 +452,14 @@ def validation_gap(task: dict) -> str | None:
         return "validation_commands: результат записан до сверки CI с GitHub (unverified, legacy)"
     if task.get("validation_generation") != generation:
         return "validation_commands не прогонялись для текущего поколения"
+    # #2208: the pass belongs to the list it was obtained for. Changing the
+    # card's commands leaves the old result standing unless this comparison
+    # exists — the old pass would outlive the very commands it proved.
+    recorded = str(task.get("validation_commands_fp") or "")
+    if recorded and not recorded == ci_contract.validation_commands_fingerprint(
+        commands
+    ):
+        return STALE_COMMANDS_REASON
     if task.get("validation_status") != PASS:
         return f"validation_commands не прошли: статус {task.get('validation_status')}"
     return None

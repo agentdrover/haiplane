@@ -49,6 +49,7 @@ from hub.services.author_answers import undisposed_findings
 from hub.integrations.registry import plugins
 from hub.services.brief_failure import failure_from, public_reason
 from hub.models import ReviewInFlight
+from hub.services.validation_standing import VALIDATION_NOT_RUN, validation_standing
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from hub.models import ReviewReport
@@ -583,6 +584,48 @@ async def ci_evidence_state(db, task: dict):
     return CIEvidenceState(mutations=mutations, baseline=baseline)
 
 
+async def _validation_of_report(
+    db, task: dict, report: dict[str, Any]
+) -> dict[str, Any]:
+    """The card's validation_commands as THIS report recorded them (#2208).
+
+    Read from the same confirmed row the prepass came from, so the two halves of
+    "checked" can never come from different reports. ``declared`` separates "the
+    card names commands" from "there is nothing to prove": an unknown outcome
+    blocks "checked" only in the first case.
+    """
+    commands = task.get("validation_commands")
+    if commands is None:
+        row = await repo_module.get_task(db, int(task.get("id") or 0))
+        commands = dict(row).get("validation_commands") if row is not None else None
+    if isinstance(commands, str):
+        try:
+            commands = json.loads(commands or "[]")
+        except ValueError:
+            commands = []
+    status = str(report.get("validation_status") or "").strip()
+    reason = str(report.get("reason") or "").strip()
+    # #2208: the report's own marker names the list it ran. A pass obtained for
+    # another list is not a pass for this card, however green the report is.
+    from hub.services.validation_run import stale_commands_reason
+
+    stale = stale_commands_reason(commands, str(report.get("validation_log") or ""))
+    if stale and commands:
+        status, reason = "stale", stale
+    if not reason:
+        tail = [
+            line
+            for line in str(report.get("validation_log") or "").splitlines()
+            if line.strip()
+        ]
+        reason = tail[-1][:200] if tail else ""
+    return {
+        "validation_declared": bool(commands),
+        "validation_status": status,
+        "validation_reason": reason,
+    }
+
+
 async def prepass_state(db, task: dict):
     """Which deterministic checks passed on the commit under review (#875).
 
@@ -631,6 +674,9 @@ async def prepass_state(db, task: dict):
     passed = sorted(k for k, v in checks.items() if v == CHECK_PASS)
     failed = sorted(k for k, v in checks.items() if v == CHECK_FAIL)
     skipped = sorted(k for k, v in checks.items() if v == CHECK_SKIPPED)
+    # #2208: the card's validation_commands, from this very report — the second
+    # half of "checked", which the checks list never spoke for.
+    validation = await _validation_of_report(db, task, dict(row))
     # #1687: the run as a whole counts, not only its steps. A run that ended in
     # anything but success is a failed prepass even when each step it names
     # passed; the steps stay listed on their own.
@@ -647,6 +693,7 @@ async def prepass_state(db, task: dict):
             failed=failed,
             skipped=skipped,
             head_sha=pinned,
+            **validation,
         )
     return PrepassState(
         # A failed check is louder than a passing one: it means the code under
@@ -662,6 +709,7 @@ async def prepass_state(db, task: dict):
         failed=failed,
         skipped=skipped,
         head_sha=pinned,
+        **validation,
     )
 
 
@@ -706,106 +754,6 @@ def _prepass_lines(state) -> str:
     if state.skipped:
         lines.append(f"Пропущены (ничего не доказывают): {', '.join(state.skipped)}.")
     return " ".join(lines)
-
-
-# --- The prepass over the author's word (#1246) ------------------------------
-#
-# Spike #1168 went to review with a FAILED prepass while its text listed green
-# runs of lint, security and the budget; the full suite was never run. The hub
-# cannot see how an author ran a command, so an "rc=0" in a submission stays a
-# word. The rule: the prepass the hub ran is the only basis for "checked"; the
-# author's lines about runs stay visible, quoted as his.
-#
-# The hub does NOT judge what those lines mean. Three review rounds tried to
-# tell "green claimed" from "failure described" with regular expressions and
-# each round found a new negation ("0 passed, 3 failed", "rc=0 не получен",
-# "rc=0, no failures", "expected rc=0, got rc=1"). The owner's decision of
-# 24.09: extract broadly, quote, and hand the comparison to a human whenever
-# the prepass failed and the author wrote about runs at all.
-
-AUTHOR_WORD = "СЛОВО АВТОРА"
-
-# Broad on purpose: any line that talks about a run, whatever it says of it.
-_RUN_WORD_RE = re.compile(
-    r"\brc\s*=|\bexit(?:\s+code)?\b|\bpassed\b|\bfailed\b|\bgreen\b|"
-    r"зел[её]н|all checks",
-    re.IGNORECASE,
-)
-_CLAUSE_SPLIT_RE = re.compile(r"[;\n]|\.\s")
-_MAX_CLAIMS = 5
-_MAX_CLAIM_LEN = 100
-
-VALIDATION_PASSED = "passed"
-VALIDATION_FAILED = "failed"
-VALIDATION_NOT_RUN = "not_run"
-
-
-def author_run_lines(text: str) -> list[str]:
-    """The clauses of a submission text that talk about a run — his word.
-
-    No judgement of meaning: a clause is taken when it names a run at all.
-    """
-    out: list[str] = []
-    for clause in _CLAUSE_SPLIT_RE.split(text or ""):
-        clause = clause.strip()
-        if clause and _RUN_WORD_RE.search(clause) and clause not in out:
-            out.append(clause[:_MAX_CLAIM_LEN])
-        if len(out) >= _MAX_CLAIMS:
-            break
-    return out
-
-
-def validation_standing(prepass, submission_text: str):
-    """Whether the submission is checked: the prepass decides, the text does not.
-
-    Three states, never two: a prepass that did not run is neither a pass nor
-    a failure. ``needs_human_compare`` is set only where the prepass FAILED
-    and the author wrote about runs — the hub cannot tell whether his lines
-    agree with the failure, so a human compares them.
-    """
-    from hub.models import ValidationStanding
-
-    lines = author_run_lines(submission_text)
-    word = f"{AUTHOR_WORD}: «{'; '.join(lines)}»" if lines else ""
-    sha = (prepass.head_sha or "")[:12] or "—"
-    if prepass.state == "covered":
-        headline = (
-            f"Сдача проверена предпасом хаба на {sha}: прошли "
-            f"{', '.join(prepass.passed)}."
-        )
-        if lines:
-            headline += f" {word} — основанием не служит."
-        return ValidationStanding(
-            state=VALIDATION_PASSED,
-            verified=True,
-            author_run_lines=lines,
-            headline=headline,
-        )
-    if prepass.state == "failed":
-        headline = (
-            f"Сдача НЕ проверена: предпас хаба на {sha} упал "
-            f"({', '.join(prepass.failed)})."
-        )
-        if lines:
-            headline += (
-                f" Предпас упал; автор пишет: {word}. "
-                "Сверяет человек — смысл строк хаб не судит."
-            )
-        return ValidationStanding(
-            state=VALIDATION_FAILED,
-            author_run_lines=lines,
-            needs_human_compare=bool(lines),
-            headline=headline,
-        )
-    headline = (
-        f"Сдача НЕ проверена: предпас не запускался — {prepass.reason}. "
-        "Это не «прошёл» и не «упал»."
-    )
-    if lines:
-        headline += f" {word} — предпасом не подтверждено."
-    return ValidationStanding(
-        state=VALIDATION_NOT_RUN, author_run_lines=lines, headline=headline
-    )
 
 
 async def latest_submission_text(db, task_id: int) -> str:

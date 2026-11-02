@@ -951,6 +951,7 @@ async def test_the_steward_packet_asks_before_it_builds_the_brief(db, monkeypatc
 
 async def test_a_run_that_failed_is_not_a_checked_submission(db):
     from hub.services import review_evidence
+    from hub.services.validation_standing import VALIDATION_FAILED, validation_standing
 
     task_id = await _task(db)
     await _post(
@@ -962,9 +963,9 @@ async def test_a_run_that_failed_is_not_a_checked_submission(db):
     prepass = await review_evidence.prepass_state(db, task)
     assert prepass.state == "failed" and "прогон" in prepass.failed
     assert prepass.passed == ["format", "lint", "tests", "types"], "steps stay listed"
-    standing = review_evidence.validation_standing(prepass, "")
+    standing = validation_standing(prepass, "")
     assert standing.verified is False
-    assert standing.state == review_evidence.VALIDATION_FAILED
+    assert standing.state == VALIDATION_FAILED
 
     ok = await _task(db)
     await _post(db, ok, GH.attempt(ok, SHA))
@@ -2148,6 +2149,64 @@ async def test_a_done_report_is_judged_on_the_tip_it_completes_not_on_the_pinned
     else:
         await lifecycle.add_update(db, task_id, done)
         assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+async def test_a_tip_pass_proves_only_the_command_list_it_ran(db, monkeypatch):
+    """#2208 round 2 (finding 904733d690d68a7b): the tip's pass has its own list.
+
+    The gate read "validation pass" from the tip's report and threw the task's
+    staleness away. With the card's commands edited after the pass, the result
+    of the OLD list completed the work on a new tip — бриф при этом говорил
+    "прошли" про список, который никто не запускал.
+    """
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from hub import config
+    from hub.models import TaskUpdateCreate
+    from hub.services import lifecycle, validation_run
+
+    tip = "sha-tip-c"
+    commands = ["uv run ruff check ."]
+    other = ["uv run pytest -q"]
+    marker = validation_run.log_with_commands_fingerprint
+    monkeypatch.setattr(config, "SDD_VALIDATION", "require")
+    task_id = await _task(db)  # pinned SHA = A, generation 1
+    await repo.update_task(db, task_id, validation_commands=json.dumps(commands))
+    await db.commit()
+    await _post(
+        db,
+        task_id,
+        GH.attempt(task_id, SHA, run_id="9701", validation_log=marker("ok", commands)),
+    )
+    await _post(
+        db,
+        task_id,
+        GH.attempt(task_id, tip, run_id="9702", validation_log=marker("ok", other)),
+    )
+    await repo.update_task(db, task_id, status="running", auto_review=0)
+    await db.commit()
+    monkeypatch.setattr(
+        lifecycle, "resolve_branch_tip", AsyncMock(return_value=(tip, ""))
+    )
+    done = TaskUpdateCreate(agent="dev", kind="done", content="done")
+
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.add_update(db, task_id, done)
+    assert refused.value.status_code == 422
+    assert "validation_failed" in str(refused.value.detail)
+    assert "других validation_commands" in str(refused.value.detail)
+    assert dict(await repo.get_task(db, task_id))["status"] != "completed"
+
+    # The same tip, but its attempt ran the CURRENT list: the work is covered.
+    await _post(
+        db,
+        task_id,
+        GH.attempt(task_id, tip, run_id="9703", validation_log=marker("ok", commands)),
+    )
+    await lifecycle.add_update(db, task_id, done)
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
 
 
 async def test_validation_written_from_another_commit_does_not_cover_the_work(

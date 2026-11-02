@@ -72,6 +72,7 @@ from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
 from hub.services.rule_catalogue import rules_for_areas
 from hub.services.statement_freshness import statement_freshness
+from hub.services.validation_standing import validation_standing
 from hub.services.task_diff import _is_missing
 from hub.services.test_existence import resolve_locators_at_ref
 
@@ -898,7 +899,7 @@ async def build_review_brief(
     )
     # #1246: the prepass decides whether the submission is checked; the
     # submission text only contributes the author's word beside it.
-    validation = review_evidence.validation_standing(prepass, latest_submission_summary)
+    validation = validation_standing(prepass, latest_submission_summary)
 
     # #615: the statement the reviewer is judging may predate the work that
     # invalidated it. Same computation as pair-start, one source.

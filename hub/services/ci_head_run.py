@@ -42,6 +42,8 @@ from hub.integrations import git_ops as git_ops_mod
 from hub.integrations.protocols import CIRunRequestOutcome
 from hub.integrations.registry import plugins
 from hub.services import ci_contract, ci_trust, project_policy, watch_notices
+from hub.services.validation_run import FAIL as VALIDATION_FAIL
+from hub.services.validation_run import UNKNOWN as VALIDATION_UNKNOWN
 
 log = logging.getLogger("hub")
 
@@ -597,6 +599,14 @@ async def request_for_new_heads(
 
 # ---- объявление итога --------------------------------------------------------
 
+#: Validation outcomes that contradict a green GitHub run (#2208): the run
+#: succeeded, the card's commands on that same commit did not.
+_DISAGREEING_VALIDATION = frozenset({VALIDATION_FAIL, VALIDATION_UNKNOWN})
+_VALIDATION_NOTE = {
+    VALIDATION_FAIL: "validation_commands карточки на этом коммите не прошли",
+    VALIDATION_UNKNOWN: "итог validation_commands карточки не назван",
+}
+
 
 def _announcement(row: Mapping[str, Any], stale: bool) -> str:
     conclusion = ci_trust.run_conclusion(row) or "итог не назван"
@@ -604,7 +614,20 @@ def _announcement(row: Mapping[str, Any], stale: bool) -> str:
         f"CI на sha {str(row['head_sha'])[:12]}: {conclusion} "
         f"(run {row['run_id']}, попытка {row['run_attempt']})"
     )
-    return f"{text}; голова уже другая" if stale else text
+    if stale:
+        text += "; голова уже другая"
+    # #2208: the run's conclusion and the hub's own validation of the card's
+    # commands are TWO facts about one sha. On #2203 this line said success
+    # while validation_status was fail, and the green word was read as both.
+    # The second outcome is named only when it is known and disagrees: an
+    # agreed pair, or a validation that never ran, adds nothing here.
+    validation = str(row.get("validation_status") or "").strip()
+    if conclusion == ci_trust.SUCCESS and validation in _DISAGREEING_VALIDATION:
+        text += (
+            f"; validation хаба: {validation} — GitHub-прогон зелёный, а "
+            f"{_VALIDATION_NOTE[validation]}"
+        )
+    return text
 
 
 def _in_scope_for_read(scope: _Scope) -> bool:

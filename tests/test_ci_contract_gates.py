@@ -330,3 +330,67 @@ async def test_a_refresh_under_no_contract_asks_and_writes_nothing(db, monkeypat
     # Called quietly it never raises, and leaves nothing confirmed.
     await ci_trust.refresh_quietly(db, task_id, SAT_SHA)
     assert await ci_trust.pass_gap(db, task_id, SAT_SHA) is not None
+
+
+# --- The two outcomes of one sha are never merged into one word (#2208) ------
+
+
+def test_feed_line_names_validation_fail_on_green_run():
+    """AC-4: "CI на sha …: success" out of the run alone beside a red validation.
+
+    On #2203 the feed said success (GitHub's conclusion) while the hub's own
+    validation of the card's commands was fail. Two facts, one line, and the
+    line named only the flattering one.
+    """
+    from hub.services import ci_head_run
+
+    row = {
+        "head_sha": "1665ab88" + "0" * 32,
+        "run_id": "41222299175",
+        "run_attempt": "1",
+        "provenance": json.dumps({"run_conclusion": "success"}),
+        "validation_status": "fail",
+    }
+    text = ci_head_run._announcement(row, False)
+    assert "CI на sha 1665ab880000" in text
+    assert "success" in text
+    assert "validation хаба: fail" in text
+
+    # Disagreeing is what earns the second half: an agreed pair says it once,
+    # and an unread validation is not announced as a result.
+    for status in ("pass", "", "skipped"):
+        row["validation_status"] = status
+        assert "validation хаба" not in ci_head_run._announcement(row, False), status
+
+
+async def test_review_not_bought_hint_for_validation_only_failure(db):
+    """AC-5: when only validation_commands failed, the way out is not a new commit.
+
+    The old wording — "исправить и пересдать" — read as "your code is broken",
+    and on #2203 the author changed the commit instead of the card's commands.
+    """
+    from hub.services import review_ci_gate
+
+    _pid, task_id = await satellite_task(db)
+    await base._post(db, task_id, base._sat_attempt(task_id, validation_status="fail"))
+    task = dict(await repo.get_task(db, task_id))
+    assert await review_ci_gate.review_may_be_bought(db, task, None) is False
+
+    alerts = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    [line] = [text for text in alerts if text.startswith("Ревью не куплено")]
+    assert "validation_commands" in line
+    assert "перезапустить CI на том же sha" in line
+    assert "новый коммит не нужен" in line
+    assert "исправить" not in line, "the code is not what failed"
+
+    # A failed required check keeps the old wording: there the code IS the problem.
+    _pid2, task_id2 = await satellite_task(db, slug="sat2")
+    await base._post(
+        db, task_id2, base._sat_attempt(task_id2, checks={"tests": "fail"})
+    )
+    task2 = dict(await repo.get_task(db, task_id2))
+    assert await review_ci_gate.review_may_be_bought(db, task2, None) is False
+    alerts2 = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id2)]
+    [line2] = [text for text in alerts2 if text.startswith("Ревью не куплено")]
+    assert "исправить и пересдать" in line2
+    assert "validation_commands" not in line2

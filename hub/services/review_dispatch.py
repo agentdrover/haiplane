@@ -3810,11 +3810,12 @@ async def prepare_review_order(
     # this module's siblings, and the top-level cycle is the reason every
     # other cross-service call in this file is local too.
     from hub.services import review_evidence
+    from hub.services.validation_standing import validation_standing
 
     prepass = await review_evidence.prepass_state(db, task)
     # #1246: the reviewer is told whether the submission is checked — by the
     # prepass — and sees the author's lines about runs only as his word.
-    validation = review_evidence.validation_standing(
+    validation = validation_standing(
         prepass, await review_evidence.latest_submission_text(db, task_id)
     )
     only_tests = await _only_tests_of(ctx, diff)

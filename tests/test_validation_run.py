@@ -102,6 +102,76 @@ def test_safe_env_strips_secrets(monkeypatch):
     assert env.get("SAFE_VAR") == "ok"
 
 
+async def test_changed_commands_make_result_stale(db):
+    # AC-2 (#2208): a recorded pass belongs to the commands it was obtained
+    # for. On #2203 the card named commands the runner could not execute;
+    # fixing that list would have inherited the old verdict for the whole
+    # generation — in both directions, an old pass surviving stricter commands
+    # too.
+    from hub.services import ci_contract
+    from tests.ci_trust_support import SAT_SHA, accept_backed, satellite_task
+
+    commands = ["uv run ruff check ."]
+    task_id = await _task(db, commands=commands)
+
+    async def fake(cmds, repo_path):
+        return (0, "ok")
+
+    await run_validation_commands(db, task_id, runner=fake)
+    row = dict(await repo.get_task(db, task_id))
+    assert validation_run.validation_gap(row) is None
+    assert row["validation_commands_fp"] == (
+        ci_contract.validation_commands_fingerprint(commands)
+    )
+
+    # The card now names other commands: the recorded pass is about the old ones.
+    await repo.update_task(
+        db, task_id, validation_commands=json.dumps([*commands, "uv run pytest -q"])
+    )
+    await db.commit()
+    gap = validation_run.validation_gap(dict(await repo.get_task(db, task_id)))
+    assert gap and "других validation_commands" in gap
+
+    # A record without a fingerprint (written before #2208) reads as before:
+    # the fingerprint binds new results, it does not reinterpret old ones.
+    await repo.update_task(db, task_id, validation_commands_fp=None)
+    await db.commit()
+    assert validation_run.validation_gap(dict(await repo.get_task(db, task_id))) is None
+
+    # The CI report names the list it executed INSIDE its validation log (the
+    # artifact's key set is fixed by the reporter that ships from the default
+    # branch): the hub binds the result to that, never to the card at intake.
+    _pid, sat = await satellite_task(db, contract=None)
+    await repo.update_task(db, sat, validation_commands=json.dumps(commands))
+    await db.commit()
+    report_log = validation_run.log_with_commands_fingerprint(
+        "$ uv run ruff check .\nAll checks passed!", commands
+    )
+    await accept_backed(
+        db,
+        sat,
+        head_sha=SAT_SHA,
+        ac_results={},
+        checks={"lint": "pass"},
+        validation_status="pass",
+        validation_log=report_log,
+    )
+    row = dict(await repo.get_task(db, sat))
+    assert row["validation_status"] == "pass"
+    assert row["validation_commands_fp"] == (
+        ci_contract.validation_commands_fingerprint(commands)
+    )
+    assert "[validation-commands:" not in (row["validation_log"] or ""), (
+        "the marker is not part of the log people read"
+    )
+    await repo.update_task(
+        db, sat, validation_commands=json.dumps(["uv run pytest -q"])
+    )
+    await db.commit()
+    gap = validation_run.validation_gap(dict(await repo.get_task(db, sat)))
+    assert gap and "других validation_commands" in gap
+
+
 async def test_runner_kills_timed_out_command(monkeypatch, tmp_path):
     # The timed-out child used to survive: wait_for cancels only the read, and
     # every retry leaked another live process into the workspace.

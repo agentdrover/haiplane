@@ -729,7 +729,7 @@ def _commit_signal(brief: ReviewBrief) -> list[tuple[str, str]]:
     # the author's lines about runs for a human to compare. Derived here by the
     # function the brief uses, from the same two fields, rather than read from
     # a third one that could disagree with them.
-    from hub.services.review_evidence import validation_standing
+    from hub.services.validation_standing import validation_standing
 
     standing = validation_standing(prepass, brief.latest_submission_summary)
     if not standing.verified:
