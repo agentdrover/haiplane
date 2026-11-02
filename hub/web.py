@@ -46,6 +46,7 @@ from hub.csrf import CSRF_FIELD_NAME
 from hub.hub_instance import hub_base_url
 from hub.csrf import token_for_request as csrf_token_for_request
 from hub.integrations.registry import plugins
+from hub.services.gate_events import is_reserved_actor_name, reserved_actor_detail
 from hub.services import admin as admin_svc
 from hub.services import card_actions, card_c2, card_sheet
 from hub.services import chat_pair as chat_pair_svc
@@ -3685,6 +3686,14 @@ async def web_review_verdict(
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
+    if is_reserved_actor_name(identity.username):
+        # Форма пишет вердикт под именем пользователя: то же имя, что API
+        # отвергает в поле agent (#2147).
+        return _review_form_error(
+            request,
+            task_id,
+            _verdict_refusal_text(reserved_actor_detail(identity.username)),
+        )
     self_approved = services.ensure_reviewer_independence(
         dict(row),
         is_agent=identity.is_agent,
