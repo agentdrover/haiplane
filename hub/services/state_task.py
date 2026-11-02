@@ -41,6 +41,7 @@ from hub.models import (
     TaskView,
 )
 from hub.services import (
+    behavior_snapshot,
     owner_minutes,
     prevention_gate,
     state_evidence,
@@ -285,6 +286,7 @@ async def submit_state(
     async with write_transaction(db):
         fresh = dict(lc._existing_task(await repo.get_task(db, task_id), task_id))
         _require_submittable(fresh)
+        await behavior_snapshot.refuse_if_unspecified(db, fresh)
         ac_rows = [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
         gaps = _statement_gaps(fresh, ac_rows)
         if gaps:

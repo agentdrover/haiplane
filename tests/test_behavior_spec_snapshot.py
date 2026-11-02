@@ -19,10 +19,10 @@ from hub import repository as repo
 from hub.integrations.git_ops import GitOpsIntegration
 from hub.integrations.registry import plugins
 from hub.mcp_server import hub_get_review_brief, hub_submit_for_review
-from hub.services import spec_index
+from hub.services import behavior_snapshot, spec_index
 from hub.services.spec_format import parse_spec_file, requirement_revision
 from tests.cli_support import _run_main
-from tests.state_support import make_state_task
+from tests.state_support import evidence_for, make_state_task, submit
 from tests.test_behavior_spec_index import AUTH_SPEC, BRANCH, Origin
 from tests.test_mcp_server import _mcp_structured, _mcp_text
 
@@ -626,3 +626,71 @@ async def test_no_delta_inside_gate_still_freezes_empty_snapshot(
     assert frozen["records"] == []
     assert frozen["explicit_no_delta"] is True
     assert frozen["head_sha"] == S1
+
+
+def _flip_after_first_check(monkeypatch, task_id: int, name: str, later: str):
+    """После первой проверки дельты подменяет строку: так refine обгоняет лок."""
+    real = getattr(behavior_snapshot, name)
+    calls = {"n": 0}
+
+    async def wrapped(db, *args, **kwargs):
+        calls["n"] += 1
+        outcome = await real(db, *args, **kwargs)
+        if calls["n"] == 1:
+            await repo.update_task(db, task_id, behavior_delta=later)
+            await db.commit()
+        return outcome
+
+    monkeypatch.setattr(behavior_snapshot, name, wrapped)
+    return calls
+
+
+async def test_state_delta_is_reread_under_the_lock(
+    client: AsyncClient, db, origin: Origin, project_id: int, monkeypatch
+):
+    """Пока state-сдача ждёт лок, refine на unspecified отвергается, поколения нет."""
+    await _indexed_revision(db, origin, project_id)
+    task_id = await make_state_task(
+        db, project_id=project_id, status="running", plan=True
+    )
+    await repo.update_task(db, task_id, behavior_delta="no_delta")
+    await db.commit()
+    calls = _flip_after_first_check(
+        monkeypatch, task_id, "refuse_if_unspecified", "unspecified"
+    )
+    resp = await submit(client, task_id, evidence_for(("AC-1", "AC-2")))
+    assert resp.status_code == 422, resp.text
+    assert _detail(resp)["reason"] == "behavior_unspecified"
+    assert calls["n"] >= 2
+    card = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert card["status"] == "running"
+    assert card["submission_generation"] == 0
+    assert await _snapshot_row(db, task_id, 1) is None
+
+
+async def test_commit_delta_is_reread_under_the_lock(
+    client: AsyncClient, db, origin: Origin, project_id: int, monkeypatch
+):
+    """Снимок commit-сдачи берётся из строки под локом, не из чтения до него."""
+    await _indexed_revision(db, origin, project_id)
+    task_id = await _task(
+        client,
+        db,
+        project_id,
+        behavior_delta=[_record("added", "REQ-1")],
+    )
+    await _pair(client, task_id)
+    _pin(monkeypatch, S1)
+    later = json.dumps(
+        [_record("added", "REQ-9", obligation="The draft at write time.")],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    calls = _flip_after_first_check(monkeypatch, task_id, "prepare", later)
+    resp = await _submit(client, task_id)
+    assert resp.status_code == 200, resp.text
+    assert calls["n"] >= 2
+    frozen = await _snapshot_row(db, task_id, 1)
+    assert frozen is not None
+    assert [row["requirement_id"] for row in frozen["records"]] == ["REQ-9"]

@@ -4046,6 +4046,11 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
                     generation=int(live.get("submission_generation") or 0),
                 ),
             )
+        # #2218: дельту решали до лока. Пока сдача ждала, refine мог сменить её
+        # своим соединением; снимок и отказ берём из строки, которую пишем.
+        state.behavior_snapshot = await behavior_snapshot.prepare(
+            db, live, submission_sha
+        )
         # #1687: the CI gates decided before the lock; a report accepted since
         # then withdrew the evidence. They are asked again here, of the database.
         await ci_trust.recheck_in_transaction(
