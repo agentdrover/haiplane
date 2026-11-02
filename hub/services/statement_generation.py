@@ -61,7 +61,7 @@ from hub.db import fetchall, write_transaction
 # них только когда заполнено. Пустое значение, записанное ключом, сменило бы
 # отпечаток каждой существующей задачи и объявило бы ревизию на ровном месте
 # (тот же приём, что у result_kind ниже).
-_KEY_ONLY_WHEN_SET = frozenset({"cause_kind", "plain_summary"})
+_KEY_ONLY_WHEN_SET = frozenset({"cause_kind", "plain_summary", "requirement_ids"})
 
 STATEMENT_FIELDS: tuple[str, ...] = (
     "title",
@@ -96,6 +96,10 @@ STATEMENT_FIELDS: tuple[str, ...] = (
     "validation_commands",
     "out_of_scope_for_review",
     "review_checklist",
+    # #2215: список id, по которому контекст читает индекс. Пустая колонка
+    # (NULL у задач, заведённых раньше) в отпечаток не входит — иначе каждая
+    # существующая задача получила бы ревизию постановки на ровном месте.
+    "requirement_ids",
     # #1236: какое поведение наблюдать после доставки — часть того, что задача
     # утверждает, поэтому смена объявления двигает отпечаток постановки.
     "live_probe",
