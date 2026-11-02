@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from hub import brand, config, models, services, skill_publish
+from hub.services.spec_context import linked_requirements, requirement_lines
 from hub import db as db_module
 from hub import repository as repo
 from hub.db import get_db, log_activity, write_transaction
@@ -2748,6 +2749,8 @@ async def api_task_context(
     # правил ничего не пишет; в summary тексты слоёв опущены.
     from hub.services import working_rules as working_rules_service
 
+    requirements = await linked_requirements(db, task)
+    lines += requirement_lines(requirements)
     working_rules = await working_rules_service.build_working_rules(
         db, task_id, summary=mode == "summary"
     )
@@ -2771,6 +2774,7 @@ async def api_task_context(
         "task": task_view,
         "readiness": readiness_summary,
         "parent_goal": parent_goal,
+        "requirements": requirements,
         "working_rules": working_rules,
         "path_brief": path_brief,
     }
