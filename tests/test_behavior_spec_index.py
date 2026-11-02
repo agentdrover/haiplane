@@ -374,6 +374,20 @@ def test_parser_refuses_an_unknown_field_instead_of_gluing_it_to_the_previous_on
         parse_spec_file("## REQ-1\nObligation: x\nstray words\n")
 
 
+def test_parser_refuses_an_indented_unknown_field_instead_of_gluing_it():
+    """Ключ с отступом — своё поле, а не продолжение предыдущего значения."""
+    head = (
+        "## REQ-1\nObligation: x\n\n### Scenario\n- Given: a\n- When: b\n"
+        "- Then: c\n- Verifiable by: test\n- Test ref: tests/t.py::t\n"
+    )
+    for extra in (
+        "  - Note: the session cookie must not be set\n",
+        "\tNote: the session cookie must not be set\n",
+    ):
+        with pytest.raises(SpecParseError, match="unknown field"):
+            parse_spec_file(head + extra)
+
+
 def test_parser_joins_an_indented_continuation_into_the_value():
     text = "## REQ-1\nObligation: refuses\n  an empty password\n"
     assert parse_spec_file(text)[0].obligation == "refuses an empty password"
