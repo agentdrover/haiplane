@@ -22,6 +22,7 @@ from hub.mcp_server import hub_get_review_brief, hub_submit_for_review
 from hub.services import spec_index
 from hub.services.spec_format import parse_spec_file, requirement_revision
 from tests.cli_support import _run_main
+from tests.state_support import make_state_task
 from tests.test_behavior_spec_index import AUTH_SPEC, BRANCH, Origin
 from tests.test_mcp_server import _mcp_structured, _mcp_text
 
@@ -542,3 +543,86 @@ async def test_unspecified_outside_gate_is_not_refused(
             else 1
         )
         assert await _snapshot_row(db, item_id, generation) is None
+
+
+async def test_bare_delta_inside_gate_is_refused(
+    client: AsyncClient, db, origin: Origin, project_id: int, monkeypatch
+):
+    """Голое ``delta`` внутри границы отвергается как «не сказано», снимка нет."""
+    await _indexed_revision(db, origin, project_id)
+    task_id = await _task(client, db, project_id, behavior_delta="delta")
+    await _pair(client, task_id)
+    _pin(monkeypatch, S1)
+    await _refuse_on_surface(client, task_id, monkeypatch)
+    assert await _snapshot_row(db, task_id, 1) is None
+    card = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert card["status"] == "running"
+    assert card["submission_generation"] == 0
+
+
+async def test_state_task_unspecified_inside_gate_is_refused(
+    client: AsyncClient, db, origin: Origin, project_id: int, monkeypatch
+):
+    """result_kind=state не обходит отказ «не сказано» ни в REST, ни в CLI, ни в MCP."""
+    await _indexed_revision(db, origin, project_id)
+    task_id = await make_state_task(
+        db, project_id=project_id, status="running", plan=True
+    )
+    await db.commit()
+    assert dict(await repo.get_task(db, task_id))["result_kind"] == "state"
+    _pin(monkeypatch, S1)
+    await _refuse_on_surface(client, task_id, monkeypatch)
+    assert await _snapshot_row(db, task_id, 1) is None
+    card = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert card["status"] == "running"
+    assert card["submission_generation"] == 0
+
+
+async def test_bare_delta_outside_gate_is_not_refused(
+    client: AsyncClient, db, origin: Origin, project_id: int, monkeypatch
+):
+    """Вне границы голое ``delta`` сдачу не отвергает и снимка не создаёт."""
+    _pin(monkeypatch, S1)
+    bare = await _task(client, db, project_id, behavior_delta="delta")
+    await _pair(client, bare)
+    accepted = await _submit(client, bare)
+    assert accepted.status_code == 200, accepted.text
+    assert await _snapshot_row(db, bare, 1) is None
+
+    await _indexed_revision(db, origin, project_id)
+    created = await client.post(
+        "/api/tasks",
+        json={"title": "epic", "task_type": "epic", "project": "snap-proj"},
+    )
+    assert created.status_code == 200, created.text
+    epic_id = int(created.json()["id"])
+    await repo.update_task(db, epic_id, behavior_delta="delta")
+    await db.commit()
+    await _pair(client, epic_id)
+    resp = await _submit(client, epic_id)
+    assert resp.status_code != 422 or _detail(resp).get("reason") != (
+        "behavior_unspecified"
+    ), resp.text
+    generation = (
+        int(resp.json().get("submission_generation") or 0)
+        if resp.status_code == 200
+        else 1
+    )
+    assert await _snapshot_row(db, epic_id, generation) is None
+
+
+async def test_no_delta_inside_gate_still_freezes_empty_snapshot(
+    client: AsyncClient, db, origin: Origin, project_id: int, monkeypatch
+):
+    """Явное ``no_delta`` внутри границы по-прежнему даёт снимок без записей."""
+    await _indexed_revision(db, origin, project_id)
+    task_id = await _task(client, db, project_id, behavior_delta="no_delta")
+    await _pair(client, task_id)
+    _pin(monkeypatch, S1)
+    submitted = await _submit(client, task_id)
+    assert submitted.status_code == 200, submitted.text
+    frozen = await _snapshot_row(db, task_id, 1)
+    assert frozen is not None
+    assert frozen["records"] == []
+    assert frozen["explicit_no_delta"] is True
+    assert frozen["head_sha"] == S1

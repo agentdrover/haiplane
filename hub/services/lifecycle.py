@@ -3545,6 +3545,7 @@ async def submit_for_review(
         from hub.services.state_task import submit_state
 
         expected_sha_gate.refuse_for_state_task(body)  # #1937
+        await behavior_snapshot.refuse_if_unspecified(db, task)
         return await submit_state(db, task_id, task, body, principal_id=principal_id)
 
     state = SubmitContext(db=db, task_id=task_id, task=task, body=body)

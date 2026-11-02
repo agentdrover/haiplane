@@ -23,6 +23,7 @@ from hub.services.spec_format import requirement_revision
 from hub.services.spec_index import index_state, indexed_requirements
 
 _GATED_TYPES = frozenset({"task", "subtask"})
+_UNANSWERED = frozenset({"unspecified", "delta"})
 _COMPARE_KEYS = (
     "requirement_id",
     "op",
@@ -62,19 +63,26 @@ def requirement_ids_of(value: Any) -> list[str]:
     return ids
 
 
+async def refuse_if_unspecified(db: aiosqlite.Connection, task: dict[str, Any]) -> None:
+    """Внутри границы отказ на «не сказано» и на голое ``delta``; вне — ничего.
+
+    Граница: task или subtask, у проекта уже был успешный индекс. Снимка не
+    пишет и записей не читает: это дверь для сдачи, где снимка нет.
+    """
+    kind, _records = parse_delta(task.get("behavior_delta"))
+    if kind in _UNANSWERED and await _inside_gate(db, task):
+        raise _unspecified()
+
+
 async def prepare(db: aiosqlite.Connection, task: dict[str, Any], head_sha: str) -> str:
     """JSON снимка без поколения, либо ``""`` когда снимок не создаётся.
 
-    «Не сказано» отказывает только внутри границы: task или subtask, у
-    проекта уже был успешный индекс. Вне границы сдача идёт дальше и
-    снимка нет. Явное ``no_delta`` — снимок без записей.
+    «Не сказано» и голое ``delta`` отказывают только внутри границы, вне её
+    сдача идёт дальше и снимка нет. Явное ``no_delta`` — снимок без записей.
     """
+    await refuse_if_unspecified(db, task)
     kind, records = parse_delta(task.get("behavior_delta"))
-    if kind == "unspecified":
-        if await _inside_gate(db, task):
-            raise _unspecified()
-        return ""
-    if kind == "delta":
+    if kind in _UNANSWERED:
         return ""
     areas = deserialize_str_list(task.get("affected_areas"))
     if kind == "no_delta":
