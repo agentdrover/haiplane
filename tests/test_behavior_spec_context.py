@@ -141,3 +141,38 @@ async def test_unknown_id_is_not_a_current_obligation(
     assert _ids(rest) == ["REQ-1"]
     assert "REQ-9" not in rest["context_text"]
     await _same_set(rest, task_id, capsys, monkeypatch)
+
+
+async def test_child_reads_requirements_from_the_epic_project(
+    client: AsyncClient, db, origin: Origin, project_id: int, capsys, monkeypatch
+):
+    """Дочерняя задача не носит project_id: проект живёт на эпике.
+
+    Подтверждённая находка 42476eccb3198d48. Индекс проекта эпика виден
+    потомку. Колонка project_id у потомка пустая — это штатная форма, не дыра.
+    """
+    origin.publish({"specs/auth/spec.md": AUTH_SPEC})
+    assert (await spec_index.index_project(db, project_id)).state == "indexed"
+    epic = await client.post(
+        "/api/tasks",
+        json={"title": "epic", "task_type": "epic", "project": "specs-proj"},
+    )
+    assert epic.status_code == 200, epic.text
+    epic_id = int(epic.json()["id"])
+    child = await client.post(
+        "/api/tasks", json={"title": "child", "parent_id": epic_id}
+    )
+    assert child.status_code == 200, child.text
+    child_id = int(child.json()["id"])
+    stored = dict(await repo.get_task(db, child_id))
+    assert stored["project_id"] is None
+    patched = await client.post(
+        f"/api/tasks/{child_id}/refine", json={"requirement_ids": ["REQ-1"]}
+    )
+    assert patched.status_code == 200, patched.text
+
+    rest = await _context(client, child_id)
+
+    assert _ids(rest) == ["REQ-1"]
+    assert "REQ-2" not in rest["context_text"]
+    await _same_set(rest, child_id, capsys, monkeypatch)

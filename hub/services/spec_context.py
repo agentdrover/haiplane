@@ -12,6 +12,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub import repository as repo
 from hub.db import deserialize_str_list
 from hub.models import IndexedRequirement
 from hub.services.spec_index import indexed_requirements
@@ -31,8 +32,12 @@ async def linked_requirements(
 ) -> list[IndexedRequirement]:
     """Требования индекса в порядке списка id. Неизвестного id в ответе нет."""
     ids = deserialize_str_list(task.get("requirement_ids"))
-    project_id = task.get("project_id")
-    if not ids or project_id is None:
+    if not ids:
         return []
-    by_id = {req.id: req for req in await indexed_requirements(db, int(project_id))}
+    # Проект живёт на эпике, ребёнок наследует: колонка tasks.project_id у
+    # ребёнка NULL, ключ индекса берём тем же путём, что и остальной /context.
+    project = await repo.resolve_project_for_task(db, int(task["id"]))
+    if project is None:
+        return []
+    by_id = {req.id: req for req in await indexed_requirements(db, int(project["id"]))}
     return [by_id[req_id] for req_id in ids if req_id in by_id]
