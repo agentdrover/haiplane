@@ -3468,6 +3468,7 @@ async def record_submission(
     sha: str,
     base_branch: str,
     state_snapshot: str = "",
+    behavior_snapshot: str = "",
 ) -> None:
     """Remember which commit a submission pinned (#880).
 
@@ -3476,12 +3477,13 @@ async def record_submission(
     """
     await db.execute(
         "INSERT INTO submissions (task_id, generation, sha, base_branch, "
-        "state_snapshot) VALUES (?, ?, ?, ?, ?) "
+        "state_snapshot, behavior_snapshot) VALUES (?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(task_id, generation) DO UPDATE SET "
         "sha=excluded.sha, base_branch=excluded.base_branch, "
         "state_snapshot=excluded.state_snapshot, "
+        "behavior_snapshot=excluded.behavior_snapshot, "
         "submitted_at=datetime('now')",
-        (task_id, generation, sha, base_branch, state_snapshot),
+        (task_id, generation, sha, base_branch, state_snapshot, behavior_snapshot),
     )
 
 

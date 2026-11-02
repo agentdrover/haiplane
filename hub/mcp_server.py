@@ -5768,10 +5768,10 @@ PREPARE_HIDDEN: tuple[Hidden, ...] = (
     Hidden("human_owner", "бухгалтерия, а не постановка: ставится через refine"),
     Hidden("human_reviewer", "бухгалтерия, а не постановка: ставится через refine"),
     Hidden(
-        "requirement_ids",
-        "список id читает контекст; задают его REST и CLI. Плоская сигнатура "
-        "доводки его не публикует: заморозка каталога не вмещает ещё параметр, "
-        "а читатель списка — контекст, не этот инструмент",
+        "behavior_delta",
+        "записи дельты задают REST и CLI (--from-file). Плоская сигнатура "
+        "доводки их не публикует: заморозка каталога не вмещает вложенную "
+        "схему, а снимок читает бриф, не этот инструмент",
     ),
 )
 
@@ -5951,10 +5951,10 @@ REFINE_HIDDEN: tuple[Hidden, ...] = (
         "он читался бы как ещё одно значение",
     ),
     Hidden(
-        "requirement_ids",
-        "список id читает контекст; задают его REST и CLI. Плоская сигнатура "
-        "refine его не публикует: заморозка каталога не вмещает ещё параметр, "
-        "а читатель списка — контекст, не этот инструмент",
+        "behavior_delta",
+        "записи дельты задают REST и CLI (--from-file). Плоская сигнатура "
+        "refine их не публикует: заморозка каталога не вмещает вложенную "
+        "схему, а снимок читает бриф, не этот инструмент",
     ),
 )
 
@@ -5993,7 +5993,6 @@ async def hub_refine_task(
         affected_areas: Paths hit.
         validation_commands: Proof commands.
         live_probe: Post-delivery probe name.
-        behavior_delta: unspecified|delta|no_delta.
         result_kind: Draft only.
         rollback: State undo.
         out_of_scope_for_review: Reviewer skips.

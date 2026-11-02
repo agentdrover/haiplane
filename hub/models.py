@@ -10,6 +10,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hub import config
+from hub.behavior_delta import (
+    BehaviorDeltaRecord,
+    BehaviorSnapshot,
+    coerce_behavior_delta,
+    reject_repeated_delta_ids,
+)
 from hub.cause_task_view import CauseTaskView
 from hub.expected_sha import ExpectedShaMixin, ReviewPinSubmit, ReviewPinView
 from hub.outcome_hint import OutcomeHintView
@@ -2091,6 +2097,8 @@ class ReviewBrief(BaseModel):
     # three states, never collapsed: "could not look" must not read as
     # "nothing moved". The reviewer sees this before spending an hour.
     submission_sha: str = ""
+    # #2218: снимок дельты этого поколения. None — сдача снимка не создавала.
+    behavior_snapshot: BehaviorSnapshot | None = None
     current_branch_tip: str = ""
     sha_check: str = "unknown"
     sha_check_reason: str = ""
@@ -2566,18 +2574,15 @@ class TaskRefine(PlainSummaryInput):
     validation_commands: list[str] | None = Field(default=None, max_length=10)
     out_of_scope_for_review: list[str] | None = Field(default=None, max_length=10)
     review_checklist: list[str] | None = Field(default=None, max_length=10)
-    # Список id требований, по которому контекст читает индекс. До появления
-    # дельты это единственный источник: путь из affected_areas id не выбирает.
-    requirement_ids: list[str] | None = Field(default=None, max_length=50)
     # #1236: ИМЯ читающей пробы из закрытого реестра (hub/services/live_probe.py),
     # которую хаб исполнит сам после доставки. Не команда и не строка вызова:
     # проверяется на принадлежность реестру ДО записи, потому что поле, куда
     # ложится текст из карточки, а исполняет его служба с ключами, — это не
     # поле, а канал исполнения. "" очищает объявление.
     live_probe: str | None = Field(default=None, max_length=64)
-    # #2217: omitted = untouched (not in model_fields_set, so never written); an
-    # explicit null or "" is written as ``unspecified``, never as ``no_delta``.
-    behavior_delta: BehaviorDeltaMark | None = None
+    # #2218: отметка #2217 или список записей. Пропущенное поле не пишется;
+    # явные null и "" — unspecified, никогда no_delta.
+    behavior_delta: BehaviorDeltaMark | list["BehaviorDeltaRecord"] | None = None
     # #1647: результат работы и способ отката. result_kind меняется только в
     # draft; после сдачи state-задачи rollback и AC заморожены до возврата в
     # работу (refinement._guard_state_statement).
@@ -2599,22 +2604,14 @@ class TaskRefine(PlainSummaryInput):
     @field_validator("behavior_delta", mode="before")
     @classmethod
     def _blank_behavior_delta(cls, v: Any) -> Any:
-        return blank_is_unspecified(v)
+        return coerce_behavior_delta(v)
 
-    @field_validator("requirement_ids")
-    @classmethod
-    def _requirement_ids(cls, value: list[str] | None) -> list[str] | None:
-        """Id из списка — ^REQ-[0-9]+$, без повторов. Иначе это не список требований."""
-        if value is None:
-            return None
-        seen: set[str] = set()
-        for item in value:
-            if not re.fullmatch(r"REQ-[0-9]+", item):
-                raise ValueError(f"requirement id {item!r} does not match ^REQ-[0-9]+$")
-            if item in seen:
-                raise ValueError(f"requirement id {item} is listed twice")
-            seen.add(item)
-        return value
+    @model_validator(mode="after")
+    def _delta_ids_once(self) -> TaskRefine:
+        records = self.behavior_delta
+        if isinstance(records, list):
+            reject_repeated_delta_ids(records)
+        return self
 
     @field_validator("risks")
     @classmethod
@@ -3369,13 +3366,15 @@ class TaskView(PlainSummaryView):
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
-    # #2217: stored default is ``unspecified``; a row without the column too.
-    behavior_delta: BehaviorDeltaMark = BehaviorDeltaMark.unspecified
+    # #2218: отметка или записи дельты. Пустая колонка читается как unspecified.
+    behavior_delta: BehaviorDeltaMark | list[BehaviorDeltaRecord] = (
+        BehaviorDeltaMark.unspecified
+    )
 
     @field_validator("behavior_delta", mode="before")
     @classmethod
     def _blank_behavior_delta(cls, v: Any) -> Any:
-        return blank_is_unspecified(v)
+        return coerce_behavior_delta(v)
 
     # Shadow-mode risk class (#581): read-only surface, None = "not
     # computed" and is NOT the same thing as RiskClass.r0.
@@ -5489,4 +5488,5 @@ ReviewReport.model_rebuild()
 ReviewBrief.model_rebuild()
 StateReviewView.model_rebuild()
 TaskView.model_rebuild()
+TaskRefine.model_rebuild()
 ProdDefectFiled.model_rebuild()

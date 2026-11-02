@@ -168,7 +168,6 @@ LIST_STR_COLUMNS = frozenset(
         "out_of_scope_for_review",
         "review_checklist",
         "risk_class_reasons",
-        "requirement_ids",
     }
 )
 
@@ -281,6 +280,10 @@ def structured_fields_to_db(
             if value is None:
                 continue
             out["risks"] = serialize_risks(value)
+        elif key == "behavior_delta" and isinstance(value, list):
+            out[key] = json.dumps(
+                value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
         elif key in LIST_STR_COLUMNS:
             if value is None:
                 continue
