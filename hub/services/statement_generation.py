@@ -61,7 +61,22 @@ from hub.db import fetchall, write_transaction
 # них только когда заполнено. Пустое значение, записанное ключом, сменило бы
 # отпечаток каждой существующей задачи и объявило бы ревизию на ровном месте
 # (тот же приём, что у result_kind ниже).
-_KEY_ONLY_WHEN_SET = frozenset({"cause_kind", "plain_summary", "requirement_ids"})
+_KEY_ONLY_WHEN_SET = frozenset(
+    {"cause_kind", "plain_summary", "behavior_delta", "requirement_ids"}
+)
+
+# Для этих полей «не заполнено» хранится не NULL, а значением по умолчанию
+# (#2217): отметка дельты без слова автора - ``unspecified``, и она в отпечаток
+# не входит, как и NULL у остальных. requirement_ids (#2215) остаётся NULL,
+# пока список не задан, поэтому отдельного пустого значения у него нет.
+_EMPTY_DEFAULTS = {"behavior_delta": "unspecified"}
+
+
+def _in_fingerprint(field: str, value: Any) -> bool:
+    if field not in _KEY_ONLY_WHEN_SET:
+        return True
+    return value is not None and value != _EMPTY_DEFAULTS.get(field)
+
 
 STATEMENT_FIELDS: tuple[str, ...] = (
     "title",
@@ -103,6 +118,8 @@ STATEMENT_FIELDS: tuple[str, ...] = (
     # #1236: какое поведение наблюдать после доставки — часть того, что задача
     # утверждает, поэтому смена объявления двигает отпечаток постановки.
     "live_probe",
+    # #2217: заявление «поведение не меняется» - часть того, что задача утверждает.
+    "behavior_delta",
     "risks",
     "prepared_by",
 )
@@ -122,9 +139,7 @@ async def statement_fingerprint(db: aiosqlite.Connection, task_id: int) -> str:
         return ""
     task = dict(row)
     payload: dict[str, Any] = {
-        f: task.get(f)
-        for f in STATEMENT_FIELDS
-        if f not in _KEY_ONLY_WHEN_SET or task.get(f) is not None
+        f: task.get(f) for f in STATEMENT_FIELDS if _in_fingerprint(f, task.get(f))
     }
     if (task.get("result_kind") or "commit") == "state":
         # #1647: способ отката и вид результата — часть постановки state-задачи.
