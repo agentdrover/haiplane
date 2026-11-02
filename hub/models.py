@@ -1626,7 +1626,7 @@ class CIEvidenceState(BaseModel):
 
 
 class PrepassState(BaseModel):
-    """Which deterministic checks already ran on the code under review (#875).
+    """What deterministic evidence a CI run left on the code under review (#875).
 
     ``state`` is ``covered`` (at least one check ran and passed on the pinned
     commit), ``failed`` (a check ran and did NOT pass) or ``unknown`` (no report
@@ -1637,6 +1637,12 @@ class PrepassState(BaseModel):
     the sole basis on which the reviewer is told not to spend its pass on a
     class — a list built from anything else would be a promise the run cannot
     keep.
+
+    ``validation_*`` (#2208) is the card's own validation_commands as the SAME
+    report recorded them: checks and validation are two facts about one commit,
+    and a green check never stood in for a red validation. ``declared`` keeps
+    "the card names commands" apart from "there is nothing to prove" — an
+    unknown outcome blocks "checked", an absent list does not.
     """
 
     state: str = "unknown"
@@ -1645,14 +1651,20 @@ class PrepassState(BaseModel):
     failed: list[str] = Field(default_factory=list)
     skipped: list[str] = Field(default_factory=list)
     head_sha: str = ""
+    validation_declared: bool = False
+    validation_status: str = ""
+    validation_reason: str = ""
 
 
 class ValidationStanding(BaseModel):
     """Whether a submission is checked — by the prepass, not by its text (#1246).
 
-    ``state`` is ``passed``, ``failed`` or ``not_run``: three, never two. Only
-    ``passed`` makes ``verified`` true. ``author_run_lines`` are the lines of
-    the submission text that talk about runs — quoted as the author's word,
+    ``state`` is ``passed``, ``failed``, ``not_run`` or ``unknown``: one answer
+    per case, never two. Only ``passed`` makes ``verified`` true. ``unknown``
+    (#2208) is the answer the first three could not give: the checks ran and
+    passed, but the card's own validation_commands reported no outcome — it is
+    neither a pass nor a failure of the work. ``author_run_lines`` are the lines
+    of the submission text that talk about runs — quoted as the author's word,
     never judged for meaning and never a basis. ``needs_human_compare`` is
     true only where the prepass failed and such lines exist: the hub cannot
     tell whether they agree with the failure, so a human compares.
@@ -2554,6 +2566,9 @@ class TaskRefine(PlainSummaryInput):
     validation_commands: list[str] | None = Field(default=None, max_length=10)
     out_of_scope_for_review: list[str] | None = Field(default=None, max_length=10)
     review_checklist: list[str] | None = Field(default=None, max_length=10)
+    # Список id требований, по которому контекст читает индекс. До появления
+    # дельты это единственный источник: путь из affected_areas id не выбирает.
+    requirement_ids: list[str] | None = Field(default=None, max_length=50)
     # #1236: ИМЯ читающей пробы из закрытого реестра (hub/services/live_probe.py),
     # которую хаб исполнит сам после доставки. Не команда и не строка вызова:
     # проверяется на принадлежность реестру ДО записи, потому что поле, куда
@@ -2585,6 +2600,21 @@ class TaskRefine(PlainSummaryInput):
     @classmethod
     def _blank_behavior_delta(cls, v: Any) -> Any:
         return blank_is_unspecified(v)
+
+    @field_validator("requirement_ids")
+    @classmethod
+    def _requirement_ids(cls, value: list[str] | None) -> list[str] | None:
+        """Id из списка — ^REQ-[0-9]+$, без повторов. Иначе это не список требований."""
+        if value is None:
+            return None
+        seen: set[str] = set()
+        for item in value:
+            if not re.fullmatch(r"REQ-[0-9]+", item):
+                raise ValueError(f"requirement id {item!r} does not match ^REQ-[0-9]+$")
+            if item in seen:
+                raise ValueError(f"requirement id {item} is listed twice")
+            seen.add(item)
+        return value
 
     @field_validator("risks")
     @classmethod
@@ -3533,6 +3563,9 @@ class TaskContextView(BaseModel):
     task: TaskView | None = None
     readiness: ContextReadinessSummary | None = None
     parent_goal: ContextParentGoal | None = None
+    # Требования индекса по списку id задачи. Id, которого в индексе нет,
+    # сюда не попадает: это не действующее обязательство.
+    requirements: list[IndexedRequirement] = Field(default_factory=list)
     # #1630: тот же блок, что в pair-start; в mode=summary — без текстов слоёв.
     working_rules: WorkingRules | None = None
     # #1643: следующая задача и критический путь проекта задачи. None — сервер
@@ -5386,6 +5419,63 @@ class StewardJudgementView(BaseModel):
         return v
 
 
+# --- Behavior spec index (#2214) ---
+
+
+class SpecScenario(BaseModel):
+    """Scenario of a requirement as written in ``specs/<capability>/spec.md``."""
+
+    given: str
+    when: str
+    then: str
+    verifiable_by: str
+    test_ref: str = ""
+
+
+class SpecRequirement(BaseModel):
+    """Requirement block: the unit whose revision is hashed (``{id, obligation, scenarios}``)."""
+
+    id: str = Field(pattern=r"^REQ-[0-9]+$")
+    obligation: str
+    scenarios: list[SpecScenario] = Field(default_factory=list)
+
+
+class IndexedRequirement(SpecRequirement):
+    """A requirement as the index stores it: its block plus both revisions.
+
+    ``file_revision`` is the git blob SHA of the file on the default branch,
+    ``revision`` the sha256 of the canonical JSON of the block alone, so editing
+    one requirement ages its own revision and the file's, not its neighbours'.
+    """
+
+    path: str
+    capability: str
+    file_revision: str
+    revision: str
+
+
+class SpecIndexIssue(BaseModel):
+    file: str
+    reason: str
+
+
+class SpecIndexResult(BaseModel):
+    """Outcome of indexing a project's spec files by the default-branch ref.
+
+    ``refused`` (a duplicate id or a file that does not parse) and
+    ``unreadable`` (git could not answer) both leave the previous index
+    untouched; they are kept apart because the second says nothing about the files.
+    """
+
+    state: Literal["indexed", "refused", "unreadable"]
+    ref: str = ""
+    commit: str = ""
+    files: int = 0
+    requirements: int = 0
+    issues: list[SpecIndexIssue] = Field(default_factory=list)
+    detail: str = ""
+
+
 # --- Deprecated aliases for backward compatibility ---
 
 ProposalStatus = TaskStatus
@@ -5394,6 +5484,7 @@ ProposalView = TaskView
 
 # Forward-ref rebuild: ReviewBrief.machine_review points at MachineReviewView,
 # which is declared after ReviewBrief (#381).
+TaskContextView.model_rebuild()
 ReviewReport.model_rebuild()
 ReviewBrief.model_rebuild()
 StateReviewView.model_rebuild()

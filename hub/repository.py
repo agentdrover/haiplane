@@ -2206,7 +2206,8 @@ async def drop_ci_validation(
     """Withdraw the validation result written from CI, unless it is ``keep_source``'s."""
     await db.execute(
         "UPDATE tasks SET validation_generation=NULL, validation_status=NULL, "
-        "validation_log=NULL, validation_source='manual' "
+        "validation_log=NULL, validation_commands_fp=NULL, "
+        "validation_source='manual' "
         "WHERE id=? AND validation_source LIKE 'ci:%' AND validation_source != ?",
         (task_id, keep_source),
     )

@@ -168,6 +168,7 @@ LIST_STR_COLUMNS = frozenset(
         "out_of_scope_for_review",
         "review_checklist",
         "risk_class_reasons",
+        "requirement_ids",
     }
 )
 

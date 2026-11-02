@@ -290,6 +290,16 @@ class NoopGitOps:
         """No git here — "could not look", never "the submission lacks it" (#764)."""
         return None
 
+    async def read_spec_files(self, repo: str, branch: str) -> dict[str, Any]:
+        """No git here - "could not look", never "the project has no spec" (#2214)."""
+        return {
+            "state": "unreadable",
+            "ref": f"origin/{branch}",
+            "commit": "",
+            "files": [],
+            "reason": "git не настроен",
+        }
+
     async def files_naming_at_ref(
         self, repo: str, ref: str, word: str, pathspec: str = "*.py"
     ) -> set[str] | None:

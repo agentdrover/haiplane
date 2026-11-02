@@ -25,7 +25,7 @@ from hub.actionable_errors import (
 )
 from hub.config import PAIR_BASE_BRANCH
 from hub.integrations import forge as forge_registry
-from hub.integrations import git_history, git_rerun, proc
+from hub.integrations import git_history, git_rerun, git_spec, proc
 from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
     BaseFreshness,
@@ -1139,7 +1139,9 @@ def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
     return BranchUpdateOutcome.unavailable
 
 
-class GitOpsIntegration(git_history.HistoryReads, git_rerun.RerunCalls):
+class GitOpsIntegration(
+    git_history.HistoryReads, git_rerun.RerunCalls, git_spec.SpecReads
+):
     """Concrete git_ops plugin: local git here, the repository host behind a forge.
 
     ``forge`` is an attribute, not a module-level singleton, so a project on
