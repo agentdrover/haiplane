@@ -39,13 +39,8 @@ def _canonical(value: object) -> str:
 
 def parse_delta(value: Any) -> tuple[str, list[BehaviorDeltaRecord]]:
     """``unspecified`` | ``delta`` | ``no_delta`` | ``records`` и сами записи."""
-    if isinstance(value, list):
-        raw = value
-    elif isinstance(value, str) and value.strip().startswith("["):
-        raw = _json_list(value)
-        if raw is None:
-            return "unspecified", []
-    else:
+    raw = _as_record_list(value)
+    if raw is None:
         return _mark(value), []
     if not raw:
         return "unspecified", []
@@ -158,6 +153,14 @@ async def load_raw(db: aiosqlite.Connection, task_id: int, generation: int) -> s
     if row is None:
         return ""
     return str(row["behavior_snapshot"] or "")
+
+
+def _as_record_list(value: Any) -> list[Any] | None:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip().startswith("["):
+        return _json_list(value)
+    return None
 
 
 def _json_list(value: str) -> list[Any] | None:
