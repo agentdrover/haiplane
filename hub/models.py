@@ -2545,6 +2545,9 @@ class TaskRefine(PlainSummaryInput):
     validation_commands: list[str] | None = Field(default=None, max_length=10)
     out_of_scope_for_review: list[str] | None = Field(default=None, max_length=10)
     review_checklist: list[str] | None = Field(default=None, max_length=10)
+    # Список id требований, по которому контекст читает индекс. До появления
+    # дельты это единственный источник: путь из affected_areas id не выбирает.
+    requirement_ids: list[str] | None = Field(default=None, max_length=50)
     # #1236: ИМЯ читающей пробы из закрытого реестра (hub/services/live_probe.py),
     # которую хаб исполнит сам после доставки. Не команда и не строка вызова:
     # проверяется на принадлежность реестру ДО записи, потому что поле, куда
@@ -2568,6 +2571,21 @@ class TaskRefine(PlainSummaryInput):
     prepared_at: str | None = Field(default=None, max_length=100)
     human_owner: str | None = Field(default=None, max_length=100)
     human_reviewer: str | None = Field(default=None, max_length=100)
+
+    @field_validator("requirement_ids")
+    @classmethod
+    def _requirement_ids(cls, value: list[str] | None) -> list[str] | None:
+        """Id из списка — ^REQ-[0-9]+$, без повторов. Иначе это не список требований."""
+        if value is None:
+            return None
+        seen: set[str] = set()
+        for item in value:
+            if not re.fullmatch(r"REQ-[0-9]+", item):
+                raise ValueError(f"requirement id {item!r} does not match ^REQ-[0-9]+$")
+            if item in seen:
+                raise ValueError(f"requirement id {item} is listed twice")
+            seen.add(item)
+        return value
 
     @field_validator("risks")
     @classmethod
@@ -3508,6 +3526,9 @@ class TaskContextView(BaseModel):
     task: TaskView | None = None
     readiness: ContextReadinessSummary | None = None
     parent_goal: ContextParentGoal | None = None
+    # Требования индекса по списку id задачи. Id, которого в индексе нет,
+    # сюда не попадает: это не действующее обязательство.
+    requirements: list[IndexedRequirement] = Field(default_factory=list)
     # #1630: тот же блок, что в pair-start; в mode=summary — без текстов слоёв.
     working_rules: WorkingRules | None = None
     # #1643: следующая задача и критический путь проекта задачи. None — сервер
@@ -5426,6 +5447,7 @@ ProposalView = TaskView
 
 # Forward-ref rebuild: ReviewBrief.machine_review points at MachineReviewView,
 # which is declared after ReviewBrief (#381).
+TaskContextView.model_rebuild()
 ReviewReport.model_rebuild()
 ReviewBrief.model_rebuild()
 StateReviewView.model_rebuild()
