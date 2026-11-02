@@ -112,6 +112,7 @@ EXPECTED_SUBMIT_ORDER = (
     "canonical_branch",
     "branch_matches",
     "pin_submission_sha",
+    "behavior_snapshot",  # #2218
     "critic_passed",  # #1953
     "same_sha_from_review_is_current",
     "empty_resubmission",
@@ -245,6 +246,8 @@ def test_the_two_pipelines_are_compared_by_their_lists():
         # #1783: пустая пересдача на headless — не отказ, а needs_decision в
         # transition_after_agent_done (решение #1122: гейты headless не отказывают).
         "empty_resubmission",
+        # #2218: снимок дельты — шаг сдачи pair. Done-отчёт headless его не пишет.
+        "behavior_snapshot",
     }
     assert set(headless) - set(submit) == set()
 

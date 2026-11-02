@@ -60,6 +60,7 @@ from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
 from hub.services import (
     accepted_delivery_retry,
     archive_guard,
+    behavior_snapshot,
     critic_orders,
     expected_sha_gate,
     expected_state,
@@ -2624,6 +2625,8 @@ class SubmitContext:
     clean_lines: list[str] = dc_field(default_factory=list)
     unchecked_lines: list[str] = dc_field(default_factory=list)
     submission_sha: str = ""
+    #: #2218: JSON снимка дельты без поколения; пусто — снимок не создаётся.
+    behavior_snapshot: str = ""
     sha_reason: str = ""
     discovered_pr: int | None = None
     pr_opened_by_hub: bool = False
@@ -3220,6 +3223,17 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
         await ci_trust.invalidate(state.db, state.task, state.submission_sha)
 
 
+async def _step_behavior_snapshot(state: SubmitContext) -> None:
+    """Снимок дельты на закреплённом head (#2218). Пишет контекст, не строку.
+
+    Стоит после пиннинга, потому что head_sha — это закреплённая вершина, и
+    до распознавания повтора: «не сказано» внутри границы — отказ, а не no-op.
+    """
+    state.behavior_snapshot = await behavior_snapshot.prepare(
+        state.db, state.task, state.submission_sha
+    )
+
+
 async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
     """Пересдача того же коммита из review не открывает новое поколение (#1265).
 
@@ -3361,6 +3375,8 @@ SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("canonical_branch", _step_canonical_branch, refuses=False),
     Step("branch_matches", _step_branch_matches),
     Step("pin_submission_sha", _step_pin_submission_sha),
+    # #2218: head уже закреплён; отказ «не сказано» дешевле критика и сети.
+    Step("behavior_snapshot", _step_behavior_snapshot),
     # #1953: то же наблюдение, что закрепил шаг выше; до bump и записей.
     Step("critic_passed", critic_orders.submit_step),
     Step(
@@ -4070,6 +4086,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
             task_id,
             submission_sha=submission_sha,
             submission_model=declared_model,
+            behavior_approval_void=0,
         )
         # #880: the ledger of what each generation pinned. Written here, in the
         # same transaction that pins the sha, because tasks.submission_sha is
@@ -4084,6 +4101,9 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
             generation=generation,
             sha=submission_sha,
             base_branch=(ledger_ctx.get("base_branch") or config.PAIR_BASE_BRANCH),
+            behavior_snapshot=behavior_snapshot.bind_generation(
+                state.behavior_snapshot, generation
+            ),
         )
         # #546: CI normally runs when the PR opens — before this submission
         # existed, when the generation was still 0 — so its evidence is stored

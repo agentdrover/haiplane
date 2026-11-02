@@ -31,6 +31,7 @@ from typing import Any, Awaitable, Iterator
 from hub import commit_scope, config
 from hub.db import fetchall
 from hub import repository as repo
+from hub.services.behavior_snapshot import for_brief as behavior_snapshot_for_brief
 from hub.services.outcome_ownership import ownership_for_task
 from hub.services.outcomes import outcome_status_for_task
 from hub.integrations.registry import plugins
@@ -1134,6 +1135,7 @@ async def _late_reads(
         in_flight = await review_evidence.inflight_view(db, task_row)
         generation_state = await generation_review(db, task_row)
         cause_task = await cause_task_view(db, task_row)
+        frozen_delta = await behavior_snapshot_for_brief(db, task_id, generation)
     # Models are built outside the read zone: they are assembly, not a read.
     late: dict[str, Any] = {
         "profile_downgrade": downgrade,
@@ -1153,6 +1155,7 @@ async def _late_reads(
         "review_in_flight": in_flight,
         "current_generation_review": generation_state,
         "cause_task": cause_task,
+        "behavior_snapshot": frozen_delta,
     }
     late["verdict_route"] = (
         await timer.run(

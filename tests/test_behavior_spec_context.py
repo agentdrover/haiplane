@@ -1,9 +1,8 @@
-"""Контекст задачи отдаёт требования индекса по списку id (#2215).
+"""Контекст задачи отдаёт требования индекса по записям дельты (#2215, #2218).
 
-Список id лежит на задаче. Контекст показывает обязательство из индекса
-только для id из этого списка и только если индекс такой id знает.
-Один и тот же набор у REST, CLI и MCP. Пути affected_areas требования
-не выбирают.
+Id берутся из behavior_delta. Контекст показывает обязательство из индекса
+только для такого id и только если индекс его знает. Один и тот же набор
+у REST, CLI и MCP. Пути affected_areas требования не выбирают.
 """
 
 from __future__ import annotations
@@ -44,6 +43,30 @@ async def project_id(db, origin: Origin, monkeypatch) -> int:
 
 def _ids(payload: dict) -> list[str]:
     return [item["id"] for item in payload["requirements"]]
+
+
+def _delta(*ids: str) -> list[dict[str, object]]:
+    return [
+        {
+            "requirement_id": req_id,
+            "op": "added",
+            "base_spec_revision": "",
+            "obligation": "linked from the delta",
+            "scenarios": [
+                {
+                    "given": "a user",
+                    "when": "the context is read",
+                    "then": "the indexed obligation is shown",
+                    "verifiable_by": "test",
+                    "test_ref": (
+                        "tests/test_behavior_spec_context.py::"
+                        "test_context_returns_linked_requirement_only"
+                    ),
+                }
+            ],
+        }
+        for req_id in ids
+    ]
 
 
 async def _task(client: AsyncClient, db, project_id: int, **refine: object) -> int:
@@ -101,7 +124,7 @@ async def test_context_returns_linked_requirement_only(
     origin.publish({"specs/auth/spec.md": AUTH_SPEC})
     indexed = await spec_index.index_project(db, project_id)
     assert indexed.state == "indexed", indexed.detail
-    task_id = await _task(client, db, project_id, requirement_ids=["REQ-1"])
+    task_id = await _task(client, db, project_id, behavior_delta=_delta("REQ-1"))
 
     rest = await _context(client, task_id)
 
@@ -134,7 +157,9 @@ async def test_unknown_id_is_not_a_current_obligation(
     """AC-3: REQ-9 в списке, но не в индексе, действующим обязательством не становится."""
     origin.publish({"specs/auth/spec.md": AUTH_SPEC})
     assert (await spec_index.index_project(db, project_id)).state == "indexed"
-    task_id = await _task(client, db, project_id, requirement_ids=["REQ-1", "REQ-9"])
+    task_id = await _task(
+        client, db, project_id, behavior_delta=_delta("REQ-1", "REQ-9")
+    )
 
     rest = await _context(client, task_id)
 
@@ -167,7 +192,7 @@ async def test_child_reads_requirements_from_the_epic_project(
     stored = dict(await repo.get_task(db, child_id))
     assert stored["project_id"] is None
     patched = await client.post(
-        f"/api/tasks/{child_id}/refine", json={"requirement_ids": ["REQ-1"]}
+        f"/api/tasks/{child_id}/refine", json={"behavior_delta": _delta("REQ-1")}
     )
     assert patched.status_code == 200, patched.text
 

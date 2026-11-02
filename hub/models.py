@@ -305,6 +305,37 @@ def blank_is_unspecified(value: Any) -> Any:
     return value
 
 
+def coerce_behavior_delta(value: Any) -> Any:
+    """Blank is ``unspecified``. A JSON array is the record list, not a mark."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return BehaviorDeltaMark.unspecified
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                return text
+            if isinstance(parsed, list):
+                return parsed
+        return text
+    return value
+
+
+def reject_repeated_delta_ids(records: list[BehaviorDeltaRecord]) -> None:
+    """One id, once. An empty list is not ``no_delta``."""
+    if not records:
+        raise ValueError("behavior_delta has no records; use no_delta")
+    seen: set[str] = set()
+    for rec in records:
+        for ident in (rec.requirement_id, rec.new_requirement_id):
+            if not ident:
+                continue
+            if ident in seen:
+                raise ValueError(f"requirement id {ident} is listed twice")
+            seen.add(ident)
+
+
 class RiskClass(str, Enum):
     """Blast-radius class of a task, R0 (harmless) to R5 (irreversible) (#581).
 
@@ -2091,6 +2122,8 @@ class ReviewBrief(BaseModel):
     # three states, never collapsed: "could not look" must not read as
     # "nothing moved". The reviewer sees this before spending an hour.
     submission_sha: str = ""
+    # #2218: снимок дельты этого поколения. None — сдача снимка не создавала.
+    behavior_snapshot: BehaviorSnapshot | None = None
     current_branch_tip: str = ""
     sha_check: str = "unknown"
     sha_check_reason: str = ""
@@ -2566,18 +2599,15 @@ class TaskRefine(PlainSummaryInput):
     validation_commands: list[str] | None = Field(default=None, max_length=10)
     out_of_scope_for_review: list[str] | None = Field(default=None, max_length=10)
     review_checklist: list[str] | None = Field(default=None, max_length=10)
-    # Список id требований, по которому контекст читает индекс. До появления
-    # дельты это единственный источник: путь из affected_areas id не выбирает.
-    requirement_ids: list[str] | None = Field(default=None, max_length=50)
     # #1236: ИМЯ читающей пробы из закрытого реестра (hub/services/live_probe.py),
     # которую хаб исполнит сам после доставки. Не команда и не строка вызова:
     # проверяется на принадлежность реестру ДО записи, потому что поле, куда
     # ложится текст из карточки, а исполняет его служба с ключами, — это не
     # поле, а канал исполнения. "" очищает объявление.
     live_probe: str | None = Field(default=None, max_length=64)
-    # #2217: omitted = untouched (not in model_fields_set, so never written); an
-    # explicit null or "" is written as ``unspecified``, never as ``no_delta``.
-    behavior_delta: BehaviorDeltaMark | None = None
+    # #2218: отметка #2217 или список записей. Пропущенное поле не пишется;
+    # явные null и "" — unspecified, никогда no_delta.
+    behavior_delta: BehaviorDeltaMark | list["BehaviorDeltaRecord"] | None = None
     # #1647: результат работы и способ отката. result_kind меняется только в
     # draft; после сдачи state-задачи rollback и AC заморожены до возврата в
     # работу (refinement._guard_state_statement).
@@ -2599,22 +2629,14 @@ class TaskRefine(PlainSummaryInput):
     @field_validator("behavior_delta", mode="before")
     @classmethod
     def _blank_behavior_delta(cls, v: Any) -> Any:
-        return blank_is_unspecified(v)
+        return coerce_behavior_delta(v)
 
-    @field_validator("requirement_ids")
-    @classmethod
-    def _requirement_ids(cls, value: list[str] | None) -> list[str] | None:
-        """Id из списка — ^REQ-[0-9]+$, без повторов. Иначе это не список требований."""
-        if value is None:
-            return None
-        seen: set[str] = set()
-        for item in value:
-            if not re.fullmatch(r"REQ-[0-9]+", item):
-                raise ValueError(f"requirement id {item!r} does not match ^REQ-[0-9]+$")
-            if item in seen:
-                raise ValueError(f"requirement id {item} is listed twice")
-            seen.add(item)
-        return value
+    @model_validator(mode="after")
+    def _delta_ids_once(self) -> TaskRefine:
+        records = self.behavior_delta
+        if isinstance(records, list):
+            reject_repeated_delta_ids(records)
+        return self
 
     @field_validator("risks")
     @classmethod
@@ -3369,13 +3391,15 @@ class TaskView(PlainSummaryView):
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
-    # #2217: stored default is ``unspecified``; a row without the column too.
-    behavior_delta: BehaviorDeltaMark = BehaviorDeltaMark.unspecified
+    # #2218: отметка или записи дельты. Пустая колонка читается как unspecified.
+    behavior_delta: BehaviorDeltaMark | list[BehaviorDeltaRecord] = (
+        BehaviorDeltaMark.unspecified
+    )
 
     @field_validator("behavior_delta", mode="before")
     @classmethod
     def _blank_behavior_delta(cls, v: Any) -> Any:
-        return blank_is_unspecified(v)
+        return coerce_behavior_delta(v)
 
     # Shadow-mode risk class (#581): read-only surface, None = "not
     # computed" and is NOT the same thing as RiskClass.r0.
@@ -5454,6 +5478,52 @@ class IndexedRequirement(SpecRequirement):
     revision: str
 
 
+class BehaviorDeltaRecord(BaseModel):
+    """One behavior-delta record. ``added`` is the only op with an empty base."""
+
+    requirement_id: str = Field(pattern=r"^REQ-[0-9]+$")
+    op: Literal["added", "modified", "removed", "renamed"]
+    base_spec_revision: str = ""
+    new_requirement_id: str = ""
+    obligation: str = Field(min_length=1)
+    scenarios: list[SpecScenario] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _shape(self) -> BehaviorDeltaRecord:
+        if self.op != "added" and not self.base_spec_revision.strip():
+            raise ValueError("base_spec_revision is required when op is not added")
+        if self.op == "renamed":
+            if not re.fullmatch(r"^REQ-[0-9]+$", self.new_requirement_id):
+                raise ValueError("renamed requires new_requirement_id")
+        elif self.new_requirement_id:
+            raise ValueError("new_requirement_id belongs only to renamed")
+        for scenario in self.scenarios:
+            if scenario.verifiable_by == "test" and not scenario.test_ref.strip():
+                raise ValueError("test_ref is required when verifiable_by is test")
+        return self
+
+
+class BehaviorSnapshotRecord(BaseModel):
+    """A frozen delta record: the draft plus the hash captured at submit."""
+
+    requirement_id: str
+    op: str
+    content_hash: str
+    base_spec_revision: str = ""
+    new_requirement_id: str = ""
+    obligation: str = ""
+    scenarios: list[SpecScenario] = Field(default_factory=list)
+
+
+class BehaviorSnapshot(BaseModel):
+    """The delta frozen on a submission: generation, head and records."""
+
+    generation: int
+    head_sha: str
+    records: list[BehaviorSnapshotRecord] = Field(default_factory=list)
+    explicit_no_delta: bool = False
+
+
 class SpecIndexIssue(BaseModel):
     file: str
     reason: str
@@ -5489,4 +5559,5 @@ ReviewReport.model_rebuild()
 ReviewBrief.model_rebuild()
 StateReviewView.model_rebuild()
 TaskView.model_rebuild()
+TaskRefine.model_rebuild()
 ProdDefectFiled.model_rebuild()
