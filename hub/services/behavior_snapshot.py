@@ -17,7 +17,8 @@ from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.db import deserialize_str_list
-from hub.models import BehaviorDeltaRecord, IndexedRequirement, SpecRequirement
+from hub.behavior_delta import BehaviorDeltaRecord
+from hub.models import IndexedRequirement, SpecRequirement, SpecScenario
 from hub.services.spec_format import requirement_revision
 from hub.services.spec_index import index_state, indexed_requirements
 
@@ -249,9 +250,7 @@ def _with_hash(
     if rec.op == "removed":
         return _public_record(rec, _removed_hash(rec, indexed))
     ident = rec.new_requirement_id if rec.op == "renamed" else rec.requirement_id
-    digest = requirement_revision(
-        SpecRequirement(id=ident, obligation=rec.obligation, scenarios=rec.scenarios)
-    )
+    digest = requirement_revision(_spec_block(ident, rec))
     return _public_record(rec, digest)
 
 
@@ -269,6 +268,14 @@ def _removed_hash(
     if digest != rec.base_spec_revision:
         raise _base_missing(rec.requirement_id)
     return digest
+
+
+def _spec_block(ident: str, rec: BehaviorDeltaRecord) -> SpecRequirement:
+    return SpecRequirement(
+        id=ident,
+        obligation=rec.obligation,
+        scenarios=[SpecScenario(**item.model_dump()) for item in rec.scenarios],
+    )
 
 
 def _public_record(rec: BehaviorDeltaRecord, digest: str) -> dict[str, Any]:

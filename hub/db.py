@@ -281,7 +281,6 @@ def structured_fields_to_db(
                 continue
             out["risks"] = serialize_risks(value)
         elif key == "behavior_delta" and isinstance(value, list):
-            # #2218: записи дельты живут в той же колонке, что и отметка.
             out[key] = json.dumps(
                 value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             )
