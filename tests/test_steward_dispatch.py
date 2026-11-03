@@ -3248,6 +3248,57 @@ async def test_a_resubmission_supersedes_the_advisor_order(
     assert row["status"] == RUN_SUPERSEDED
 
 
+async def test_never_started_reason_names_red_ci(db, monkeypatch):
+    """#2209 AC-2: закрытие называет красный CI, а не неползванного ревьюера.
+
+    На #2203 диспетчер отказал окончательно, карточка закрылась текстом «заказ
+    ждал кросс-модельного ревьюера и не дождался», и человек прочёл это как
+    «ревьюер не ответил». Причина обязана называть CI — и до закрытия слота
+    тоже, иначе карточка ждёт того, кого не позовут.
+    """
+    from hub.services.steward_shadow import REFUSED_RED_CI, waiting_refusal_code
+    from hub.services.verdict_route import verdict_route
+    from tests.ci_trust_support import seed_verified_report
+    from tests.test_steward_shadow import (
+        _no_dispatch,
+        _project,
+        _runs,
+        _task,
+        _tick_waiting,
+    )
+
+    monkeypatch.setattr(config, "STEWARD_REVIEW_WAIT_MAX", 0)
+    project_id = await _project(db, "dispatch-red-ci")
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await seed_verified_report(db, task_id, "a" * 40, validation_status="fail")
+    await order_run(db, task_id, 1)
+    await _tick_waiting(db, 2)
+
+    run = (await _runs(db, task_id))[0]
+    assert await waiting_refusal_code(db, task_id, run["id"]) == REFUSED_RED_CI
+
+    # Пока слот ещё ждёт, маршрут карточки называет CI, а не ревьюера.
+    route = await verdict_route(db, task_id)
+    assert "красн" in route.reason.lower(), route.reason
+
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','-1 minute') "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+    assert await close_finished_runs(db) == 1
+
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_NEVER_STARTED
+    reason = run["closed_reason"]
+    assert "ревью не куплено" in reason and "CI красный" in reason, reason
+    assert "кросс-модельного ревьюера" not in reason, (
+        "ревьюера никто не звал — заказ ждал не его"
+    )
+
+
 async def test_a_local_advisor_run_is_withdrawn_and_closed_on_every_exit(
     db: aiosqlite.Connection, local_spool, local_identity, local_service
 ):
