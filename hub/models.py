@@ -3564,7 +3564,7 @@ class TaskContextView(BaseModel):
     parent_goal: ContextParentGoal | None = None
     # Требования индекса по списку id задачи. Id, которого в индексе нет,
     # сюда не попадает: это не действующее обязательство.
-    requirements: list[IndexedRequirement] = Field(default_factory=list)
+    requirements: list[ContextRequirement] = Field(default_factory=list)
     # #1630: тот же блок, что в pair-start; в mode=summary — без текстов слоёв.
     working_rules: WorkingRules | None = None
     # #1643: следующая задача и критический путь проекта задачи. None — сервер
@@ -5451,6 +5451,24 @@ class IndexedRequirement(SpecRequirement):
     capability: str
     file_revision: str
     revision: str
+
+
+class ContextRequirement(IndexedRequirement):
+    """A requirement as the task context shows it, with where its text was read from (#2216).
+
+    ``source`` is ``index`` while the file on the base branch is at the revision
+    the index recorded; ``obligation`` is then the index text. When the file
+    moved on, ``source`` is ``file``: ``obligation`` and ``scenarios`` are read
+    from the file at ``file_revision`` (the base branch), ``index_file_revision``
+    names the revision the index still stands on, and the index text is not
+    returned as a current record. ``file_unavailable``: the file moved on and no
+    text of this requirement can be read from it (``note`` says why); the
+    ``obligation`` is empty rather than the index text.
+    """
+
+    source: Literal["index", "file", "file_unavailable"] = "index"
+    index_file_revision: str = ""
+    note: str = ""
 
 
 class SpecIndexIssue(BaseModel):
