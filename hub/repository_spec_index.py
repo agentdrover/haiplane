@@ -11,6 +11,7 @@ write-транзакции вызывающего, и прежний индек�
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from typing import Any
 
 import aiosqlite
@@ -108,4 +109,35 @@ async def list_requirements(
             revision=row["revision"],
         )
         for row in await cur.fetchall()
+    ]
+
+
+async def approved_snapshots(
+    db: aiosqlite.Connection, project_id: int, merge_shas: Collection[str]
+) -> list[str]:
+    """Снимки дельты одобренных сдач, чей слитый коммит - один из ``merge_shas`` (#2223).
+
+    Слияние - факт хаба: ``pipeline_merges`` (по проекту слияния, как у остальных
+    чтений, не по ``tasks.project_id``). Снимок берётся у поколения, которое
+    одобрил вердикт, и только пока одобрение не сброшено расхождением черновика.
+    Текст на этом коммите, у которого такой строки нет, одобрения не имеет.
+    """
+    if not merge_shas:
+        return []
+    cur = await db.execute(
+        "SELECT m.merge_sha, s.behavior_snapshot FROM pipeline_merges m "
+        "JOIN tasks t ON t.id = m.task_id "
+        "JOIN submissions s ON s.task_id = t.id "
+        "AND s.generation = t.review_verdict_generation "
+        "WHERE m.project_id = ? AND COALESCE(m.merge_sha, '') <> '' "
+        "AND t.review_verdict = 'approved' "
+        "AND COALESCE(t.behavior_approval_void, 0) = 0 "
+        "AND COALESCE(s.behavior_snapshot, '') <> ''",
+        (project_id,),
+    )
+    wanted = set(merge_shas)
+    return [
+        str(r["behavior_snapshot"])
+        for r in await cur.fetchall()
+        if r["merge_sha"] in wanted
     ]

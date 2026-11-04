@@ -13,12 +13,14 @@ write-транзакцией заменяет индекс. Git работает
 * ``unreadable`` - git не ответил. Это не «спецификации нет»: по нему индекс не
   стирается.
 
-Команда и событие переиндексации - отдельная задача (#2223).
+Построчная переиндексация с доверием к слитому тексту (команда и ход поллера) -
+``hub.services.spec_reindex`` (#2223); она берёт чтение и запись отсюда.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import aiosqlite
@@ -117,7 +119,7 @@ def _refused(ref: str, commit: str, issues: list[SpecIndexIssue]) -> SpecIndexRe
     )
 
 
-def _rows(
+def rows_of(
     files: list[dict[str, Any]], parsed: dict[str, list[SpecRequirement]]
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     file_rows = [
@@ -154,8 +156,27 @@ async def _read_spec(workspace: str, branch: str) -> dict[str, Any]:
         }
 
 
-async def index_project(db: aiosqlite.Connection, project_id: int) -> SpecIndexResult:
-    """Построить индекс проекта по ветке по умолчанию; отказ индекс не меняет."""
+@dataclass(frozen=True)
+class SpecRead:
+    """Прочитанная и проверенная спецификация коммита: файлы разобраны, id уникальны."""
+
+    workspace: str
+    branch: str
+    ref: str
+    commit: str
+    files: list[dict[str, Any]]
+    parsed: dict[str, list[SpecRequirement]]
+
+
+async def read_checked(
+    db: aiosqlite.Connection, project_id: int, *, fetch: bool = False
+) -> SpecRead | SpecIndexResult:
+    """Прочитать спецификацию ветки по умолчанию и проверить её; в БД не пишет.
+
+    Отказ (``refused``) и неизвестность (``unreadable``) приходят готовым
+    ``SpecIndexResult``: вызывающий возвращает его как есть. ``fetch`` обновляет
+    ``origin/<ветка>`` перед чтением: явная команда не вправе читать старый ref.
+    """
     project = await repo.get_project(db, project_id)
     if project is None:
         raise LookupError(f"project {project_id} not found")
@@ -163,6 +184,10 @@ async def index_project(db: aiosqlite.Connection, project_id: int) -> SpecIndexR
     workspace = (project["workspace_path"] or "").strip()
     if not workspace:
         return _unreadable(f"origin/{branch}", "the project has no workspace_path")
+    if fetch:
+        fetched, why = await plugins.git_ops.fetch_base(workspace, branch)
+        if not fetched:
+            return _unreadable(f"origin/{branch}", f"fetch failed: {why[:150]}")
     raw = await _read_spec(workspace, branch)
     if raw["state"] != "read":
         return _unreadable(
@@ -173,20 +198,28 @@ async def index_project(db: aiosqlite.Connection, project_id: int) -> SpecIndexR
     issues += _duplicate_ids(parsed)
     if issues:
         return _refused(ref, commit, issues)
-    file_rows, req_rows = _rows(files, parsed)
+    return SpecRead(workspace, branch, ref, commit, files, parsed)
+
+
+async def index_project(db: aiosqlite.Connection, project_id: int) -> SpecIndexResult:
+    """Построить индекс проекта по ветке по умолчанию; отказ индекс не меняет."""
+    read = await read_checked(db, project_id)
+    if isinstance(read, SpecIndexResult):
+        return read
+    file_rows, req_rows = rows_of(read.files, read.parsed)
     async with write_transaction(db):
         await store.replace_index(
             db,
             project_id,
-            ref=ref,
-            commit_sha=commit,
+            ref=read.ref,
+            commit_sha=read.commit,
             files=file_rows,
             requirements=req_rows,
         )
     return SpecIndexResult(
         state="indexed",
-        ref=ref,
-        commit=commit,
+        ref=read.ref,
+        commit=read.commit,
         files=len(file_rows),
         requirements=len(req_rows),
     )

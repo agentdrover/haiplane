@@ -2526,6 +2526,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("sessions_retention", _sweep_sessions_retention),
     Sweep("release_policy", _sweep_release_policy),
     Sweep("release_deploy_watch", release_deploy_sweep),
+    Sweep("spec_reindex", services.spec_reindex.run_sweep),  # #2223
     Sweep("orchestrator_queue", orchestrator_queue.run_sweep),
     Sweep("messages_retention", _sweep_messages_retention),
     Sweep("mcp_retention", _sweep_mcp_retention),

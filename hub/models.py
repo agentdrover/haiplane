@@ -5464,6 +5464,9 @@ class SpecIndexResult(BaseModel):
     ``refused`` (a duplicate id or a file that does not parse) and
     ``unreadable`` (git could not answer) both leave the previous index
     untouched; they are kept apart because the second says nothing about the files.
+    ``skipped`` (#2223) names the merged requirement blocks a reindex did not
+    take because their hash is not an approved snapshot of the merged commit:
+    the index keeps their previous revision, or has none for a new id.
     """
 
     state: Literal["indexed", "refused", "unreadable"]
@@ -5472,6 +5475,7 @@ class SpecIndexResult(BaseModel):
     files: int = 0
     requirements: int = 0
     issues: list[SpecIndexIssue] = Field(default_factory=list)
+    skipped: list[SpecIndexIssue] = Field(default_factory=list)
     detail: str = ""
 
 

@@ -29,6 +29,9 @@ MAX_SPEC_BYTES = 1_000_000
 MAX_SPEC_FILES = 500
 MAX_SPEC_TOTAL_BYTES = 8_000_000
 MAX_TREE_LISTING_BYTES = 1_000_000
+#: Потолок числа коммитов между двумя проходами индекса (#2223).
+MAX_RANGE_COMMITS = 1000
+_SHA = re.compile(r"^[0-9a-f]{7,64}$")
 _REGULAR_BLOBS = ("100644", "100755")
 _STEP_TIMEOUT = 30
 
@@ -179,9 +182,76 @@ async def read_spec_files(repo: str, branch: str) -> dict[str, Any]:
     return {"state": "read", "ref": ref, "commit": commit, "files": files, "reason": ""}
 
 
+def _range_unreadable(reason: str) -> dict[str, Any]:
+    return {
+        "state": "unreadable",
+        "specs_changed": False,
+        "commits": [],
+        "truncated": False,
+        "reason": reason,
+    }
+
+
+async def spec_range(repo: str, old: str, new: str) -> dict[str, Any]:
+    """``{state, specs_changed, commits, truncated, reason}`` между двумя коммитами (#2223).
+
+    ``specs_changed`` - в разности деревьев ``old`` и ``new`` есть путь под
+    ``specs/``. ``commits`` - коммиты ``old..new``: по ним индекс ищет слияния,
+    которые хаб сделал сам. Больше ``MAX_RANGE_COMMITS`` - список усечён
+    (``truncated``), и усечение сужает доверие, а не расширяет его. ``old`` не
+    найден в клоне (история переписана) - ``unreadable``: вызывающий не знает,
+    менялась ли спецификация, и не вправе считать, что нет.
+    """
+    if not (_SHA.match(old) and _SHA.match(new)):
+        return _range_unreadable("commit id is not a hex SHA")
+    rc, raw, err = await proc.run_capped(
+        "git",
+        "-C",
+        repo,
+        "diff",
+        "--name-only",
+        "-z",
+        old,
+        new,
+        "--",
+        "specs",
+        cwd=repo,
+        timeout=_STEP_TIMEOUT,
+        max_bytes=MAX_TREE_LISTING_BYTES,
+    )
+    if rc != 0:
+        return _range_unreadable(f"git diff failed (rc={rc}): {err[:150]}")
+    paths = [p for p in raw.decode("utf-8", errors="replace").split("\0") if p]
+    rc, out, err = await proc.run_capped(
+        "git",
+        "-C",
+        repo,
+        "rev-list",
+        f"--max-count={MAX_RANGE_COMMITS + 1}",
+        f"{old}..{new}",
+        cwd=repo,
+        timeout=_STEP_TIMEOUT,
+        max_bytes=MAX_TREE_LISTING_BYTES,
+    )
+    if rc != 0:
+        return _range_unreadable(f"git rev-list failed (rc={rc}): {err[:150]}")
+    commits = out.decode("utf-8", errors="replace").split()
+    return {
+        "state": "read",
+        "specs_changed": bool(paths),
+        "commits": commits[:MAX_RANGE_COMMITS],
+        "truncated": len(commits) > MAX_RANGE_COMMITS,
+        "reason": "",
+    }
+
+
 class SpecReads:
     """Чтение спецификации как метод плагина git_ops (#2214)."""
 
     async def read_spec_files(self, repo: str, branch: str) -> dict[str, Any]:
         """Spec files of ``origin/<branch>`` with blob SHAs; never the working copy."""
         return await read_spec_files(repo, branch)
+
+    async def spec_range(self, repo: str, old: str, new: str) -> dict[str, Any]:
+        """Did ``specs/`` change between two commits, and which commits lie between."""
+        return await spec_range(repo, old, new)
