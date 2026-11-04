@@ -157,3 +157,68 @@ async def test_requirement_gone_from_newer_file_is_not_served_from_index(
     assert INDEXED_TEXT not in rest["context_text"]
     assert rev_a in rest["context_text"]
     assert rev_b in rest["context_text"]
+
+
+async def _unreadable(repo: str, branch: str) -> dict:
+    return {
+        "state": "unreadable",
+        "ref": f"origin/{branch}",
+        "commit": "",
+        "files": [],
+        "reason": "git did not answer",
+    }
+
+
+async def _raises(repo: str, branch: str) -> dict:
+    raise OSError("git is gone")
+
+
+async def _no_workspace(db, project_id: int) -> None:
+    await db.execute(
+        "UPDATE projects SET workspace_path = '' WHERE id = ?", (project_id,)
+    )
+    await db.commit()
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "exception", "no_workspace"])
+async def test_unread_file_is_not_reported_as_matching_revisions(
+    client: AsyncClient,
+    db,
+    origin: Origin,
+    project_id: int,
+    capsys,
+    monkeypatch,
+    failure: str,
+):
+    """Файл на базе не удалось прочитать: это не совпадение ревизий (#6fc637b3dec7eaac).
+
+    Ответ не называет ``source=index`` (он значит «файл смотрели и он на
+    ревизии индекса»), называет причину и не выдаёт ревизию файла за
+    сравнённую. Текст индекса остаётся, но помечен как не сверенный с файлом.
+    """
+    task_id, rev_a = await _indexed_task(client, db, origin, project_id)
+    if failure == "no_workspace":
+        await _no_workspace(db, project_id)
+    else:
+        broken = _unreadable if failure == "unreadable" else _raises
+        monkeypatch.setattr(plugins.git_ops, "read_spec_files", broken)
+
+    rest = await _context(client, task_id)
+
+    item = rest["requirements"][0]
+    assert item["source"] == "index_unverified"
+    assert item["note"]
+    assert item["file_revision"] == ""
+    assert item["index_file_revision"] == rev_a
+    assert item["obligation"] == INDEXED_TEXT
+    shown = [INDEXED_TEXT, rev_a, "not checked against the file", item["note"]]
+    _surfaces_agree(rest["context_text"], shown=shown, hidden=[], label="REST")
+    assert "text read from file" not in rest["context_text"]
+
+    rc, _api = _run_main(["context", str(task_id)], api_result=rest)
+    assert rc == 0
+    _surfaces_agree(capsys.readouterr().out, shown=shown, hidden=[], label="CLI")
+    text, ctx = await _mcp_context(rest, task_id, monkeypatch)
+    _surfaces_agree(text, shown=shown, hidden=[], label="MCP text")
+    assert ctx["requirements"][0]["source"] == "index_unverified"
+    assert ctx["requirements"][0]["note"] == item["note"]

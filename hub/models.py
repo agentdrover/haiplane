@@ -5463,10 +5463,14 @@ class ContextRequirement(IndexedRequirement):
     names the revision the index still stands on, and the index text is not
     returned as a current record. ``file_unavailable``: the file moved on and no
     text of this requirement can be read from it (``note`` says why); the
-    ``obligation`` is empty rather than the index text.
+    ``obligation`` is empty rather than the index text. ``index_unverified``:
+    the file on the base branch could not be read at all (``note`` gives the
+    reason), so nothing was compared; ``obligation`` is the index text, not
+    checked against the file, and ``file_revision`` is empty. Only ``index``
+    means the file was looked at and stands on the indexed revision.
     """
 
-    source: Literal["index", "file", "file_unavailable"] = "index"
+    source: Literal["index", "file", "file_unavailable", "index_unverified"] = "index"
     index_file_revision: str = ""
     note: str = ""
 

@@ -9,6 +9,9 @@ affected_areas требование не выбирает.
 обязательства из файла на базовой ветке, называет обе ревизии и помечает текст
 как прочитанный из файла; текст индекса действующим не называется. Индекс при
 этом не трогается: переиндексация - отдельная задача (#2223).
+
+Файл не прочитан вовсе (git молчит, нет workspace): сверки не было, и ответ это
+говорит (``source=index_unverified`` с причиной), а не выдаёт себя за совпадение.
 """
 
 from __future__ import annotations
@@ -36,6 +39,11 @@ def _line(req: ContextRequirement) -> str:
     """Строка дайджеста: источник текста назван, когда это не индекс."""
     if req.source == "index":
         return f"- {req.id}: {req.obligation}"
+    if req.source == "index_unverified":
+        return (
+            f"- {req.id} (index text at revision {req.index_file_revision}, not "
+            f"checked against the file: {req.note}): {req.obligation}"
+        )
     behind = f"the index is behind at revision {req.index_file_revision}"
     if req.source == "file":
         return (
@@ -61,6 +69,21 @@ def _from_index(req: IndexedRequirement) -> ContextRequirement:
     return ContextRequirement(
         **req.model_dump(), source="index", index_file_revision=req.file_revision
     )
+
+
+def _unverified(req: IndexedRequirement, reason: str) -> ContextRequirement:
+    """Файл базовой ветки не прочитан: сверки не было, ревизия файла неизвестна.
+
+    ``source=index`` значит «файл смотрели, он на ревизии индекса»; без
+    чтения этого не сказать, поэтому ответ другой, с причиной сбоя.
+    """
+    data = req.model_dump() | {
+        "file_revision": "",
+        "source": "index_unverified",
+        "index_file_revision": req.file_revision,
+        "note": reason,
+    }
+    return ContextRequirement(**data)
 
 
 def _file_unavailable(
@@ -110,24 +133,27 @@ def _from_moved_file(
     )
 
 
-async def _base_files(project: aiosqlite.Row) -> dict[str, dict[str, Any]] | None:
-    """Файлы спецификации базовой ветки по пути; None - git не ответил.
+async def _base_files(
+    project: aiosqlite.Row,
+) -> tuple[dict[str, dict[str, Any]] | None, str]:
+    """``(files, reason)``: файлы спецификации базовой ветки по пути.
 
-    «Не смог посмотреть» не обвинение: без ответа git текст остаётся из
-    индекса, как до #2216 (линия #725).
+    ``files`` is None, когда чтение не состоялось, и тогда ``reason`` называет
+    причину. «Не смог посмотреть» не обвинение (линия #725), но и не
+    совпадение: вызывающий помечает такой ответ как не сверенный (#2216).
     """
     workspace = (project["workspace_path"] or "").strip()
     if not workspace:
-        return None
+        return None, "the project has no workspace_path"
     branch = (project["default_branch"] or "").strip()
     try:
         raw = await plugins.git_ops.read_spec_files(workspace, branch)
     except Exception as exc:  # noqa: BLE001 - сбой чтения это ответ «неизвестно»
         log.warning("spec files of %s not read for context: %s", workspace, exc)
-        return None
+        return None, f"read failed: {type(exc).__name__}"
     if raw.get("state") != "read":
-        return None
-    return {f["path"]: f for f in raw["files"]}
+        return None, raw.get("reason") or "git did not answer"
+    return {f["path"]: f for f in raw["files"]}, ""
 
 
 async def linked_requirements(
@@ -144,9 +170,11 @@ async def linked_requirements(
         return []
     by_id = {req.id: req for req in await indexed_requirements(db, int(project["id"]))}
     found = [by_id[req_id] for req_id in ids if req_id in by_id]
-    files = await _base_files(project) if found else None
+    if not found:
+        return []
+    files, reason = await _base_files(project)
     if files is None:
-        return [_from_index(req) for req in found]
+        return [_unverified(req, reason) for req in found]
     return [
         _from_index(req)
         if (entry := files.get(req.path)) is not None
