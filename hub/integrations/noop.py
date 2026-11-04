@@ -300,6 +300,20 @@ class NoopGitOps:
             "reason": "git не настроен",
         }
 
+    async def read_spec_delta(
+        self, repo: str, head_sha: str, branch: str
+    ) -> dict[str, Any]:
+        """No git here - "could not look", never "the diff of specs/ is clean" (#2220)."""
+        return {
+            "state": "unreadable",
+            "head": head_sha,
+            "base": "",
+            "reason": "git не настроен",
+            "head_files": [],
+            "base_files": [],
+            "changed": [],
+        }
+
     async def files_naming_at_ref(
         self, repo: str, ref: str, word: str, pathspec: str = "*.py"
     ) -> set[str] | None:

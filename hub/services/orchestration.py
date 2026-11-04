@@ -30,6 +30,7 @@ from hub.db import (
     log_activity,
     write_transaction,
 )
+from hub.services import spec_archive
 from hub.services.behavior_snapshot import refusal_for_moved_head
 from hub.services.prevention_gate import hold_completion
 from hub.services.result_kind import automation_not_applicable
@@ -4397,11 +4398,14 @@ async def _refused_merge_outcome(
                 "проверить, гейт ли его влил, не удалось — merge-коммит не "
                 "прочитан или мерж соседнего пути ещё идёт. Это не ручной мерж, а непроверенный"
             )
+        # #2220: слитый мимо проверенного снимка PR - не чистый архив, долг по id снимка.
+        debt = await spec_archive.note_outside_merge(db, task, ctx, pr_num)
         return False, (
             f"{MERGED_OUTSIDE_GATE_PREFIX}: PR влит не гейтом — PR #{pr_num} уже "
             "MERGED, но мержа гейта по нему нет (ни строки pipeline_merges этой "
             "задачи, ни merge-коммита из реестра гейта). Строка реестра не "
             "создана: drift-guard должен видеть этот мерж как ручной"
+            + (f". {debt}" if debt else "")
         )
     if not state and not merge_detail:
         return False, (
