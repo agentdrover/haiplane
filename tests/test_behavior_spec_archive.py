@@ -12,12 +12,15 @@ from __future__ import annotations
 import asyncio
 import sys
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient, Response
 
+from hub import poller
 from hub import repository as repo
 from hub.integrations.git_ops import GitOpsIntegration
+from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
 from hub.mcp_server import HubApiError, _parse_api_error, hub_submit_for_review
 from hub.models import SpecRequirement, SpecScenario
@@ -421,9 +424,8 @@ async def test_renamed_hashes_the_new_id(env: Env):
     assert detail["ids"] == ["REQ-5"]
 
 
-async def _merged_outside(env: Env, task_id: int, merged_sha: str) -> tuple[bool, str]:
-    """Хаб натыкается на PR, слитый не им: форж говорит MERGED, следа гейта нет."""
-    ctx = {"repo": str(env.origin.clone), "gh_repo": "", "forge": ""}
+def _forge_says_merged(env: Env, merged_sha: str) -> None:
+    """Форж говорит MERGED на ``merged_sha``, следа гейта у PR нет."""
 
     async def state(_pr, **_kw) -> str:
         return "merged"
@@ -440,6 +442,12 @@ async def _merged_outside(env: Env, task_id: int, merged_sha: str) -> tuple[bool
         ("merge_commit_sha", merge_commit),
     ):
         env.monkeypatch.setattr(plugins.git_ops, name, fn)
+
+
+async def _merged_outside(env: Env, task_id: int, merged_sha: str) -> tuple[bool, str]:
+    """Хаб натыкается на PR, слитый не им: форж говорит MERGED, следа гейта нет."""
+    ctx = {"repo": str(env.origin.clone), "gh_repo": "", "forge": ""}
+    _forge_says_merged(env, merged_sha)
     task = dict(await repo.get_task(env.db, task_id))
     return await orchestration._refused_merge_outcome(env.db, task, ctx, "")
 
@@ -502,6 +510,135 @@ async def test_outside_merge_records_debt_and_does_not_count_as_archive(env: Env
     )
     assert taken["REQ-1"] != requirement_revision(_req("REQ-1", swapped))
     assert taken["REQ-2"] == requirement_revision(_req("REQ-2", clean))
+
+
+async def _approved_then_pushed_and_merged_by_hand(
+    env: Env, delta: Any, text: str | None
+) -> tuple[int, str, str]:
+    """Снимок сверен на S1 и одобрен; автор пушит S2 и сливает PR руками.
+
+    Возвращает ``(task_id, S1, S2)``; ветка origin и форж стоят на S2.
+    """
+    task_id, s1, resp = await env.attempt(delta, text)
+    assert resp is not None and resp.status_code == 200, resp and resp.text
+    await env.approve(task_id)
+    branch = (await env.card(task_id))["branch"]
+    swapped = _req("REQ-1", _mod("REQ-1", "", OTHER))
+    outside = _commit(env.origin, branch, _file({"REQ-1": swapped}), new=False)
+    _merge_outside_hub(env.origin, branch)
+    _forge_says_merged(env, outside)
+    return task_id, s1, outside
+
+
+async def _indexed_revisions(env: Env) -> dict[str, str]:
+    indexed = await spec_index.index_project(env.db, env.project_id)
+    assert indexed.state == "indexed", indexed.detail
+    return {
+        r.id: r.revision
+        for r in await spec_index.indexed_requirements(env.db, env.project_id)
+    }
+
+
+async def _debts(env: Env) -> list[tuple[str, int, str, str]]:
+    return [
+        (d["requirement_id"], d["task_id"], d["approved_sha"], d["merged_sha"])
+        for d in await spec_debt.open_debts(env.db, env.project_id)
+    ]
+
+
+async def test_pair_gate_records_debt_when_the_tip_moved_and_pr_merged_by_hand(
+    env: Env,
+):
+    """AC-9 на боевом пути пары: сдвиг вершины даёт stale_approval, но долг пишется."""
+    revs = await env.index()
+    record = _mod("REQ-1", revs["REQ-1"], "The hub records the archived delta.")
+    task_id, s1, outside = await _approved_then_pushed_and_merged_by_hand(
+        env, [record], _file({"REQ-1": _req("REQ-1", record)})
+    )
+    _pin(env.monkeypatch, outside)  # хаб наблюдает вершину ветки: она на S2
+    task = dict(await repo.get_task(env.db, task_id))
+
+    ok, reason = await orchestration.merge_before_completion(env.db, task)
+
+    assert ok is False and reason.startswith("stale_approval")
+    assert await _debts(env) == [("REQ-1", task_id, s1, outside)]
+    updates = (await env.card(task_id))["updates"]
+    assert sum("долг" in u["content"] for u in updates) == 1
+    taken = await _indexed_revisions(env)
+    assert taken["REQ-1"] == revs["REQ-1"], (
+        "слито вне проверенного SHA — индекс не берёт"
+    )
+
+
+async def test_pair_gate_without_hand_merge_records_no_debt(env: Env):
+    """Сдвинутая вершина без слитого PR — просто stale_approval, долга нет."""
+    revs = await env.index()
+    record = _mod("REQ-1", revs["REQ-1"], "The hub records the archived delta.")
+    task_id, _s1, resp = await env.attempt(
+        [record], _file({"REQ-1": _req("REQ-1", record)})
+    )
+    assert resp is not None and resp.status_code == 200, resp and resp.text
+    await env.approve(task_id)
+    branch = (await env.card(task_id))["branch"]
+    moved = _commit(env.origin, branch, None, new=False)
+
+    async def state(_pr, **_kw) -> str:
+        return "open"
+
+    env.monkeypatch.setattr(plugins.git_ops, "pr_state", state)
+    _pin(env.monkeypatch, moved)
+    task = dict(await repo.get_task(env.db, task_id))
+
+    ok, reason = await orchestration.merge_before_completion(env.db, task)
+
+    assert ok is False and reason.startswith("stale_approval")
+    assert await _debts(env) == []
+
+
+async def test_headless_poller_records_debt_when_pr_merged_by_hand(env: Env):
+    """AC-9 на боевом пути поллера: форж отказал мержу, PR слит вне хаба — долг есть."""
+    revs = await env.index()
+    record = _mod("REQ-1", revs["REQ-1"], "The hub records the archived delta.")
+    task_id, s1, outside = await _approved_then_pushed_and_merged_by_hand(
+        env, [record], _file({"REQ-1": _req("REQ-1", record)})
+    )
+
+    async def ci(*_a, **_kw) -> CIProbeResult:
+        return CIProbeResult(CIProbeOutcome.passed, "checks_pass")
+
+    async def refused(*_a, **_kw) -> tuple[bool, str]:
+        return False, "pull request is already merged"
+
+    env.monkeypatch.setattr(plugins.git_ops, "check_pr_ci", ci)
+    env.monkeypatch.setattr(plugins.git_ops, "merge_pr_with_detail", refused)
+    task = dict(await repo.get_task(env.db, task_id))
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await poller._deliver_approved_review(env.db, task)
+
+    assert await _debts(env) == [("REQ-1", task_id, s1, outside)]
+    taken = await _indexed_revisions(env)
+    assert taken["REQ-1"] == revs["REQ-1"], (
+        "слито вне проверенного SHA — индекс не берёт"
+    )
+
+
+async def test_project_wide_debt_keeps_the_previous_index(env: Env):
+    """Снимок без id: долг на весь проект, прежний индекс остаётся как был."""
+    revs = await env.index()
+    task_id, s1, outside = await _approved_then_pushed_and_merged_by_hand(
+        env, "no_delta", None
+    )
+    _pin(env.monkeypatch, outside)
+    task = dict(await repo.get_task(env.db, task_id))
+
+    ok, reason = await orchestration.merge_before_completion(env.db, task)
+
+    assert ok is False and reason.startswith("stale_approval")
+    assert await _debts(env) == [("", task_id, s1, outside)]
+    updates = (await env.card(task_id))["updates"]
+    assert any("долг на весь проект" in u["content"] for u in updates)
+    taken = await _indexed_revisions(env)
+    assert taken == revs, "алерт обещает: индекс блоки этого слияния не принимает"
 
 
 async def test_spec_refusal_reads_the_same_on_cli_and_mcp(env: Env, capsys):

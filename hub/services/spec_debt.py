@@ -6,7 +6,9 @@
 человеком - #2219; переиндексация после слияния - #2223.
 
 Индекс не подхватывает блок id из долга: прежняя строка индекса остаётся как
-была, а блока, которого в индексе не было, там не появляется.
+была, а блока, которого в индексе не было, там не появляется. Долг без id
+(снимок «дельты нет») - на весь проект: прежний индекс остаётся целиком, пока
+долг не закрыт.
 """
 
 from __future__ import annotations
@@ -58,6 +60,20 @@ async def record(
     return fresh
 
 
+def _held_row(old: Any) -> dict[str, Any]:
+    """Строка индекса в прежнем виде: текст, сценарии и ревизия те же."""
+    block = SpecRequirement(
+        id=old.id, obligation=old.obligation, scenarios=old.scenarios
+    )
+    return {
+        "id": old.id,
+        "path": old.path,
+        "obligation": old.obligation,
+        "scenarios": scenarios_json(block),
+        "revision": old.revision,
+    }
+
+
 async def hold_rows(
     db: aiosqlite.Connection,
     project_id: int,
@@ -67,29 +83,22 @@ async def hold_rows(
     """Строки требований для индекса с прежними блоками на месте id из долга.
 
     Id из долга берёт прежняя строка индекса, если её файл ещё есть среди
-    прочитанных; иначе блок в индекс не попадает. Остальные строки не тронуты.
+    прочитанных; иначе блок в индекс не попадает. Долг на весь проект (``""``:
+    в снимке не было id) держит весь прежний индекс: новых строк не берётся, а
+    прежние остаются как были. Остальные строки не тронуты.
     """
     held = {d["requirement_id"] for d in await store.list_open(db, project_id)}
-    held.discard("")
     if not held:
         return rows
     previous = {r.id: r for r in await index_store.list_requirements(db, project_id)}
+    whole_project = "" in held
+    if whole_project:
+        held = set(previous)
     paths = {f["path"] for f in files}
-    kept = [row for row in rows if row["id"] not in held]
-    for ident in sorted(held):
-        old = previous.get(ident)
-        if old is None or old.path not in paths:
-            continue
-        block = SpecRequirement(
-            id=old.id, obligation=old.obligation, scenarios=old.scenarios
-        )
-        kept.append(
-            {
-                "id": old.id,
-                "path": old.path,
-                "obligation": old.obligation,
-                "scenarios": scenarios_json(block),
-                "revision": old.revision,
-            }
-        )
+    kept = [] if whole_project else [row for row in rows if row["id"] not in held]
+    kept += [
+        _held_row(previous[ident])
+        for ident in sorted(held)
+        if ident in previous and previous[ident].path in paths
+    ]
     return kept

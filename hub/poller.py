@@ -699,6 +699,7 @@ async def _deliver_approved_review(db, task: dict) -> None:
             step, _detail = await services.merge_if_approval_stands(
                 db, task, mctx, checked_sha=(task.get("submission_sha") or "")
             )
+            await services.note_refused_merge(db, task, step, mctx, pr_num)
             if await _explicit_outcome(db, task, step.value, _detail, pr_num):
                 return  # also: a neighbour merges / a rerun booking holds (#1956)
             merged = step in (services.MergeStep.MERGED, services.MergeStep.ALREADY)
