@@ -212,6 +212,10 @@ CHAT_PAIR_IMPLEMENTER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("POST", "/api/tasks/{task_id}/pair-start"),
     ("POST", "/api/tasks/{task_id}/submit-review"),
     ("POST", "/api/tasks/{task_id}/declare-wait"),
+    # #2223: the spec reindex command is the agent's own (hub_reindex_spec). It
+    # is a read of the default branch plus a trust-filtered index write, not a
+    # gate; the reviewer list stays closed to it.
+    ("POST", "/api/projects/{project_id}/spec/reindex"),
     ("POST", "/api/sessions/register"),
     ("POST", "/api/sessions/{session_id}/heartbeat"),
     ("POST", "/api/auth/chat-pair/redeem"),

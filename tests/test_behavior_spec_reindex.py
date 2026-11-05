@@ -24,14 +24,14 @@ from unittest.mock import patch
 import pytest
 from httpx import AsyncClient
 
-from hub import cli, mcp_server
+from hub import cli, config, mcp_server
 from hub import poller
 from hub import repository as repo
 from hub.integrations import git_spec
 from hub.integrations.git_ops import GitOpsIntegration
 from hub.integrations.registry import plugins
 from hub.mcp_server import HubApiError, hub_reindex_spec
-from hub.services import spec_index, spec_reindex
+from hub.services import chat_pair, spec_index, spec_reindex
 from tests.test_behavior_spec_index import (
     AUTH_SPEC,
     BILLING_SPEC,
@@ -598,3 +598,57 @@ async def test_truncated_commit_window_keeps_the_index_and_the_poller_retries(
     await _tick(db)
     ids = {r.id for r in await spec_index.indexed_requirements(db, project_id)}
     assert ids == {"REQ-2"}
+
+
+async def _pair_headers(
+    client: AsyncClient, db, kind: str, task_id: int
+) -> dict[str, str]:
+    """Заголовок сессии chat-pair настоящего вида: код выписан и обменян по-настоящему."""
+    await db.execute(
+        "INSERT OR IGNORE INTO principals (id, kind, username, status) "
+        "VALUES (47, 'agent', 'reindex-pair', 'active')"
+    )
+    code, _ = await chat_pair.issue_code(
+        db, 47, kind=kind, bound_task_id=task_id, bound_generation=1
+    )
+    await db.commit()
+    resp = await client.post(
+        "/api/auth/chat-pair/redeem",
+        json={"code": code},
+        headers={"x-forwarded-for": f"203.0.113.{47 if kind == 'implementer' else 48}"},
+    )
+    assert resp.status_code == 200, resp.text
+    return {"Authorization": f"Bearer {resp.json()['token']}"}
+
+
+async def test_chat_pair_implementer_reaches_the_reindex_command(
+    client: AsyncClient, db, origin: Origin, project_id: int, monkeypatch
+):
+    """AC-2 через настоящий допуск: токены включены, команду зовёт сессия исполнителя.
+
+    Тест MCP подменяет ``_api_post`` и допуск не задевает; здесь запрос идёт
+    через ``AuthMiddleware``. Исполнитель chat-pair доходит до обработчика, а
+    ревьюер той же задачи получает 403: ему команда не положена.
+    """
+    origin.publish({"specs/auth/spec.md": AUTH_SPEC})
+    assert (await spec_index.index_project(db, project_id)).state == "indexed"
+    created = await client.post("/api/tasks", json={"title": "pair reindex"})
+    task_id = int(created.json()["id"])
+    second = await client.post("/api/tasks", json={"title": "pair review"})
+    review_task = int(second.json()["id"])
+    await repo.update_task(db, review_task, status="review", submission_generation=1)
+    await db.commit()
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"agent-2223-x": config.TokenIdentity("bot", "agent")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    chat_pair.chat_pair_limiter._buckets.clear()
+    implementer = await _pair_headers(client, db, "implementer", task_id)
+    reviewer = await _pair_headers(client, db, "reviewer", review_task)
+    path = f"/api/projects/{project_id}/spec/reindex"
+
+    refused = await client.post(path, headers=reviewer)
+    assert refused.status_code == 403, refused.text
+    reached = await client.post(path, headers=implementer)
+    assert reached.status_code == 200, reached.text
+    assert reached.json()["state"] == "indexed"
