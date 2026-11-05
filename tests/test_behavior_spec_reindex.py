@@ -27,6 +27,7 @@ from httpx import AsyncClient
 from hub import cli, config, mcp_server
 from hub import poller
 from hub import repository as repo
+from hub.auth import chat_pair_route_allowed
 from hub.integrations import git_spec
 from hub.integrations.git_ops import GitOpsIntegration
 from hub.integrations.registry import plugins
@@ -615,7 +616,10 @@ async def _pair_headers(
     resp = await client.post(
         "/api/auth/chat-pair/redeem",
         json={"code": code},
-        headers={"x-forwarded-for": f"203.0.113.{47 if kind == 'implementer' else 48}"},
+        headers={
+            "x-forwarded-for": "203.0.113."
+            + str({"implementer": 47, "reviewer": 48}.get(kind, 49))
+        },
     )
     assert resp.status_code == 200, resp.text
     return {"Authorization": f"Bearer {resp.json()['token']}"}
@@ -627,28 +631,86 @@ async def test_chat_pair_implementer_reaches_the_reindex_command(
     """AC-2 через настоящий допуск: токены включены, команду зовёт сессия исполнителя.
 
     Тест MCP подменяет ``_api_post`` и допуск не задевает; здесь запрос идёт
-    через ``AuthMiddleware``. Исполнитель chat-pair доходит до обработчика, а
-    ревьюер той же задачи получает 403: ему команда не положена.
+    через ``AuthMiddleware``. Исполнитель chat-pair доходит до обработчика
+    только для проекта своей задачи: у дочерней задачи ``project_id`` пуст, проект
+    наследуется от эпика. Чужой проект, ревьюер и intake получают 403;
+    человеческий ключ вне chat-pair чужой проект переиндексирует как прежде.
     """
     origin.publish({"specs/auth/spec.md": AUTH_SPEC})
     assert (await spec_index.index_project(db, project_id)).state == "indexed"
-    created = await client.post("/api/tasks", json={"title": "pair reindex"})
+    foreign = await repo.create_project(db, slug="foreign-specs", name="Foreign")
+    epic = await client.post(
+        "/api/tasks", json={"title": "pair epic", "task_type": "epic"}
+    )
+    epic_id = int(epic.json()["id"])
+    await repo.update_task(db, epic_id, project_id=project_id)
+    created = await client.post(
+        "/api/tasks", json={"title": "pair reindex", "parent_id": epic_id}
+    )
     task_id = int(created.json()["id"])
-    second = await client.post("/api/tasks", json={"title": "pair review"})
+    second = await client.post(
+        "/api/tasks", json={"title": "pair review", "parent_id": epic_id}
+    )
     review_task = int(second.json()["id"])
     await repo.update_task(db, review_task, status="review", submission_generation=1)
     await db.commit()
+    assert (await repo.get_task(db, task_id))["project_id"] is None
     monkeypatch.setattr(
-        config, "HUB_TOKENS", {"agent-2223-x": config.TokenIdentity("bot", "agent")}
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-2223-x": config.TokenIdentity("bot", "agent"),
+            "human-2223-x": config.TokenIdentity("owner", "human"),
+        },
     )
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
     chat_pair.chat_pair_limiter._buckets.clear()
     implementer = await _pair_headers(client, db, "implementer", task_id)
     reviewer = await _pair_headers(client, db, "reviewer", review_task)
+    intake = await _pair_headers(client, db, "intake", task_id)
     path = f"/api/projects/{project_id}/spec/reindex"
+    foreign_path = f"/api/projects/{foreign}/spec/reindex"
 
-    refused = await client.post(path, headers=reviewer)
-    assert refused.status_code == 403, refused.text
+    for headers in (reviewer, intake):
+        refused = await client.post(path, headers=headers)
+        assert refused.status_code == 403, refused.text
+    for target in (foreign_path, "/api/projects/99/spec/reindex"):
+        refused = await client.post(target, headers=implementer)
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["detail"]["reason"] == "chat_pair_gate_forbidden"
     reached = await client.post(path, headers=implementer)
     assert reached.status_code == 200, reached.text
     assert reached.json()["state"] == "indexed"
+    human = await client.post(
+        foreign_path, headers={"Authorization": "Bearer human-2223-x"}
+    )
+    assert human.status_code != 403, human.text
+
+
+def test_reindex_route_names_the_project_of_the_bound_task():
+    """Без проекта задачи сессии допуск исполнителя на reindex закрыт.
+
+    ``{project_id}`` сверяется так же, как ``{task_id}``: задача 7, POST на
+    проект 99 — отказ, пока middleware не назвал проект задачи равным 99.
+    """
+    session = config.TokenIdentity(
+        "bot",
+        "agent",
+        auth_source="chat_pair",
+        chat_pair_kind="implementer",
+        chat_pair_task_id=7,
+    )
+    path = "/api/projects/99/spec/reindex"
+    assert not chat_pair_route_allowed("POST", path, session)
+    assert not chat_pair_route_allowed("POST", path, session, bound_project_id=5)
+    assert chat_pair_route_allowed("POST", path, session, bound_project_id=99)
+    assert chat_pair_route_allowed("POST", "/api/tasks/7/claim", session)
+    for kind in ("reviewer", "intake"):
+        other = config.TokenIdentity(
+            "bot",
+            "agent",
+            auth_source="chat_pair",
+            chat_pair_kind=kind,
+            chat_pair_task_id=7,
+        )
+        assert not chat_pair_route_allowed("POST", path, other, bound_project_id=99)

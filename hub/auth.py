@@ -29,6 +29,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from hub import brand, config
+from hub import repository as repo
 from hub.actionable_errors import (
     chat_pair_gate_forbidden_detail,
     human_only_gate_detail,
@@ -212,9 +213,10 @@ CHAT_PAIR_IMPLEMENTER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("POST", "/api/tasks/{task_id}/pair-start"),
     ("POST", "/api/tasks/{task_id}/submit-review"),
     ("POST", "/api/tasks/{task_id}/declare-wait"),
-    # #2223: the spec reindex command is the agent's own (hub_reindex_spec). It
-    # is a read of the default branch plus a trust-filtered index write, not a
-    # gate; the reviewer list stays closed to it.
+    # #2223: the spec reindex command is the agent's own (hub_reindex_spec).
+    # {project_id} must be the project of the bound task: a first index of a
+    # project is written without the trust filter, so a foreign project is
+    # refused. The reviewer list stays closed to it.
     ("POST", "/api/projects/{project_id}/spec/reindex"),
     ("POST", "/api/sessions/register"),
     ("POST", "/api/sessions/{session_id}/heartbeat"),
@@ -260,15 +262,16 @@ def _template_to_regex(template: str) -> re.Pattern[str]:
     string surgery on every request.
 
     ``{task_id}`` is a named group so implementer sessions can refuse a
-    different task without a second parse (#980). Other placeholders stay
+    different task without a second parse (#980); ``{project_id}`` likewise
+    against the project of the bound task (#2223). Other placeholders stay
     anonymous — ``{session_id}`` is the caller's own UUID, not the bound task.
     """
     parts: list[str] = []
     for seg in template.split("/"):
         if seg.startswith("{") and seg.endswith("}"):
             name = seg[1:-1]
-            if name == "task_id":
-                parts.append("(?P<task_id>[^/]+)")
+            if name in ("task_id", "project_id"):
+                parts.append(f"(?P<{name}>[^/]+)")
             elif name == "name" and "executor-hosts" in template:
                 # #1712: the host named in the path is compared to the key's own.
                 parts.append("(?P<name>[^/]+)")
@@ -306,14 +309,31 @@ _ALLOW_BY_KIND: Final[dict[str, tuple[tuple[str, re.Pattern[str]], ...]]] = {
 }
 
 
+def _bound_segment_ok(captured: str | None, bound: int | None) -> bool:
+    """A captured path id equals the session's; non-numeric is a refusal."""
+    if captured is None:
+        return True
+    try:
+        got = int(captured)
+    except ValueError:
+        return False
+    return bound is not None and got == int(bound)
+
+
 def chat_pair_route_allowed(
-    method: str, path: str, identity: TokenIdentity | None = None
+    method: str,
+    path: str,
+    identity: TokenIdentity | None = None,
+    *,
+    bound_project_id: int | None = None,
 ) -> bool:
     """Whether a chat-pair session may reach ``(method, path)``.
 
     Intake uses :data:`CHAT_PAIR_ALLOWLIST` unchanged. Implementer uses its
     own list and, when the path carries ``{task_id}``, requires that segment
-    to equal the bound task. A non-numeric segment is a refusal, not a 500.
+    to equal the bound task; ``{project_id}`` must equal ``bound_project_id``,
+    the project of the bound task, and without it is refused (#2223). A
+    non-numeric segment is a refusal, not a 500.
     """
     kind = (
         (getattr(identity, "chat_pair_kind", None) or "intake")
@@ -329,15 +349,12 @@ def chat_pair_route_allowed(
         matched = pattern.match(path)
         if not matched:
             continue
-        captured = matched.groupdict().get("task_id")
-        if kind in config.CHAT_PAIR_TASK_BOUND_KINDS and captured is not None:
-            try:
-                got = int(captured)
-            except ValueError:
-                return False
-            if bound is None or got != int(bound):
-                return False
-        return True
+        if kind not in config.CHAT_PAIR_TASK_BOUND_KINDS:
+            return True
+        captured = matched.groupdict()
+        return _bound_segment_ok(captured.get("task_id"), bound) and _bound_segment_ok(
+            captured.get("project_id"), bound_project_id
+        )
     return False
 
 
@@ -849,7 +866,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     # on the cookie session behind it).
                     return _unauthorized(request)
                 identity = resolved_public or ANONYMOUS_IDENTITY
-                if _chat_pair_refused(identity, request.method, path):
+                if await _chat_pair_refused(request, identity, path):
                     return _chat_pair_forbidden(request.method, path)
                 if (blocked := await _role_gate(request, identity, path)) is not None:
                     return blocked
@@ -878,7 +895,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # The allowlist is checked HERE, before the route runs, so a branch
             # that reads "not an agent" as "a human" never executes for a
             # chat-pair session in the first place (#961).
-            if _chat_pair_refused(identity, request.method, path):
+            if await _chat_pair_refused(request, identity, path):
                 return _chat_pair_forbidden(request.method, path)
             if (blocked := await _role_gate(request, identity, path)) is not None:
                 return blocked
@@ -926,9 +943,30 @@ def _unauthorized(request: Request) -> Response:
     )
 
 
-def _chat_pair_refused(identity: TokenIdentity, method: str, path: str) -> bool:
-    return identity.auth_source == "chat_pair" and not chat_pair_route_allowed(
-        method, path, identity
+async def _bound_project_id(
+    request: Request, identity: TokenIdentity, path: str
+) -> int | None:
+    """Project of the session's bound task, read only for a path that names one.
+
+    The same walk as everywhere else (#335): a child task has no project_id of
+    its own and inherits the epic's.
+    """
+    task_id = identity.chat_pair_task_id
+    db = getattr(request.app.state, "db", None)
+    if task_id is None or db is None or not path.startswith("/api/projects/"):
+        return None
+    project = await repo.resolve_project_for_task(db, int(task_id))
+    return int(project["id"]) if project is not None else None
+
+
+async def _chat_pair_refused(
+    request: Request, identity: TokenIdentity, path: str
+) -> bool:
+    if identity.auth_source != "chat_pair":
+        return False
+    project_id = await _bound_project_id(request, identity, path)
+    return not chat_pair_route_allowed(
+        request.method, path, identity, bound_project_id=project_id
     )
 
 
