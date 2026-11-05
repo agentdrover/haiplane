@@ -114,8 +114,10 @@ async def list_requirements(
 
 async def approved_snapshots(
     db: aiosqlite.Connection, project_id: int, merge_shas: Collection[str]
-) -> list[str]:
-    """Снимки дельты одобренных сдач, чей слитый коммит - один из ``merge_shas`` (#2223).
+) -> list[tuple[str, str]]:
+    """``(слитый коммит, снимок дельты)`` одобренных сдач из ``merge_shas`` (#2223).
+
+    Порядок здесь не задан: его даёт история git, вызывающий сортирует по ней.
 
     Слияние - факт хаба: ``pipeline_merges`` (по проекту слияния, как у остальных
     чтений, не по ``tasks.project_id``). Снимок берётся у поколения, которое
@@ -137,7 +139,7 @@ async def approved_snapshots(
     )
     wanted = set(merge_shas)
     return [
-        str(r["behavior_snapshot"])
+        (str(r["merge_sha"]), str(r["behavior_snapshot"]))
         for r in await cur.fetchall()
         if r["merge_sha"] in wanted
     ]

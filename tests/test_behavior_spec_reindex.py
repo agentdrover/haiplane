@@ -186,6 +186,24 @@ def _modified(obligation: str) -> dict[str, Any]:
     }
 
 
+def _removed() -> dict[str, Any]:
+    """Запись снимка: REQ-1 снят; блок снятия - хеш прежнего текста (как в снимке хаба)."""
+    return {
+        "requirement_id": "REQ-1",
+        "op": "removed",
+        "base_spec_revision": _req1_hash(REQ1_TEXT),
+        "new_requirement_id": "",
+        "obligation": REQ1_TEXT,
+        "scenarios": [REQ1_SCENARIO],
+        "content_hash": _req1_hash(REQ1_TEXT),
+    }
+
+
+def _without_req1() -> str:
+    """AUTH_SPEC без REQ-1: коммит, который его снимает."""
+    return "# Auth\n\n" + AUTH_SPEC[AUTH_SPEC.index("## REQ-2") :]
+
+
 def _reindex_sweep():
     return next(sweep for sweep in poller.SWEEPS if sweep.name == "spec_reindex")
 
@@ -410,3 +428,77 @@ async def test_reindex_skips_unapproved_requirement_block(
     final = {r.id: r for r in await spec_index.indexed_requirements(db, project_id)}
     assert final["REQ-1"].obligation == approved
     assert final["REQ-1"].revision == _req1_hash(approved)
+
+
+async def test_reindex_does_not_take_an_approved_text_that_was_removed_later(
+    client: AsyncClient, db, origin: Origin, merger: Merger, project_id: int
+):
+    """Порядок снимков в окне: одобренный текст, потом одобренное снятие блока.
+
+    Три слияния в одном окне ``прежний..новый``: одобренный modified REQ-1 на
+    текст A, одобренный removed REQ-1, и недоверенный коммит, который возвращает
+    в файл тот же текст A. Ранний хеш A снят позже: текст из слитого коммита
+    индекс не подхватывает, прежняя ревизия остаётся.
+    """
+    origin.publish({"specs/auth/spec.md": AUTH_SPEC})
+    assert (await spec_index.index_project(db, project_id)).state == "indexed"
+    before = {r.id: r for r in await spec_index.indexed_requirements(db, project_id)}
+    text_a = "The hub accepts an empty password."
+
+    first = merger.merge({"specs/auth/spec.md": _auth_spec(req1=text_a)}, "approved A")
+    second = merger.merge({"specs/auth/spec.md": _without_req1()}, "approved removal")
+    merger.merge({"specs/auth/spec.md": _auth_spec(req1=text_a)}, "A comes back")
+    await _approve_merge(client, db, project_id, first, [_modified(text_a)])
+    await _approve_merge(client, db, project_id, second, [_removed()])
+
+    resp = await _reindex(client, project_id)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [(s["file"], s["reason"].split(":")[0]) for s in body["skipped"]] == [
+        ("specs/auth/spec.md", "REQ-1")
+    ]
+    after = {r.id: r for r in await spec_index.indexed_requirements(db, project_id)}
+    assert after["REQ-1"].obligation == REQ1_TEXT
+    assert after["REQ-1"].revision == before["REQ-1"].revision
+
+
+async def test_reindex_takes_only_the_latest_approved_snapshot_of_a_block(
+    client: AsyncClient, db, origin: Origin, merger: Merger, project_id: int
+):
+    """Порядок снимков в окне: одобрены B, затем C, файл откатили на B без снимка.
+
+    Порядок задаёт история git, а не очередность записей слияний: снимок C
+    записан в хабе РАНЬШЕ снимка B, но слит позже. Принимается только последний
+    одобренный текст блока в окне, откат на B - нет; а C, будь он в файле, прошёл бы.
+    """
+    origin.publish({"specs/auth/spec.md": AUTH_SPEC})
+    assert (await spec_index.index_project(db, project_id)).state == "indexed"
+    text_b = "The hub refuses a login with a blank password."
+    text_c = "The hub refuses a login with a blank or missing password."
+
+    first = merger.merge({"specs/auth/spec.md": _auth_spec(req1=text_b)}, "approved B")
+    second = merger.merge({"specs/auth/spec.md": _auth_spec(req1=text_c)}, "approved C")
+    merger.merge({"specs/auth/spec.md": _auth_spec(req1=text_b, preamble="\nr\n")}, "B")
+    await _approve_merge(client, db, project_id, second, [_modified(text_c)])
+    await _approve_merge(client, db, project_id, first, [_modified(text_b)])
+
+    resp = await _reindex(client, project_id)
+
+    assert resp.status_code == 200, resp.text
+    assert [s["reason"].split(":")[0] for s in resp.json()["skipped"]] == ["REQ-1"]
+    kept = {r.id: r for r in await spec_index.indexed_requirements(db, project_id)}
+    assert kept["REQ-1"].obligation == REQ1_TEXT
+
+    # Тот же порядок, но файл остаётся на последнем одобренном тексте C: принят.
+    third = merger.merge({"specs/auth/spec.md": _auth_spec(req1=text_b)}, "approved B2")
+    fourth = merger.merge(
+        {"specs/auth/spec.md": _auth_spec(req1=text_c)}, "approved C2"
+    )
+    await _approve_merge(client, db, project_id, fourth, [_modified(text_c)])
+    await _approve_merge(client, db, project_id, third, [_modified(text_b)])
+    resp = await _reindex(client, project_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["skipped"] == []
+    final = {r.id: r for r in await spec_index.indexed_requirements(db, project_id)}
+    assert final["REQ-1"].obligation == text_c

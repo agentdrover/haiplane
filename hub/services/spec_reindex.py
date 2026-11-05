@@ -11,13 +11,16 @@
 
 Блок требования из слитого коммита попадает в индекс, только если
 
-* его хеш равен хешу записи одобренного снимка сдачи, чьё слияние входит в
-  разность ``прежний_коммит..новый`` (``pipeline_merges``), либо
+* его хеш равен ПОСЛЕДНЕМУ одобренному снимку этого id среди слияний окна
+  ``прежний_коммит..новый`` (``pipeline_merges``), либо
 * его хеш не менялся относительно прежнего индекса.
 
-Иначе блок пропущен и назван в ``skipped``: прежняя ревизия остаётся, а у нового
-id ревизии нет. Исчезнувший из файла блок снимается, только если одобренная
-запись ``removed``/``renamed`` называет его id и ревизию; иначе он остаётся.
+Снимки читаются в порядке коммитов git, а не записей хаба: одобренный текст,
+который позже снят или заменён одобренным, возвращённый в файл коммитом без
+снимка, не подхватывается. Иначе блок пропущен и назван в ``skipped``: прежняя
+ревизия остаётся, а у нового id ревизии нет. Исчезнувший из файла блок снимается,
+только если последняя одобренная запись окна - ``removed``/``renamed`` с
+ревизией, которую индекс или одобренная цепочка окна знали; иначе он остаётся.
 Первая сборка индекса сверять не с чем и проходит без этого фильтра. Запись долга
 по пропущенным id - #2220, ответ контекста при отставшем индексе - #2216.
 """
@@ -27,7 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,17 +58,39 @@ _settled: dict[int, str] = {}
 _clock: dict[str, float] = {}
 
 
+#: Последняя одобренная запись id в окне - снятие (хеша нет).
+REMOVED = ""
+
+
 @dataclass
 class Approved:
-    """Что одобрено снимками слитых сдач: хеши блоков и снятия ``(id, ревизия)``."""
+    """Последняя одобренная запись каждого id окна: хеш блока или ``REMOVED``."""
 
-    hashes: set[str] = field(default_factory=set)
-    removed: set[tuple[str, str]] = field(default_factory=set)
+    latest: dict[str, str] = field(default_factory=dict)
+    known: dict[str, set[str]] = field(default_factory=dict)
 
 
-def approved_from(snapshots: Iterable[str]) -> Approved:
-    """Одобренные хеши из JSON снимков; непрочитанный снимок ничего не одобряет."""
-    approved = Approved()
+def ordered_snapshots(
+    pairs: Iterable[tuple[str, str]], commits: list[str]
+) -> list[str]:
+    """JSON снимков в порядке коммитов окна (старые первыми), не записей хаба."""
+    position = {sha: i for i, sha in enumerate(commits)}
+    ranked = sorted(
+        (p for p in pairs if p[0] in position), key=lambda p: position[p[0]]
+    )
+    return [raw for _sha, raw in ranked]
+
+
+def approved_from(
+    snapshots: Iterable[str], prior: Mapping[str, str] | None = None
+) -> Approved:
+    """Свёртка снимков в порядке коммитов: позднее одобрение id заменяет раннее.
+
+    ``prior`` - ревизии прежнего индекса: снять можно только текст, который
+    индекс или одобренная цепочка окна уже знали. Непрочитанный снимок ничего
+    не одобряет.
+    """
+    approved = Approved(known={i: {h} for i, h in (prior or {}).items()})
     for raw in snapshots:
         try:
             records = json.loads(raw).get("records") or []
@@ -76,15 +101,24 @@ def approved_from(snapshots: Iterable[str]) -> Approved:
     return approved
 
 
+def _retire(approved: Approved, ident: str, base: str) -> None:
+    if base and base in approved.known.get(ident, set()):
+        approved.latest[ident] = REMOVED
+        approved.known[ident] = set()
+
+
 def _collect(approved: Approved, rec: dict[str, Any]) -> None:
     op, digest = rec.get("op"), str(rec.get("content_hash") or "")
     ident = str(rec.get("requirement_id") or "")
-    if op in _ADDING_OPS and digest:
-        approved.hashes.add(digest)
-    if op == "removed" and digest:
-        approved.removed.add((ident, digest))
-    if op == "renamed" and rec.get("base_spec_revision"):
-        approved.removed.add((ident, str(rec["base_spec_revision"])))
+    if op == "removed":
+        _retire(approved, ident, digest)
+        return
+    if op == "renamed":
+        _retire(approved, ident, str(rec.get("base_spec_revision") or ""))
+        ident = str(rec.get("new_requirement_id") or "")
+    if op in _ADDING_OPS and digest and ident:
+        approved.latest[ident] = digest
+        approved.known.setdefault(ident, set()).add(digest)
 
 
 @dataclass
@@ -151,7 +185,9 @@ def plan_reindex(
             seen.add(req.id)
             digest = requirement_revision(req)
             old = before.get(req.id)
-            if digest in approved.hashes or (old and old.revision == digest):
+            if approved.latest.get(req.id) == digest or (
+                old and old.revision == digest
+            ):
                 rows.append(_block_row(path, req, digest))
                 continue
             skipped.append(_skip_issue(path, req.id, digest, read.commit, bool(old)))
@@ -160,7 +196,7 @@ def plan_reindex(
     rows += [
         _kept_row(r)
         for r in prior
-        if r.id not in seen and (r.id, r.revision) not in approved.removed
+        if r.id not in seen and approved.latest.get(r.id) != REMOVED
     ]
     return Plan(_file_rows(read, rows, prior_files), rows, skipped)
 
@@ -171,7 +207,7 @@ async def _indexed_commit(db: aiosqlite.Connection, project_id: int) -> str:
 
 
 async def _commits_since(read: SpecRead, old: str) -> list[str]:
-    """Коммиты ``old..новый``; не названные git - пусто, а пусто доверия не расширяет."""
+    """Коммиты ``old..новый``, старые первыми; не названные git - пусто, а пусто доверия не расширяет."""
     if not old:
         return []
     try:
@@ -191,14 +227,13 @@ async def _write(
 ) -> SpecIndexResult:
     skipped: list[SpecIndexIssue] = []
     if old:
+        prior = await store.list_requirements(db, project_id)
+        pairs = await store.approved_snapshots(db, project_id, commits)
         approved = approved_from(
-            await store.approved_snapshots(db, project_id, commits)
+            ordered_snapshots(pairs, commits), {r.id: r.revision for r in prior}
         )
         plan = plan_reindex(
-            read,
-            await store.list_requirements(db, project_id),
-            await store.list_files(db, project_id),
-            approved,
+            read, prior, await store.list_files(db, project_id), approved
         )
         files, rows, skipped = plan.files, plan.requirements, plan.skipped
     else:

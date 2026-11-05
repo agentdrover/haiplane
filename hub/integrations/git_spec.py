@@ -196,7 +196,7 @@ async def spec_range(repo: str, old: str, new: str) -> dict[str, Any]:
     """``{state, specs_changed, commits, truncated, reason}`` между двумя коммитами (#2223).
 
     ``specs_changed`` - в разности деревьев ``old`` и ``new`` есть путь под
-    ``specs/``. ``commits`` - коммиты ``old..new``: по ним индекс ищет слияния,
+    ``specs/``. ``commits`` - коммиты ``old..new``, старые первыми (порядок несёт одобрения): по ним индекс ищет слияния,
     которые хаб сделал сам. Больше ``MAX_RANGE_COMMITS`` - список усечён
     (``truncated``), и усечение сужает доверие, а не расширяет его. ``old`` не
     найден в клоне (история переписана) - ``unreadable``: вызывающий не знает,
@@ -227,6 +227,8 @@ async def spec_range(repo: str, old: str, new: str) -> dict[str, Any]:
         "-C",
         repo,
         "rev-list",
+        "--topo-order",
+        "--reverse",
         f"--max-count={MAX_RANGE_COMMITS + 1}",
         f"{old}..{new}",
         cwd=repo,
@@ -236,11 +238,16 @@ async def spec_range(repo: str, old: str, new: str) -> dict[str, Any]:
     if rc != 0:
         return _range_unreadable(f"git rev-list failed (rc={rc}): {err[:150]}")
     commits = out.decode("utf-8", errors="replace").split()
+    truncated = len(commits) > MAX_RANGE_COMMITS
+    if truncated:
+        commits = commits[
+            -MAX_RANGE_COMMITS:
+        ]  # max-count держит новые, reverse их разворачивает
     return {
         "state": "read",
         "specs_changed": bool(paths),
-        "commits": commits[:MAX_RANGE_COMMITS],
-        "truncated": len(commits) > MAX_RANGE_COMMITS,
+        "commits": commits,
+        "truncated": truncated,
         "reason": "",
     }
 
