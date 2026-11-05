@@ -1,5 +1,7 @@
 """Hub services package — re-exports all public API from submodules."""
 
+from hub.services.idempotency_maintenance import run_sweep as idempotency_sweep
+
 from hub.services.dashboard import (
     get_agent_sessions_panel,
     get_message_threads_panel,
@@ -374,4 +376,5 @@ __all__ = [
     "unarchive_task",
     "withdraw_own_draft",
     "worktree_session_advisory",
+    "idempotency_sweep",
 ]

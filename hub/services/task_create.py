@@ -58,6 +58,14 @@ class CreatePlan:
     run_check: review_limit.ReviewQueueCheck | None
     run_held: bool
 
+    operation_id: str | None = None
+    alias: str | None = None
+    args_hash: str | None = None
+    args_hash_version: int = 1
+    principal_ref: str = "t:anonymous"
+    actor_ref: str | None = None
+    scope_ref: str | None = None
+
     @property
     def project_id(self) -> int | None:
         return self.bound_project["id"] if self.bound_project else None
@@ -134,11 +142,25 @@ async def prepare_create(
     body: TaskCreate,
     client_request_id: str | None,
     force_draft: bool,
-) -> CreatePlan:
-    """Проверки и вычисления до write-лока; ничего не пишет."""
+    *,
+    operation_id: str | None = None,
+    principal_ref: str = "t:anonymous",
+    actor_ref: str | None = None,
+    identity: Any = None,
+) -> CreatePlan | lc.CreateTaskOutcome:
+    """Read-only planning; operation replay precedes all business checks.
+
+    The keyed caller already holds BEGIN IMMEDIATE; legacy plans precede it.
+    """
     idem_key = resolve_client_request_id(
         None, client_request_id or body.client_request_id
     )
+    if operation_id:
+        from hub.services.task_create_operations import replay
+
+        known = await replay(db, body, idem_key, operation_id, principal_ref, identity)
+        if known is not None:
+            return known
     await _refuse_bad_shape(db, body)
 
     # Bind an epic to a project at creation (#346). Only epics carry
@@ -160,6 +182,11 @@ async def prepare_create(
         initial_status=initial_status,
         run_check=run_check,
         run_held=run_held,
+        operation_id=operation_id,
+        alias=idem_key,
+        args_hash=hash_task_create_payload(normalized) if operation_id else None,
+        principal_ref=principal_ref,
+        actor_ref=actor_ref,
     )
 
 
@@ -188,7 +215,7 @@ async def _replay_known_key(
         )
     await db.commit()
     task = await _load_task_view(db, int(existing["task_id"]))
-    return lc.CreateTaskOutcome(task=task, is_new=False)
+    return lc.CreateTaskOutcome(task=task, is_new=False, legacy_replay=True)
 
 
 async def _insert_new_task(db: aiosqlite.Connection, plan: CreatePlan) -> int:
@@ -258,7 +285,7 @@ async def _replay_after_conflict(
         )
         raise HTTPException(409, idempotency_conflict_detail(record)) from None
     task = await _load_task_view(db, int(existing["task_id"]))
-    return lc.CreateTaskOutcome(task=task, is_new=False)
+    return lc.CreateTaskOutcome(task=task, is_new=False, legacy_replay=True)
 
 
 async def insert_in_transaction(

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from hub import config
+from hub.cli_idempotency import add_operation_id_option, create_headers
 from hub import cli_outcome_retire as outcome_retire_cli
 from hub import cli_owner_minutes as om_cli
 from hub import cli_review_verdict as rv_cli
@@ -230,6 +231,7 @@ def _put_freeze_fields(body: dict[str, Any], args: argparse.Namespace) -> None:
 
 
 def _add_freeze_args(parser: argparse.ArgumentParser) -> None:
+    add_operation_id_option(parser)
     parser.add_argument(
         "--work-type",
         dest="work_type",
@@ -272,12 +274,7 @@ def cmd_task(args: argparse.Namespace) -> int:
         body["human_owner"] = args.owner
     if getattr(args, "reviewer", None):
         body["human_reviewer"] = args.reviewer
-    extra_headers: dict[str, str] = {}
-    request_id = getattr(args, "request_id", "") or ""
-    if request_id.strip():
-        body["client_request_id"] = request_id.strip()
-        extra_headers["X-Client-Request-Id"] = request_id.strip()
-    result = _api("POST", "/api/tasks", body, extra_headers=extra_headers or None)
+    result = _api("POST", "/api/tasks", body, extra_headers=create_headers(body, args))
     _print_json(result)
     return 0
 
@@ -303,7 +300,13 @@ def _cmd_create_typed(task_type: str) -> Any:
             body["human_reviewer"] = args.reviewer
         if getattr(args, "project", None):
             body["project"] = args.project
-        result = _api("POST", "/api/tasks", body)
+        headers = create_headers(body, args)
+        result = _api(
+            "POST",
+            "/api/tasks",
+            body,
+            **({"extra_headers": headers} if headers else {}),
+        )
         _print_json(result)
         return 0
 

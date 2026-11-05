@@ -649,7 +649,22 @@ async def _api_get(path: str, *, timeout: float | None = None) -> Any:
         ) from exc
 
 
-async def _api_post(
+class _ApiPostData(dict):
+    """JSON mapping with transport metadata, invisible to existing callers."""
+
+    def __init__(self, data, response_headers):
+        super().__init__(data)
+        self.response_headers = response_headers
+
+
+async def _api_post(path, body=None, *, extra_headers=None, timeout=None):
+    data, _, headers = await _post_with_headers(
+        path, body, extra_headers=extra_headers, timeout=timeout
+    )
+    return _ApiPostData(data, headers) if isinstance(data, dict) else data
+
+
+async def _post_with_headers(
     path: str,
     body: dict[str, Any] | None = None,
     *,
@@ -667,6 +682,7 @@ async def _api_post(
     # из двух способов вызывающий его передал (#1250).
     idem_key = str(
         (body or {}).get("client_request_id")
+        or headers.get("Idempotency-Key")
         or headers.get("X-Client-Request-Id")
         or ""
     ).strip()
@@ -682,7 +698,7 @@ async def _api_post(
                 raise HubApiError(
                     _parse_api_error(exc.response, exc.response.status_code)
                 ) from exc
-            return resp.json()
+            return resp.json(), resp.status_code, resp.headers
     except httpx.RequestError as exc:
         raise HubApiError(
             _parse_transport_error(
@@ -1052,6 +1068,7 @@ async def hub_create_task(
     freeze_rationale: str = "",
     result_kind: str = "commit",
     rollback: str = "",
+    operation_id: str = "",
 ) -> HubCreateTaskResult:
     """Create a new task, epic, feature, or subtask. HUMAN-ONLY (#360).
 
@@ -1073,6 +1090,7 @@ async def hub_create_task(
         freeze_rationale: Why it may enter a frozen project
         result_kind: commit | state (world state, human-accepted; leaf only)
         rollback: Undo text; DoR requires it for state
+        operation_id: Stable operation key for retries
     """
     body: dict[str, Any] = {
         "title": title,
@@ -1094,10 +1112,16 @@ async def hub_create_task(
     if parent_id is not None:
         body["parent_id"] = parent_id
     extra_headers: dict[str, str] = {}
-    idem_key = client_request_id.strip()
+    operation_key = operation_id.strip()
+    # T3 §4.12: the gateway sends the same value as operation_id and
+    # client_request_id when the caller gave no alias. That is what enables
+    # the legacy dual-write and keeps a code rollback duplicate-free.
+    idem_key = client_request_id.strip() or operation_key
     if idem_key:
         body["client_request_id"] = idem_key
         extra_headers["X-Client-Request-Id"] = idem_key
+    if operation_key:
+        extra_headers["Idempotency-Key"] = operation_key
     result = await _api_post(
         "/api/tasks",
         body,
@@ -1105,7 +1129,13 @@ async def hub_create_task(
     )
     status = result.get("status", "?")
     summary = f"{task_type.capitalize()} #{result['id']} created (status: {status})."
-    return structured_tool_result(summary, HubCreateTaskStructured(task=result))
+    output = structured_tool_result(summary, HubCreateTaskStructured(task=result))
+    headers = {k.lower(): v for k, v in getattr(result, "response_headers", {}).items()}
+    output.meta = {
+        "operation_id": headers.get("idempotency-key", ""),
+        "replayed": headers.get("idempotent-replayed", "").lower() == "true",
+    }
+    return output
 
 
 @mcp.tool()
@@ -1115,6 +1145,7 @@ async def hub_create_subtasks(
     task_type: str = "subtask",
     source: str = "agent",
     agent: str = "",
+    operation_id: str = "",
 ) -> str:
     """Create multiple child tasks under one parent in a single atomic call.
 
@@ -1128,7 +1159,7 @@ async def hub_create_subtasks(
         source: agent (draft) or human (open; human-only, #360).
         agent: Assigned agent name when source is agent.
     """
-    if not items:
+    if not items and not operation_id.strip():
         return format_echo_response("Nothing to create: items list is empty.")
     body: dict[str, Any] = {
         "items": items,
@@ -1136,7 +1167,14 @@ async def hub_create_subtasks(
         "source": source,
         "agent": agent,
     }
-    created = await _api_post(f"/api/tasks/{parent_id}/subtasks", body)
+    headers = (
+        {"Idempotency-Key": operation_id.strip()} if operation_id.strip() else None
+    )
+    created = await _api_post(
+        f"/api/tasks/{parent_id}/subtasks",
+        body,
+        **({"extra_headers": headers} if headers else {}),
+    )
     if not created:
         return format_echo_response(f"No subtasks created under #{parent_id}.")
     lines = [
@@ -3793,6 +3831,8 @@ async def hub_propose_task(
     result_kind: str = "commit",
     rollback: str = "",
     plain_summary: Annotated[str, Field(max_length=300)] = "",
+    operation_id: str = "",
+    client_request_id: str = "",
 ) -> str:
     """Propose new work for human approval (used by agents). Creates a DRAFT.
 
@@ -3816,6 +3856,13 @@ async def hub_propose_task(
         rollback: Undo text for state
         plain_summary: What it is about in plain words, up to 300 chars
     """
+    if defect_verify and operation_id.strip():
+        raise HubApiError(
+            {
+                "reason": "operation_not_idempotent",
+                "message": "Prod-defect create is not admitted",
+            }
+        )
     if defect_verify:
         return await _propose_prod_defect(
             title,
@@ -3850,10 +3897,42 @@ async def hub_propose_task(
         body["plain_summary"] = plain_summary
     if parent_id is not None:
         body["parent_id"] = parent_id
-    result = await _api_post("/api/tasks", body)
-    return format_echo_response(
-        f"Draft {task_type} #{result['id']} created. Awaiting human approval."
+    headers = {}
+    operation_key = operation_id.strip()
+    # Same T3 §4.12 rule as hub_create_task: no alias from the caller means
+    # operation_id is also the alias, so the legacy table gets a row.
+    client_key = client_request_id.strip() or operation_key
+    if operation_key:
+        headers["Idempotency-Key"] = operation_key
+    if client_key:
+        body["client_request_id"] = client_key
+        headers["X-Client-Request-Id"] = client_key
+    result = await _api_post(
+        "/api/tasks", body, **({"extra_headers": headers} if headers else {})
     )
+    echo = {k.lower(): v for k, v in getattr(result, "response_headers", {}).items()}
+    metadata = (
+        {
+            "operation_id": echo.get("idempotency-key", ""),
+            "replayed": echo.get("idempotent-replayed", "").lower() == "true",
+        }
+        if operation_id.strip()
+        else {}
+    )
+    return format_echo_response(
+        f"Draft {task_type} #{result['id']} created. Awaiting human approval.",
+        **metadata,
+    )
+
+
+@mcp.tool()
+async def hub_operation_status(
+    operation_id: str, include_result: bool = False
+) -> CallToolResult:
+    """Read own operation status and dispatch reconciliation state."""
+    path = "/api/operations/" + urllib.parse.quote(operation_id, safe="")
+    data = await _api_get(path + ("?include=result" if include_result else ""))
+    return structured_echo_result("Operation status", **data)
 
 
 @mcp.tool()

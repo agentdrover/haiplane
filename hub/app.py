@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from hub import idempotency_api
 from hub import brand, config, models, services, skill_publish
 from hub.services.spec_context import linked_requirements, requirement_lines
 from hub import db as db_module
@@ -194,7 +195,6 @@ from hub.services.submit_dry_run import SubmitDryRunView, dry_run_submit
 from hub.services.ci_report import settle_ci_run_report, store_ci_run_report
 from hub.services.ci_timing import CIRunTimingSubmit, store_ci_run_timing
 from hub.services.validation_run import run_validation_commands
-from hub.services.task_idempotency import resolve_client_request_id
 from hub.services.review_brief import build_review_brief, reviewer_harness_skill
 from hub.services.tree_output import (
     TreeOutputOptions,
@@ -553,6 +553,7 @@ app = FastAPI(title=brand.PRODUCT_TITLE, version=get_app_version(), lifespan=lif
 # Добавлен первым — значит выполняется последним, уже после аутентификации:
 # соединение открывается только для запроса, который дошёл до обработчика, а
 # не для каждого отбитого на пороге (#1065).
+app.middleware("http")(idempotency_api.operation_admission)
 app.add_middleware(RequestConnectionMiddleware)
 # #1664: after authentication (it reads the resolved identity), before the
 # handler and its connection: a refused request never touches the database.
@@ -564,6 +565,7 @@ app.add_middleware(McpStreamableAcceptCompatMiddleware)
 # production deployments can set HAIPLANE_HUB_ALLOWED_HOSTS.
 app.add_middleware(HostAllowlistMiddleware, allowed_hosts=config.HUB_ALLOWED_HOSTS)
 app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
+app.include_router(idempotency_api.router)
 app.include_router(web_router)
 app.include_router(verdict_evidence_router)
 app.include_router(decisions_router)
@@ -920,27 +922,9 @@ async def _enforce_audit_key(request: Request, body: TaskCreate, idem_key) -> No
 async def api_create_task(body: TaskCreate, request: Request, response: Response):
     _reject_agent_authored_source(request, body.source)
     _reject_chat_pair_dispatch(request, body)
-    idem_key = resolve_client_request_id(
-        request.headers.get("X-Client-Request-Id"),
-        body.client_request_id,
+    return await idempotency_api.create_task_response(
+        body, request, response, _db(request), _enforce_audit_key
     )
-    if current_identity(request).is_ci_auditor:
-        # #1686: the project check and the insert share one write transaction,
-        # so the project cannot change between them.
-        async with write_transaction(_db(request)):
-            await _enforce_audit_key(request, body, idem_key)
-            outcome = await services.create_task(
-                _db(request), body, client_request_id=idem_key
-            )
-    else:
-        outcome = await services.create_task(
-            _db(request), body, client_request_id=idem_key
-        )
-    if idem_key:
-        response.status_code = (
-            status.HTTP_201_CREATED if outcome.is_new else status.HTTP_200_OK
-        )
-    return outcome.task
 
 
 @app.post("/api/prod-defects", response_model=models.ProdDefectFiled)
@@ -965,6 +949,7 @@ async def api_create_subtasks_bulk(
     request: Request,
 ):
     """Atomically create multiple child tasks under ``parent_id``."""
+    idempotency_api.refuse_operation_headers(request)
     _reject_agent_authored_source(request, body.source)
     return await services.create_subtasks_bulk(_db(request), parent_id, body)
 

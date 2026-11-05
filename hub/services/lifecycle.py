@@ -989,6 +989,10 @@ async def _verdict_route_of(
 class CreateTaskOutcome:
     task: TaskView
     is_new: bool = True
+    response_body: str | None = None
+    response_status: int = 200
+    response_headers: dict[str, str] | None = None
+    legacy_replay: bool = False
 
     def __getattr__(self, name: str) -> Any:
         # Backward-compat: before idempotency (#20) create_task returned the
@@ -1041,6 +1045,10 @@ async def create_task(
     *,
     client_request_id: str | None = None,
     force_draft: bool = False,
+    operation_id: str | None = None,
+    principal_ref: str = "t:anonymous",
+    actor_ref: str | None = None,
+    identity: Any = None,
 ) -> CreateTaskOutcome:
     """Create a new task, optionally dispatching it immediately.
 
@@ -1052,9 +1060,22 @@ async def create_task(
     ``task_create.insert_in_transaction``, dispatch and ``task_created`` run
     after its commit and never on a replay.
     """
-    from hub.services import task_create
+    from hub.services import task_create, task_create_operations
 
+    if task_create_operations.admitted(body, client_request_id, operation_id):
+        return await task_create_operations.create(
+            db,
+            body,
+            client_request_id,
+            force_draft,
+            operation_id,
+            principal_ref,
+            actor_ref,
+            identity,
+        )
     plan = await task_create.prepare_create(db, body, client_request_id, force_draft)
+    if isinstance(plan, CreateTaskOutcome):
+        return plan
     inserted = await task_create.insert_in_transaction(db, body, plan)
     if isinstance(inserted, CreateTaskOutcome):
         return inserted

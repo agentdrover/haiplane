@@ -34,7 +34,8 @@
         "hub.mcp_http_compat",
         "hub.mcp_signature",
         "hub.mcp_task_card",
-        "hub.*_api"
+        "hub.*_api",
+        "hub.cli_idempotency"
       ],
       "trees": []
     },
@@ -48,7 +49,9 @@
       "trees": []
     },
     "services": {
-      "modules": [],
+      "modules": [
+        "hub.idempotency"
+      ],
       "trees": [
         "hub.services"
       ]

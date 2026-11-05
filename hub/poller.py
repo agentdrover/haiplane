@@ -2529,6 +2529,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("orchestrator_queue", orchestrator_queue.run_sweep),
     Sweep("messages_retention", _sweep_messages_retention),
     Sweep("mcp_retention", _sweep_mcp_retention),
+    Sweep("idempotency", services.idempotency_sweep),
 )
 
 

@@ -2750,6 +2750,7 @@ async def test_the_sweep_order_is_pinned(db):
         "orchestrator_queue",
         "messages_retention",
         "mcp_retention",
+        "idempotency",
     ]
 
 

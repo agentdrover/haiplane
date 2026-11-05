@@ -72,6 +72,17 @@ HUB_DB_PATH = Path(
 HUB_HOST = env_get("HUB_HOST", "127.0.0.1")
 HUB_PORT = int(env_get("HUB_PORT", "8080"))
 
+# T11 is opt-in; operation headers fail closed while disabled.
+IDEMPOTENCY_ENABLED = env_get("IDEMPOTENCY_ENABLED", "0") == "1"
+IDEMPOTENCY_SERVER_ID = env_get("IDEMPOTENCY_SERVER_ID", "0") == "1"
+IDEMPOTENCY_RESULT_TTL_SECONDS = int(
+    env_get("IDEMPOTENCY_RESULT_TTL_SECONDS", str(7 * 86400))
+)
+IDEMPOTENCY_KEY_TTL_SECONDS = int(
+    env_get("IDEMPOTENCY_KEY_TTL_SECONDS", str(30 * 86400))
+)
+IDEMPOTENCY_MAX_RESULT_BYTES = int(env_get("IDEMPOTENCY_MAX_RESULT_BYTES", "1048576"))
+
 MAX_REVIEW_CYCLES = int(env_get("MAX_REVIEW_CYCLES", "3"))
 # Круг ревью (#1235): сколько ЗАХОДОВ — «находки закрыли, пришли новые» —
 # хаб принимает молча, прежде чем НАЗВАТЬ круг и позвать человека.

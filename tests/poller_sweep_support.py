@@ -472,6 +472,14 @@ SWEEP_COVERAGE: dict[str, Coverage] = {
     "orchestrator_queue": Coverage(removed_by=_NONE_YET),
     "messages_retention": Coverage(removed_by=_NONE_YET),
     "mcp_retention": Coverage(removed_by=_NONE_YET),
+    "idempotency": Coverage(
+        scenarios=(
+            "tests/test_idempotency_keys.py::"
+            "test_expire_result_then_delete_key_and_alias",
+            "tests/test_effect_outbox.py::"
+            "test_crashed_dispatch_is_unknown_without_second_external_call",
+        )
+    ),
 }
 
 

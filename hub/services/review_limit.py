@@ -123,13 +123,16 @@ def _card_text(check: ReviewQueueCheck) -> str:
     )
 
 
-async def _note_once(db: aiosqlite.Connection, task_id: int, text: str) -> None:
+async def _note_once(
+    db: aiosqlite.Connection, task_id: int, text: str, *, commit: bool = True
+) -> None:
     """Запись в карточку; повтор с той же очередью карточку не засоряет."""
     updates = await repo.get_task_updates(db, task_id)
     if any((u["content"] or "") == text for u in updates):
         return
     await repo.add_task_update(db, task_id, "hub", "alert", text)
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 async def refuse_opening_over_review_limit(
@@ -204,6 +207,8 @@ async def note_run_check(
     task_id: int,
     check: ReviewQueueCheck | None,
     done: str,
+    *,
+    commit: bool = True,
 ) -> None:
     """Запись в карточку об исходе лимита на запускающем входе create/approve.
 
@@ -213,7 +218,7 @@ async def note_run_check(
     if check is None:
         return
     if check.outcome != HELD:
-        await _note_once(db, task_id, _card_text(check))
+        await _note_once(db, task_id, _card_text(check), commit=commit)
         return
     listed = ", ".join(f"#{q}" for q in check.queue)
     await _note_once(
@@ -225,4 +230,5 @@ async def note_run_check(
             f"expedite, режим warn или поднять K. Очередь проекта "
             f"«{check.project_slug}»: {listed} (#1264)."
         ),
+        commit=commit,
     )
