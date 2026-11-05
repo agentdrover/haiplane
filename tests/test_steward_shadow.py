@@ -1431,13 +1431,17 @@ async def _no_dispatch(db: aiosqlite.Connection, task_id: int) -> None:
 
 
 async def test_a_reviewer_not_yet_dispatched_is_waited_for(
-    db: aiosqlite.Connection, with_identity
+    db: aiosqlite.Connection, with_identity, review_wait_elapsed
 ):
     """#1185 AC-1: пока ревьюера не позвали, заказ ждёт, а не закрывается.
 
     Путь сдачи коммитит статус review и только потом зовёт ревьюера по HTTP.
     Тик, попавший в это окно, видел пустое имя модели и закрывал слот
     навсегда: наблюдено на #1175 поколения 3.
+
+    ``review_wait_elapsed`` — как предписывает его докстринг: без него страж
+    #1600 отвечал бы раньше, и тест проверял бы не тот страж, что заявлен
+    (#2209).
     """
     project_id = await _project(db, "shadow-race")
     task_id = await _task(db, project_id)
@@ -4845,3 +4849,92 @@ async def test_a_local_advisor_pair_is_applied_and_counted_like_a_cloud_one(
     # Сводка считает pairs = concur + object, локальные пары не выпадают.
     counts = await contour_counts(db)
     assert (counts.concur, counts.object, counts.pairs) == (2, 1, 3)
+
+
+# ---- #2209: красный CI — причина, а не «ревьюера ещё не позвали» -----------
+
+
+async def _red_ci_order(db: aiosqlite.Connection, slug: str) -> int:
+    """Сдача в review: ревью не куплено (CI красный), модель ревьюера пуста."""
+    from tests.ci_trust_support import seed_verified_report
+
+    project_id = await _project(db, slug)
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await seed_verified_report(db, task_id, "a" * 40, validation_status="fail")
+    await order_run(db, task_id, 1)
+    return task_id
+
+
+async def test_red_ci_refuses_with_red_ci_not_undeclared_model(
+    db: aiosqlite.Connection, with_identity, review_wait_elapsed
+):
+    """#2209 AC-1: ревью не куплено — отказ named, а не отговорка про ревьюера.
+
+    На #2203 диспетчер отказал окончательно (REFUSAL_RED_CI), а стюард на
+    каждом тике писал «кросс-модельного ревьюера ещё не позвали»: причина
+    была не та, и сессия агента решила, что хаб забыл ревьюера.
+    """
+    task_id = await _red_ci_order(db, "shadow-red-ci")
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        assert await start_due_runs(db) == 0
+
+    assert started.await_count == 0, "ревью не куплено — провайдер не зовётся"
+    run = (await _runs(db, task_id))[0]
+    # Слот ЖИВ: в окне может прийти зелёный отчёт, и тогда заказ пойдёт.
+    assert run["status"] == RUN_OPEN
+    assert await sh.waiting_refusal_code(db, task_id, run["id"]) == sh.REFUSED_RED_CI
+    detail = (await sh.waiting_refusal(db, task_id, run["id"]))["detail"]
+    assert "CI красный" in detail
+    assert "validation" in detail, "причина называет упавшую проверку"
+
+
+async def test_a_green_ci_keeps_waiting_for_the_reviewer(
+    db: aiosqlite.Connection, with_identity, review_wait_elapsed
+):
+    """#2209 AC-3: зелёный CI — прежнее поведение, ждём ревьюера."""
+    from tests.ci_trust_support import seed_verified_report
+
+    project_id = await _project(db, "shadow-green-ci")
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await seed_verified_report(db, task_id, "a" * 40)  # validation_status=pass
+    await order_run(db, task_id, 1)
+
+    assert await start_due_runs(db) == 0
+    run = (await _runs(db, task_id))[0]
+    assert await sh.waiting_refusal_code(db, task_id, run["id"]) == (
+        REFUSED_UNDECLARED_MODEL
+    )
+
+
+async def test_red_ci_wait_recovers_when_review_is_bought(
+    db: aiosqlite.Connection, with_identity, review_wait_elapsed
+):
+    """#2209 AC-4: отказ red_ci не закрывает заказ — зелёный отчёт пускает его."""
+    from tests.ci_trust_support import seed_verified_report
+
+    task_id = await _red_ci_order(db, "shadow-red-then-green")
+    await _tick_waiting(db, 2)
+
+    # В окне слота приходит зелёный отчёт того же коммита и покупается ревью.
+    await seed_verified_report(db, task_id, "a" * 40)
+    await db.execute(
+        "INSERT INTO review_dispatches "
+        "(task_id, submission_generation, agent_id, model, status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, 1, "rev-agent", "grok-4.6", "done"),
+    )
+    await db.commit()
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        assert await start_due_runs(db) == 1
+    assert started.await_count == 1
+    assert (await _runs(db, task_id))[0]["agent_id"] == "agent-1"
