@@ -413,10 +413,10 @@ class DispatchIntegration:
                 await _finish(_reap_spawned(spawn))
                 raise
         except OSError as exc:
-            log.warning("oc-dev-dispatch could not start at %s: %s", DISPATCH_BIN, exc)
+            log.warning("oc-dev-dispatch binary not found at %s: %s", DISPATCH_BIN, exc)
             # The process never started: no external job can exist (#2241).
             return {
-                "error": f"dispatch binary could not start: {DISPATCH_BIN}",
+                "error": f"dispatch binary not found: {DISPATCH_BIN}",
                 "delivery": "not_sent",
             }
         try:
