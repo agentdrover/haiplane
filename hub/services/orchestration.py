@@ -30,6 +30,7 @@ from hub.db import (
     log_activity,
     write_transaction,
 )
+from hub.services import spec_archive
 from hub.services.behavior_snapshot import refusal_for_moved_head
 from hub.services.prevention_gate import hold_completion
 from hub.services.result_kind import automation_not_applicable
@@ -3169,6 +3170,10 @@ async def _approved_code_check(
     # #2218: у сдачи со снимком новый head не оставляют исключением слияния базы.
     moved = await refusal_for_moved_head(db, task, current_tip, pr_num)
     if moved:
+        # #2220: сдвиг вершины обрывает доставку до шага мержа, а PR мог быть слит
+        # руками на сдвинутой вершине: долг пишется здесь, иначе он недостижим.
+        ctx = await project_git_context(db, task["id"])
+        await note_outside_merge_debt(db, task, ctx, int(pr_num))
         return moved, ""
     if current_tip != pinned:
         # #1233: вершина сдвинулась — но ЧЕМ? Если в ветку приехала только база,
@@ -4397,11 +4402,14 @@ async def _refused_merge_outcome(
                 "проверить, гейт ли его влил, не удалось — merge-коммит не "
                 "прочитан или мерж соседнего пути ещё идёт. Это не ручной мерж, а непроверенный"
             )
+        # #2220: слитый мимо проверенного снимка PR - не чистый архив, долг по id снимка.
+        debt = await spec_archive.note_outside_merge(db, task, ctx, pr_num)
         return False, (
             f"{MERGED_OUTSIDE_GATE_PREFIX}: PR влит не гейтом — PR #{pr_num} уже "
             "MERGED, но мержа гейта по нему нет (ни строки pipeline_merges этой "
             "задачи, ни merge-коммита из реестра гейта). Строка реестра не "
             "создана: drift-guard должен видеть этот мерж как ручной"
+            + (f". {debt}" if debt else "")
         )
     if not state and not merge_detail:
         return False, (
@@ -4409,6 +4417,40 @@ async def _refused_merge_outcome(
             f"#{pr_num}, а перечитать PR после отказа не удалось ({why})"
         )
     return False, await refusal_after_automerge(db, task, ctx, merge_detail)
+
+
+async def note_outside_merge_debt(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any], pr_num: int
+) -> str:
+    """Долг по спецификации, если PR слит не гейтом (#2220); "" - долга нет.
+
+    Для путей доставки, где отказ не доходит до ``_refused_merge_outcome``: у
+    пары сдвиг вершины обрывает доставку раньше мержа, у headless-поллера отказ
+    форжа разбирается без него, а красный CI до мержа не доходит. PR должен быть MERGED без следа гейта, иначе
+    слитый самим гейтом PR стал бы долгом. Сбой здесь доставку не роняет.
+    """
+    try:
+        state, _why = await _recorded_pr_state(db, task, pr_num)
+        if state != "merged":
+            return ""
+        if await _merged_by_gate(db, task, ctx, pr_num) is not GateTrace.NOT_GATE:
+            return ""
+        return await spec_archive.note_outside_merge(db, task, ctx, pr_num)
+    except Exception:  # noqa: BLE001 - долг не должен ронять доставку
+        log.exception("spec debt of #%s (PR #%s) not checked", task["id"], pr_num)
+        return ""
+
+
+async def note_refused_merge(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    step: MergeStep,
+    ctx: dict[str, Any],
+    pr_num: Any,
+) -> None:
+    """Исход ``merge_if_approval_stands`` у headless-поллера: отказ форжа - долг, если PR слит руками."""
+    if step is MergeStep.REFUSED:
+        await note_outside_merge_debt(db, task, ctx, int(pr_num))
 
 
 class GateTrace(enum.Enum):
