@@ -19,6 +19,7 @@ from hub.services.delivery_state import (
     task_delivery,
     undelivered_completed_tasks,
 )
+from hub.services import spec_reindex  # noqa: F401 - hub.poller.SWEEPS reads services.spec_reindex
 from hub.services.outcome_ownership import set_outcome_owner
 from hub.services.outcome_retirement import (
     apply_retirement,

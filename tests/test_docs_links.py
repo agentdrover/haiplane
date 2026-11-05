@@ -108,6 +108,7 @@ def test_implementer_allowlist_stays_pinned():
         ("POST", "/api/tasks/{task_id}/pair-start"),
         ("POST", "/api/tasks/{task_id}/submit-review"),
         ("POST", "/api/tasks/{task_id}/declare-wait"),
+        ("POST", "/api/projects/{project_id}/spec/reindex"),
         ("POST", "/api/sessions/register"),
         ("POST", "/api/sessions/{session_id}/heartbeat"),
         ("POST", "/api/auth/chat-pair/redeem"),
