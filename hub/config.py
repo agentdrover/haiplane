@@ -74,6 +74,10 @@ HUB_PORT = int(env_get("HUB_PORT", "8080"))
 
 # T11 is opt-in; operation headers fail closed while disabled.
 IDEMPOTENCY_ENABLED = env_get("IDEMPOTENCY_ENABLED", "0") == "1"
+# T11 review (major 5): a SEPARATE sender switch. Turning idempotency off must
+# not run outbox rows, and an operator may need to freeze dispatch while the
+# create API keeps working. 0 leaves pending effects untouched for the poller.
+IDEMPOTENCY_DISPATCH_ENABLED = env_get("IDEMPOTENCY_DISPATCH_ENABLED", "1") == "1"
 IDEMPOTENCY_SERVER_ID = env_get("IDEMPOTENCY_SERVER_ID", "0") == "1"
 IDEMPOTENCY_RESULT_TTL_SECONDS = int(
     env_get("IDEMPOTENCY_RESULT_TTL_SECONDS", str(7 * 86400))

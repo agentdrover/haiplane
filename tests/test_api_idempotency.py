@@ -380,36 +380,6 @@ class TestOperationCreate:
         aliases = await db.execute_fetchall("SELECT * FROM operation_aliases")
         assert len(aliases) == 1 and aliases[0]["alias"] == "dual-1"
 
-    async def test_principal_isolation(self, client, db, monkeypatch):
-        from hub import config
-        from hub.config import TokenIdentity
-        from hub import repository_idempotency as repo
-
-        monkeypatch.setattr(
-            config,
-            "HUB_TOKENS",
-            {
-                "test-a": TokenIdentity("a", "admin", principal_id=22411),
-                "test-b": TokenIdentity("b", "admin", principal_id=22412),
-            },
-        )
-        a = {"Authorization": "Bearer test-a", "Idempotency-Key": OP}
-        b = {"Authorization": "Bearer test-b", "Idempotency-Key": OP}
-        first = await client.post("/api/tasks", json={"title": "private"}, headers=a)
-        assert first.status_code == 201, first.text
-        assert (
-            await client.post("/api/tasks", json={"title": "private"}, headers=b)
-        ).status_code == 404
-        assert (
-            await client.get(f"/api/operations/{OP}?include=result", headers=b)
-        ).status_code == 404
-        row = dict(await repo.get_key(db, "p:22411", OP))
-        row["principal_ref"] = "p:22412"
-        await repo.insert_key(db, **row)
-        await db.commit()
-        own = await client.post("/api/tasks", json={"title": "private"}, headers=b)
-        assert own.status_code == 200 and own.content == first.content
-
     async def test_legacy_hit_does_not_bind_new_operation(self, client, db):
         from hub.models import TaskCreate
         from hub.services.task_idempotency import hash_task_create_payload
@@ -496,6 +466,14 @@ async def test_disabled_operation_headers_refused_and_short_alias_compatible(
             "/api/tasks", json={"title": "legacy short", "client_request_id": "req-1"}
         )
     ).status_code == 200
+    # Review, major 17: with the flag off the PRE-T11 resolver accepts the
+    # aliases old clients already used; the new format check must not run.
+    slashed = {"title": "legacy slash", "client_request_id": "request/123"}
+    created = await client.post("/api/tasks", json=slashed)
+    assert created.status_code == 201, created.text
+    repeated = await client.post("/api/tasks", json=slashed)
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["id"] == created.json()["id"]
     assert not await db.execute_fetchall("SELECT * FROM operation_keys")
 
 

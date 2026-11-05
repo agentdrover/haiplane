@@ -1986,7 +1986,8 @@ async def dispatch_task(
         )
         await db.commit()
         log.error("Task #%d → needs_decision: %s", task_id, error)
-        return {"error": error}
+        # Refused before submit: no external job exists (#2241, review major 6).
+        return {"error": error, "delivery": "not_sent"}
 
     updates_rows = await repo.get_task_updates(db, task_id)
     updates = [dict(r) for r in updates_rows] if updates_rows else None

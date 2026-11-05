@@ -3809,7 +3809,7 @@ async def _propose_prod_defect(
         if filed.get("release_id") is not None
         else filed.get("release_reason", "")
     )
-    return format_echo_response(
+    return (
         f"Prod defect draft #{filed['task']['id']} (expedite, found_in=prod); "
         f"{release}. Awaiting human approval."
     )
@@ -3833,7 +3833,7 @@ async def hub_propose_task(
     plain_summary: Annotated[str, Field(max_length=300)] = "",
     operation_id: str = "",
     client_request_id: str = "",
-) -> str:
+) -> CallToolResult:
     """Propose new work for human approval (used by agents). Creates a DRAFT.
 
     Since #323 agents can propose the full decomposition: task, subtask,
@@ -3855,8 +3855,14 @@ async def hub_propose_task(
         result_kind: commit | state (leaf only)
         rollback: Undo text for state
         plain_summary: What it is about in plain words, up to 300 chars
+        operation_id: Stable operation key for retries
+        client_request_id: Idempotency alias (retry-safe)
     """
-    if defect_verify and operation_id.strip():
+    # T11 review (major 8): the prod-defect branch files a DIFFERENT operation
+    # under the same tool name and has no idempotency contract yet (T11c).
+    # Refuse BOTH key kinds instead of silently dropping the alias: a dropped
+    # client_request_id would make two identical calls create two drafts.
+    if defect_verify and (operation_id.strip() or client_request_id.strip()):
         raise HubApiError(
             {
                 "reason": "operation_not_idempotent",
@@ -3864,7 +3870,7 @@ async def hub_propose_task(
             }
         )
     if defect_verify:
-        return await _propose_prod_defect(
+        message = await _propose_prod_defect(
             title,
             description,
             defect_verify,
@@ -3873,8 +3879,9 @@ async def hub_propose_task(
             parent_id,
             plain_summary,
         )
+        return structured_echo_result(message)
     if task_type not in ("task", "subtask", "feature", "epic"):
-        return format_echo_response(
+        return structured_echo_result(
             f"Invalid task_type {task_type!r}: use task, subtask, feature, or epic."
         )
     body: dict[str, Any] = {
@@ -3911,17 +3918,19 @@ async def hub_propose_task(
         "/api/tasks", body, **({"extra_headers": headers} if headers else {})
     )
     echo = {k.lower(): v for k, v in getattr(result, "response_headers", {}).items()}
-    metadata = (
-        {
-            "operation_id": echo.get("idempotency-key", ""),
-            "replayed": echo.get("idempotent-replayed", "").lower() == "true",
-        }
-        if operation_id.strip()
-        else {}
-    )
-    return format_echo_response(
+    # T11 review (major 9): the echo comes from the RESPONSE, not from the
+    # input. An alias-only call gets a hub-generated srv_ id and must still
+    # report it, and a replay of such a call must report replayed=true.
+    metadata = {
+        "operation_id": echo.get("idempotency-key", ""),
+        "replayed": echo.get("idempotent-replayed", "").lower() == "true",
+    }
+    return structured_echo_result(
         f"Draft {task_type} #{result['id']} created. Awaiting human approval.",
-        **metadata,
+        operation_id=metadata["operation_id"],
+        replayed=metadata["replayed"],
+        text_extra=metadata,
+        meta=metadata,
     )
 
 

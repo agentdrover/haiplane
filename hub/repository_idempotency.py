@@ -20,19 +20,14 @@ async def get_key(db: Any, principal: str, operation_id: str) -> Any:
     )
 
 
-async def get_key_any_principal(db: Any, operation_id: str) -> Any:
-    return await _one(
-        db, "SELECT * FROM operation_keys WHERE operation_id=?", (operation_id,)
-    )
-
-
 async def insert_key(db: Any, **fields: Any) -> None:
     await db.execute(
         """INSERT INTO operation_keys (
             principal_ref, operation_id, operation, args_hash, args_hash_version,
-            scope_ref, actor_ref, status, response_status, response_body,
-            response_headers, response_bytes, created_at, expires_at, key_expires_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,COALESCE(?,datetime('now')),?,?)""",
+            scope_ref, resource_id, actor_ref, status, response_status,
+            response_body, response_headers, response_bytes, created_at,
+            expires_at, key_expires_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,COALESCE(?,datetime('now')),?,?)""",
         (
             fields["principal_ref"],
             fields["operation_id"],
@@ -40,6 +35,7 @@ async def insert_key(db: Any, **fields: Any) -> None:
             fields["args_hash"],
             fields["args_hash_version"],
             fields.get("scope_ref"),
+            fields.get("resource_id"),
             fields.get("actor_ref"),
             fields.get("status", "completed"),
             fields.get("response_status"),

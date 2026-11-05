@@ -51,7 +51,7 @@ async def test_create_without_caller_alias_sends_operation_id_as_both(monkeypatc
     }
 
 
-async def test_propose_remains_json_text_with_operation_echo(monkeypatch):
+async def test_propose_returns_meta_echo_and_keeps_text_envelope(monkeypatch):
     post = AsyncMock(
         return_value=(
             {"id": 42},
@@ -63,15 +63,58 @@ async def test_propose_remains_json_text_with_operation_echo(monkeypatch):
     result = await mcp.hub_propose_task(
         "Draft", "Description", operation_id=OP, client_request_id="req-2"
     )
-    assert isinstance(result, str)
-    assert json.loads(result)["operation_id"] == OP
-    assert json.loads(result)["replayed"] is True
+    assert isinstance(result, mcp.CallToolResult)
+    assert result.meta == {"operation_id": OP, "replayed": True}
+    assert result.structuredContent["operation_id"] == OP
+    assert result.structuredContent["replayed"] is True
+    text = json.loads(result.content[0].text)
+    assert text["operation_id"] == OP and text["replayed"] is True
+    assert "Draft task #42 created" in text["message"]
     assert post.await_args.kwargs["extra_headers"] == {
         "Idempotency-Key": OP,
         "X-Client-Request-Id": "req-2",
     }
     assert "operation_id" not in post.await_args.args[1]
     assert post.await_args.args[1]["client_request_id"] == "req-2"
+
+
+async def test_propose_alias_only_reports_the_server_echo(monkeypatch):
+    """Review, major 9: the echo comes from the response, not the input."""
+    server_id = "srv_" + "a" * 32
+    post = AsyncMock(return_value=({"id": 44}, 201, {"Idempotency-Key": server_id}))
+    monkeypatch.setattr(mcp, "_post_with_headers", post)
+    result = await mcp.hub_propose_task(
+        "Draft", "Description", client_request_id="req-only"
+    )
+    assert result.meta == {"operation_id": server_id, "replayed": False}
+    assert result.structuredContent["operation_id"] == server_id
+
+
+async def test_propose_meta_is_visible_through_the_published_mcp_entry(monkeypatch):
+    from hub.mcp_server import mcp as server
+
+    post = AsyncMock(return_value=({"id": 45}, 201, {"Idempotency-Key": OP}))
+    monkeypatch.setattr(mcp, "_post_with_headers", post)
+    result = await server.call_tool(
+        "hub_propose_task", {"title": "Draft", "description": "Description"}
+    )
+    assert result.meta == {"operation_id": OP, "replayed": False}
+
+
+@pytest.mark.parametrize(
+    "key_kwargs",
+    [{"operation_id": OP}, {"client_request_id": "req-defect"}],
+)
+async def test_propose_prod_defect_refuses_both_key_kinds(monkeypatch, key_kwargs):
+    """Review, major 8: the prod-defect branch has no idempotency in T11a."""
+    post = AsyncMock()
+    monkeypatch.setattr(mcp, "_api_post", post)
+    with pytest.raises(mcp.HubApiError) as caught:
+        await mcp.hub_propose_task(
+            "Defect", "Broken", defect_verify="check the fix", **key_kwargs
+        )
+    assert caught.value.payload["reason"] == "operation_not_idempotent"
+    post.assert_not_awaited()
 
 
 async def test_propose_operation_only_also_sends_alias(monkeypatch):

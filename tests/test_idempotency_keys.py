@@ -3,7 +3,8 @@
 import pytest
 from fastapi import HTTPException
 
-from hub import config, idempotency as idem, repository_idempotency as repo
+from hub import config, idempotency as idem, repository as tasks
+from hub import repository_idempotency as repo
 from hub.config import TokenIdentity
 from hub.models import TaskCreate
 from hub.services.idempotency_maintenance import run_sweep
@@ -123,12 +124,17 @@ async def test_done_effect_retention(db):
 
 
 async def test_new_schema_is_additive_and_reentrant(db):
-    from hub.migrations.steps.m202611051200_2241_operation_keys import MIGRATIONS
+    from hub.migrations.steps.m202611051200_2241_operation_keys import (
+        MIGRATIONS as BASE,
+    )
+    from hub.migrations.steps.m202611051400_2241_operation_principal_resource import (
+        MIGRATIONS as REVIEW_FIXES,
+    )
 
-    assert sum("CREATE TABLE " in sql for _, sql in MIGRATIONS) == 3
-    assert sum("CREATE INDEX " in sql for _, sql in MIGRATIONS) == 6
-    assert all("IF NOT EXISTS" in sql for _, sql in MIGRATIONS)
-    for _, sql in MIGRATIONS:
+    assert sum("CREATE TABLE " in sql for _, sql in BASE) == 3
+    assert sum("CREATE INDEX " in sql for _, sql in BASE) == 6
+    assert all("IF NOT EXISTS" in sql for _, sql in BASE)
+    for _, sql in BASE:
         await db.execute(sql)
     await db.commit()
     assert (await db.execute_fetchall("PRAGMA integrity_check"))[0][0] == "ok"
@@ -142,7 +148,66 @@ async def test_new_schema_is_additive_and_reentrant(db):
     applied = await db.execute_fetchall(
         "SELECT name FROM _migrations WHERE name LIKE '2241_%'"
     )
-    assert len(applied) == len(MIGRATIONS)
+    assert len(applied) == len(BASE) + len(REVIEW_FIXES)
+    key_columns = {
+        row["name"]
+        for row in await db.execute_fetchall("PRAGMA table_info(operation_keys)")
+    }
+    assert "resource_id" in key_columns
+    legacy_columns = {
+        row["name"]
+        for row in await db.execute_fetchall("PRAGMA table_info(task_idempotency_keys)")
+    }
+    assert "principal_ref" in legacy_columns
+
+
+async def test_review_fix_columns_are_backfilled(db):
+    """Pre-fix rows: recover the owner and the resource id from what exists."""
+    import json
+
+    from hub import repository_idempotency as repo
+    from hub.migrations.steps.m202611051400_2241_operation_principal_resource import (
+        MIGRATIONS as REVIEW_FIXES,
+    )
+
+    task_id = await tasks.create_task_full(
+        db, TaskCreate(title="backfill"), status="open"
+    )
+    await db.commit()
+    snapshot = json.dumps({"id": task_id, "title": "backfill"})
+    await repo.insert_key(
+        db,
+        principal_ref=PRINCIPAL,
+        operation_id=OP,
+        operation="POST /api/tasks",
+        args_hash="hash",
+        args_hash_version=1,
+        response_status=201,
+        response_body=snapshot,
+        response_headers="{}",
+        response_bytes=len(snapshot),
+        expires_at="2999-01-01 00:00:00",
+        key_expires_at="2999-01-01 00:00:00",
+    )
+    await repo.insert_alias(db, PRINCIPAL, "old-dual-write", OP, "POST /api/tasks")
+    await tasks.insert_task_idempotency_key(
+        db,
+        client_request_id="old-dual-write",
+        task_id=task_id,
+        request_hash="hash",
+    )
+    await db.commit()
+    steps = dict(REVIEW_FIXES)
+    for name in (
+        "2241_operation_keys_resource_backfill_0",
+        "2241_task_idempotency_keys_principal_backfill_0",
+    ):
+        await db.execute(steps[name])
+    await db.commit()
+    key = await repo.get_key(db, PRINCIPAL, OP)
+    assert key["resource_id"] == task_id
+    legacy = await tasks.get_task_idempotency_key(db, "old-dual-write")
+    assert legacy["principal_ref"] == PRINCIPAL
 
 
 async def test_authorization_retains_inactive_project_binding(db):

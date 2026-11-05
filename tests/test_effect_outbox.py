@@ -5,12 +5,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hub import repository as tasks, repository_idempotency as repo
+from hub import config, repository as tasks, repository_idempotency as repo
 from hub.db import write_transaction
 from hub.idempotency import utc_timestamp
 from hub.models import TaskCreate
 from hub.services import effects, lifecycle
 from tests.idempotency_support import OP, PRINCIPAL, seed_effect, seed_key
+
+
+@pytest.fixture(autouse=True)
+def _dispatch_switches(monkeypatch):
+    """Outbox tests exercise the sender; both switches are on by default."""
+    monkeypatch.setattr(config, "IDEMPOTENCY_ENABLED", True)
+    monkeypatch.setattr(config, "IDEMPOTENCY_DISPATCH_ENABLED", True)
 
 
 async def test_enqueue_dedup_preserves_first_payload(db):
@@ -32,14 +39,24 @@ async def test_enqueue_dedup_preserves_first_payload(db):
 
 
 @pytest.mark.parametrize(
-    "result,state",
+    "result,state,last_error",
     [
-        ({"job_id": "job-one"}, "done"),
-        ({"error": "refused"}, "failed"),
-        (TimeoutError("ambiguous"), "unknown"),
+        ({"job_id": "job-one"}, "done", None),
+        ({"error": "refused", "delivery": "not_sent"}, "failed", "dispatch_not_sent"),
+        ({"error": "refused", "delivery": "permanent"}, "failed", "dispatch_refused"),
+        (
+            {"error": "refused", "delivery": "ambiguous"},
+            "unknown",
+            "dispatch_outcome_unknown",
+        ),
+        # No delivery proof: an error result is NOT evidence that no job ran.
+        ({"error": "refused"}, "unknown", "dispatch_outcome_unknown"),
+        (TimeoutError("ambiguous"), "unknown", "dispatch_outcome_unknown"),
     ],
 )
-async def test_dispatch_outcomes_and_no_retries(db, monkeypatch, result, state):
+async def test_dispatch_outcomes_and_no_retries(
+    db, monkeypatch, result, state, last_error
+):
     task_id = await tasks.create_task_full(
         db, TaskCreate(title="effect"), status="running"
     )
@@ -58,10 +75,104 @@ async def test_dispatch_outcomes_and_no_retries(db, monkeypatch, result, state):
     assert row["lease_owner"] and row["lease_until"] is None
     if state == "done":
         assert row["resolution"] == "job_id=job-one"
-    if state == "unknown":
-        assert row["last_error"] == "dispatch_outcome_unknown"
+    else:
+        assert row["last_error"] == last_error
     await effects.process_ready_effects(db)
     await effects.run_dispatch_effect(db, effect_id)
+    assert dispatch.await_count == 1
+
+
+async def test_local_refusal_is_permanent_without_ambiguity(db, monkeypatch):
+    """A refusal raised before submit proves nothing was sent (major 6)."""
+    from fastapi import HTTPException
+
+    await tasks.create_task_full(db, TaskCreate(title="refused"), status="running")
+    await db.commit()
+    effect_id = await seed_effect(db)
+    monkeypatch.setattr(
+        lifecycle, "dispatch_task", AsyncMock(side_effect=HTTPException(422, "nope"))
+    )
+    await effects.run_dispatch_effect(db, effect_id)
+    row = await repo.get_effect(db, effect_id)
+    assert row["state"] == "failed" and row["last_error"] == "dispatch_refused"
+
+
+async def test_unexpected_exception_stays_unknown(db, monkeypatch):
+    await tasks.create_task_full(db, TaskCreate(title="boom"), status="running")
+    await db.commit()
+    effect_id = await seed_effect(db)
+    monkeypatch.setattr(
+        lifecycle, "dispatch_task", AsyncMock(side_effect=RuntimeError("secret"))
+    )
+    await effects.run_dispatch_effect(db, effect_id)
+    row = await repo.get_effect(db, effect_id)
+    assert row["state"] == "unknown"
+    assert row["last_error"] == "dispatch_outcome_unknown"
+
+
+@pytest.mark.parametrize(
+    "scenario,expected_state,expected_error",
+    [
+        ("completed", "dead", "stale_intent:task_completed"),
+        ("archived", "dead", "stale_intent:task_archived"),
+        ("open", "dead", "stale_intent:task_open"),
+        ("missing", "dead", "stale_intent:task_missing"),
+        ("has_job", "done", None),
+    ],
+)
+async def test_stale_intent_is_finalized_without_dispatch(
+    db, monkeypatch, scenario, expected_state, expected_error
+):
+    """The outbox fired completed/archived/job-bearing tasks (major 5)."""
+    if scenario != "missing":
+        task_id = await tasks.create_task_full(
+            db, TaskCreate(title="stale"), status="running"
+        )
+        assert task_id == 1
+        if scenario == "completed":
+            await tasks.update_task(db, task_id, status="completed")
+        elif scenario == "archived":
+            await tasks.update_task(db, task_id, archived=1)
+        elif scenario == "open":
+            await tasks.update_task(db, task_id, status="open")
+        elif scenario == "has_job":
+            await tasks.update_task(db, task_id, job_id="existing-job")
+        await db.commit()
+    effect_id = await seed_effect(db)
+    dispatch = AsyncMock(return_value={"job_id": "would-be-second"})
+    monkeypatch.setattr(lifecycle, "dispatch_task", dispatch)
+    await effects.run_dispatch_effect(db, effect_id)
+    row = await repo.get_effect(db, effect_id)
+    assert row["state"] == expected_state
+    if expected_error:
+        assert row["last_error"] == expected_error
+    else:
+        assert row["resolution"] == "job_id=existing-job"
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("switch", ["idempotency", "dispatch"])
+async def test_sender_switches_freeze_pending_effects(db, monkeypatch, switch):
+    """Neither the poller nor a direct call runs effects with its switch off."""
+    await tasks.create_task_full(db, TaskCreate(title="frozen"), status="running")
+    await db.commit()
+    effect_id = await seed_effect(db)
+    dispatch = AsyncMock(return_value={"job_id": "after-thaw"})
+    monkeypatch.setattr(lifecycle, "dispatch_task", dispatch)
+    if switch == "idempotency":
+        monkeypatch.setattr(config, "IDEMPOTENCY_ENABLED", False)
+    else:
+        monkeypatch.setattr(config, "IDEMPOTENCY_DISPATCH_ENABLED", False)
+    await effects.process_ready_effects(db)
+    await effects.run_dispatch_effect(db, effect_id)
+    row = await repo.get_effect(db, effect_id)
+    assert row["state"] == "pending" and row["attempts"] == 0
+    dispatch.assert_not_awaited()
+    monkeypatch.setattr(config, "IDEMPOTENCY_ENABLED", True)
+    monkeypatch.setattr(config, "IDEMPOTENCY_DISPATCH_ENABLED", True)
+    await effects.run_dispatch_effect(db, effect_id)
+    row = await repo.get_effect(db, effect_id)
+    assert row["state"] == "done" and row["resolution"] == "job_id=after-thaw"
     assert dispatch.await_count == 1
 
 

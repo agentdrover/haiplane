@@ -11,8 +11,9 @@ from hub import config, idempotency as idem, services
 from hub import repository_idempotency as repo
 from hub.auth import current_identity
 from hub.db import write_transaction
-from hub.services.operation_access import require_scope
+from hub.services.operation_access import require_operation_scope
 from hub.services.task_create_operations import expired
+from hub.services.task_idempotency import resolve_client_request_id
 
 router = APIRouter()
 
@@ -28,10 +29,15 @@ def refuse_operation_headers(request: Request) -> None:
 async def create_task_response(
     body: Any, request: Request, response: Response, db: Any, enforce_audit_key: Any
 ) -> Any:
-    alias = idem.resolve_alias(
-        request.headers.get("X-Client-Request-Id"), body.client_request_id
-    )
-    if not config.IDEMPOTENCY_ENABLED:
+    alias_header = request.headers.get("X-Client-Request-Id")
+    if config.IDEMPOTENCY_ENABLED:
+        alias = idem.resolve_alias(alias_header, body.client_request_id)
+    else:
+        # Flag 0 keeps the PRE-T11 create contract (review, major 17): the old
+        # resolver did not validate the alias format, so values like
+        # "request/123" must keep working while the feature is off. New
+        # operation headers still fail closed below.
+        alias = resolve_client_request_id(alias_header, body.client_request_id)
         refuse_operation_headers(request)
     operation_id = idem.resolve_operation_id(request.headers)
     identity = current_identity(request)
@@ -82,10 +88,10 @@ async def operation_status(
     if row is None:
         raise idem.error(404, "operation_not_found")
     saved_result = json.loads(row["response_body"]) if row["response_body"] else None
-    await require_scope(
+    await require_operation_scope(
         db,
         identity,
-        row["scope_ref"],
+        row,
         source=saved_result.get("source") if saved_result else None,
     )
     is_expired = await expired(db, row)

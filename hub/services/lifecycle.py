@@ -1073,7 +1073,15 @@ async def create_task(
             actor_ref,
             identity,
         )
-    plan = await task_create.prepare_create(db, body, client_request_id, force_draft)
+    plan = await task_create.prepare_create(
+        db,
+        body,
+        client_request_id,
+        force_draft,
+        principal_ref=principal_ref,
+        actor_ref=actor_ref,
+        identity=identity,
+    )
     if isinstance(plan, CreateTaskOutcome):
         return plan
     inserted = await task_create.insert_in_transaction(db, body, plan)

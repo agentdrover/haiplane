@@ -5180,7 +5180,7 @@ async def get_task_idempotency_key(
 ) -> dict[str, Any] | None:
     rows = await fetchall(
         db,
-        "SELECT client_request_id, task_id, request_hash "
+        "SELECT client_request_id, task_id, request_hash, principal_ref "
         "FROM task_idempotency_keys WHERE client_request_id = ?",
         (client_request_id,),
     )
@@ -5195,11 +5195,13 @@ async def insert_task_idempotency_key(
     client_request_id: str,
     task_id: int,
     request_hash: str,
+    principal_ref: str | None = None,
 ) -> None:
     await db.execute(
         "INSERT INTO task_idempotency_keys "
-        "(client_request_id, task_id, request_hash) VALUES (?, ?, ?)",
-        (client_request_id, task_id, request_hash),
+        "(client_request_id, task_id, request_hash, principal_ref) "
+        "VALUES (?, ?, ?, ?)",
+        (client_request_id, task_id, request_hash, principal_ref),
     )
 
 

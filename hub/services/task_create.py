@@ -260,6 +260,7 @@ async def _insert_new_task(db: aiosqlite.Connection, plan: CreatePlan) -> int:
             client_request_id=plan.idem_key,
             task_id=task_id,
             request_hash=plan.request_hash,
+            principal_ref=plan.principal_ref,
         )
     return task_id
 

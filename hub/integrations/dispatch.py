@@ -412,9 +412,13 @@ class DispatchIntegration:
                 # его и снимаем всю группу, иначе он остаётся сиротой.
                 await _finish(_reap_spawned(spawn))
                 raise
-        except (FileNotFoundError, PermissionError):
-            log.warning("oc-dev-dispatch binary not found at %s", DISPATCH_BIN)
-            return {"error": f"dispatch binary not found: {DISPATCH_BIN}"}
+        except OSError as exc:
+            log.warning("oc-dev-dispatch could not start at %s: %s", DISPATCH_BIN, exc)
+            # The process never started: no external job can exist (#2241).
+            return {
+                "error": f"dispatch binary could not start: {DISPATCH_BIN}",
+                "delivery": "not_sent",
+            }
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=SUBMIT_TIMEOUT
@@ -429,14 +433,17 @@ class DispatchIntegration:
             log.warning(
                 "oc-dev-dispatch submit failed: %s", stderr.decode(errors="replace")
             )
+            # The subprocess RAN: it may already have submitted the job even
+            # though it exited non-zero. Only reconciliation can tell (#2241).
             return {
                 "error": stderr.decode(errors="replace"),
                 "exit_code": proc.returncode,
+                "delivery": "ambiguous",
             }
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            return {"raw": raw, "exit_code": proc.returncode}
+            return {"raw": raw, "exit_code": proc.returncode, "delivery": "ambiguous"}
 
     async def classify_task(
         self, message: str, repo_root: str | None = None

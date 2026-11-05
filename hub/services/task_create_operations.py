@@ -15,7 +15,11 @@ from hub.db import write_transaction
 from hub.models import TaskView
 from hub.services import lifecycle as lc, task_create as create_steps
 from hub.services import effects, review_limit
-from hub.services.operation_access import require_scope, task_scope
+from hub.services.operation_access import (
+    require_operation_scope,
+    require_scope,
+    task_scope,
+)
 from hub.services.task_idempotency import (
     hash_task_create_payload,
     normalize_task_create,
@@ -66,15 +70,24 @@ def _check_row(row: Any, body: Any, alias: str | None) -> None:
 
 
 async def _legacy_replay(
-    db: Any, body: Any, alias: str | None, identity: Any
+    db: Any, body: Any, alias: str | None, identity: Any, principal: str
 ) -> lc.CreateTaskOutcome | None:
     if not alias:
         return None
     row = await tasks.get_task_idempotency_key(db, alias)
     if row is None:
         return None
+    # Historical rows (the 151 keys from before T11) have no owner: their
+    # access is still checked against the task/project. Rows dual-written by
+    # T11 do have one — replaying them across principals would hand B the task
+    # A created under the same alias (review, blocker 1). The legacy table's
+    # primary key stays global during the rollback window, so the collision is
+    # reported as alias_taken instead of silently creating a second task.
+    owner = row.get("principal_ref")
+    if owner is not None and owner != principal:
+        raise idem.conflict("alias_taken", None, client_request_id=alias)
     if await tasks.get_task(db, int(row["task_id"])) is None:
-        raise idem.error(404, "operation_not_found")
+        raise idem.error(410, "operation_resource_gone")
     scope = await task_scope(db, row["task_id"])
     try:
         await require_scope(db, identity, scope, source=body.source)
@@ -108,7 +121,9 @@ async def replay(
             raise idem.conflict("alias_taken", operation_id)
         if alias and not bound:
             raise idem.conflict("alias_not_bound", operation_id)
-        await require_scope(db, identity, row["scope_ref"], source=body.source)
+        # Re-check the CURRENT binding of the object, not the saved scope_ref:
+        # an epic moved to a closed project must not keep replaying (major 4).
+        await require_operation_scope(db, identity, row, source=body.source)
         if await expired(db, row):
             raise idem.error(410, "operation_expired")
         _check_row(row, body, alias)
@@ -123,10 +138,10 @@ async def replay(
         )
     if bound:
         raise idem.conflict("operation_mismatch", operation_id)
-    other = await repo.get_key_any_principal(db, operation_id)
-    if other is not None and other["principal_ref"] != principal:
-        raise idem.error(404, "operation_not_found")
-    return await _legacy_replay(db, body, alias, identity)
+    # No global lookup: the key namespace is (principal_ref, operation_id), so
+    # the same id under another principal is an INDEPENDENT intention. Hiding a
+    # foreign key is GET's job (404); POST must be able to create its own.
+    return await _legacy_replay(db, body, alias, identity, principal)
 
 
 async def _save(
@@ -166,6 +181,7 @@ async def _save(
         args_hash=plan.args_hash,
         args_hash_version=plan.args_hash_version,
         scope_ref=plan.scope_ref,
+        resource_id=task_id,
         actor_ref=plan.actor_ref,
         response_status=201,
         response_body=snapshot,
@@ -302,7 +318,7 @@ async def _winner(
         operation_id = bound["operation_id"] if bound else None
     if operation_id:
         return await replay(db, body, alias, operation_id, principal, identity)
-    return await _legacy_replay(db, body, alias, identity)
+    return await _legacy_replay(db, body, alias, identity, principal)
 
 
 async def _read_winner(

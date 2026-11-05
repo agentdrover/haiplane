@@ -207,7 +207,10 @@ async def test_mcp_propose_files_a_prod_defect():
             "parent_id": 5,
         },
     )
-    assert "#77" in msg and prod_defect.REASON_NO_RELEASE in msg
+    text = "\n".join(
+        block.text for block in msg.content if getattr(block, "type", "") == "text"
+    )
+    assert "#77" in text and prod_defect.REASON_NO_RELEASE in text
 
 
 async def test_mcp_propose_without_defect_is_unchanged():
