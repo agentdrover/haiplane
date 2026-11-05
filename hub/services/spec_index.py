@@ -177,7 +177,9 @@ async def index_project(db: aiosqlite.Connection, project_id: int) -> SpecIndexR
     file_rows, req_rows = _rows(files, parsed)
     async with write_transaction(db):
         # #2220: блок id из долга слит мимо проверенного снимка - индекс его не берёт.
-        req_rows = await spec_debt.hold_rows(db, project_id, file_rows, req_rows)
+        file_rows, req_rows = await spec_debt.hold_index(
+            db, project_id, file_rows, req_rows
+        )
         await store.replace_index(
             db,
             project_id,

@@ -74,31 +74,33 @@ def _held_row(old: Any) -> dict[str, Any]:
     }
 
 
-async def hold_rows(
+async def hold_index(
     db: aiosqlite.Connection,
     project_id: int,
     files: list[dict[str, str]],
     rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Строки требований для индекса с прежними блоками на месте id из долга.
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Файлы и строки требований для индекса с прежними блоками на месте id из долга.
 
     Id из долга берёт прежняя строка индекса, если её файл ещё есть среди
     прочитанных; иначе блок в индекс не попадает. Долг на весь проект (``""``:
-    в снимке не было id) держит весь прежний индекс: новых строк не берётся, а
-    прежние остаются как были. Остальные строки не тронуты.
+    в снимке не было id) держит весь прежний индекс - и файлы, и требования,
+    включая те, чьих файлов на слитом SHA уже нет; новых строк не берётся.
+    Остальные строки не тронуты.
     """
     held = {d["requirement_id"] for d in await store.list_open(db, project_id)}
     if not held:
-        return rows
-    previous = {r.id: r for r in await index_store.list_requirements(db, project_id)}
-    whole_project = "" in held
-    if whole_project:
-        held = set(previous)
+        return files, rows
+    previous = await index_store.list_requirements(db, project_id)
+    if "" in held:
+        old_files = await index_store.list_files(db, project_id)
+        return old_files, [_held_row(old) for old in previous]
+    by_id = {r.id: r for r in previous}
     paths = {f["path"] for f in files}
-    kept = [] if whole_project else [row for row in rows if row["id"] not in held]
+    kept = [row for row in rows if row["id"] not in held]
     kept += [
-        _held_row(previous[ident])
+        _held_row(by_id[ident])
         for ident in sorted(held)
-        if ident in previous and previous[ident].path in paths
+        if ident in by_id and by_id[ident].path in paths
     ]
-    return kept
+    return files, kept

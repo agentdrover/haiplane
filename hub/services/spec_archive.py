@@ -26,7 +26,8 @@ PR, слитый вне хаба на другом SHA или с блоками 
 ``note_outside_merge`` пишет долг по id снимка (без id в снимке - на весь проект),
 индекс блоки долга не берёт (``spec_debt``). Долг пишут все пути доставки:
 ``_refused_merge_outcome``, обрыв пары на сдвинутой вершине (``_approved_code_check``)
-и отказ мержа у headless-поллера (``orchestration.note_refused_merge``).
+отказ мержа у headless-поллера (``orchestration.note_refused_merge``) и его же
+красный CI (``orchestration.note_outside_merge_debt``).
 Закрытие долга - #2219, переиндексация - #2223.
 """
 

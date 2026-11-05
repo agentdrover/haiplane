@@ -622,6 +622,70 @@ async def test_headless_poller_records_debt_when_pr_merged_by_hand(env: Env):
     )
 
 
+async def test_headless_poller_records_debt_when_ci_failed_on_a_hand_merge(env: Env):
+    """AC-9: PR слит вне хаба при красных проверках — долг есть, задача у человека."""
+    revs = await env.index()
+    record = _mod("REQ-1", revs["REQ-1"], "The hub records the archived delta.")
+    task_id, s1, outside = await _approved_then_pushed_and_merged_by_hand(
+        env, [record], _file({"REQ-1": _req("REQ-1", record)})
+    )
+
+    async def ci(*_a, **_kw) -> CIProbeResult:
+        return CIProbeResult(CIProbeOutcome.failed, "checks_failed")
+
+    env.monkeypatch.setattr(plugins.git_ops, "check_pr_ci", ci)
+    task = dict(await repo.get_task(env.db, task_id))
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await poller._deliver_approved_review(env.db, task)
+
+    assert await _debts(env) == [("REQ-1", task_id, s1, outside)]
+    assert (await env.card(task_id))["status"] == "needs_decision"
+    taken = await _indexed_revisions(env)
+    assert taken["REQ-1"] == revs["REQ-1"], (
+        "слито вне проверенного SHA — индекс не берёт"
+    )
+
+
+SIDE_FILE = "specs/billing/spec.md"
+
+
+async def test_project_wide_debt_keeps_a_requirement_whose_file_is_gone(env: Env):
+    """Долг на весь проект держит и требование файла, удалённого на слитом SHA."""
+    side = SpecRequirement(
+        id="REQ-7", obligation="Billing.", scenarios=BASE[0].scenarios
+    )
+    env.origin.publish({SIDE_FILE: _render([side])})
+    revs = await env.index()
+    before = await _indexed_revisions(env)
+    assert before["REQ-7"] == requirement_revision(side)
+    task_id, s1, resp = await env.attempt("no_delta", None)
+    assert resp is not None and resp.status_code == 200, resp and resp.text
+    await env.approve(task_id)
+    branch = (await env.card(task_id))["branch"]
+    clone = env.origin.clone
+    _git(clone, "checkout", "-q", branch)
+    (clone / SIDE_FILE).unlink()
+    new = _req("REQ-9", _mod("REQ-9", "", OTHER))
+    (clone / HEAD_FILE).write_text(_file(extra=(new,)), encoding="utf-8")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-q", "-m", "drop billing")
+    _git(clone, "push", "-q", "origin", f"{branch}:{branch}")
+    outside = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "checkout", "-q", BRANCH)
+    _merge_outside_hub(env.origin, branch)
+    _forge_says_merged(env, outside)
+    _pin(env.monkeypatch, outside)
+    task = dict(await repo.get_task(env.db, task_id))
+
+    ok, reason = await orchestration.merge_before_completion(env.db, task)
+
+    assert ok is False and reason.startswith("stale_approval")
+    assert await _debts(env) == [("", task_id, s1, outside)]
+    taken = await _indexed_revisions(env)
+    assert taken == before, "файла нет на слитом SHA, а прежний индекс остаётся"
+    assert revs.items() <= taken.items() and "REQ-9" not in taken
+
+
 async def test_project_wide_debt_keeps_the_previous_index(env: Env):
     """Снимок без id: долг на весь проект, прежний индекс остаётся как был."""
     revs = await env.index()

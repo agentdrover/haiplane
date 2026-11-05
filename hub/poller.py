@@ -704,15 +704,14 @@ async def _deliver_approved_review(db, task: dict) -> None:
                 return  # also: a neighbour merges / a rerun booking holds (#1956)
             merged = step in (services.MergeStep.MERGED, services.MergeStep.ALREADY)
             if step is services.MergeStep.MERGED:
-                # Record the commit the merge produced, not
-                # the PR number: the number lives in the
-                # subject the pusher writes, the SHA does
-                # not. Project resolved through the task's
-                # epic rather than its own column, so a
-                # task without one cannot record a merge
-                # that counts for every project (#534).
+                # Record the commit the merge produced, not the PR number: the
+                # number lives in the subject the pusher writes, the SHA does not.
+                # Project resolved through the task's epic rather than its own
+                # column, so a task without one cannot record a merge that
+                # counts for every project (#534).
                 await _record_merge_and_tidy(db, task, pr_num, mctx)
         elif ci.outcome == CIProbeOutcome.failed:
+            await services.note_outside_merge_debt(db, task, mctx, int(pr_num))
             written, _ = await services.record_delivery_outcome(
                 db, task, partial(delivery_writes.note_ci_failed, db, task, pr_num)
             )
