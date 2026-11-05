@@ -27,6 +27,7 @@ from httpx import AsyncClient
 from hub import cli, mcp_server
 from hub import poller
 from hub import repository as repo
+from hub.integrations import git_spec
 from hub.integrations.git_ops import GitOpsIntegration
 from hub.integrations.registry import plugins
 from hub.mcp_server import HubApiError, hub_reindex_spec
@@ -502,3 +503,98 @@ async def test_reindex_takes_only_the_latest_approved_snapshot_of_a_block(
     assert resp.json()["skipped"] == []
     final = {r.id: r for r in await spec_index.indexed_requirements(db, project_id)}
     assert final["REQ-1"].obligation == text_c
+
+
+async def _pending_removal(client, db, merger: Merger, project_id: int, origin: Origin):
+    """Индекс на A (REQ-1, REQ-2); одобренное снятие REQ-1 слито, индекс его не видел."""
+    origin.publish({"specs/auth/spec.md": AUTH_SPEC})
+    assert (await spec_index.index_project(db, project_id)).state == "indexed"
+    old = (await spec_index.index_state(db, project_id))["commit_sha"]
+    removal = merger.merge({"specs/auth/spec.md": _without_req1()}, "approved removal")
+    await _approve_merge(client, db, project_id, removal, [_removed()])
+    return old
+
+
+async def _assert_index_untouched(db, project_id: int, old: str) -> None:
+    state = await spec_index.index_state(db, project_id)
+    assert state["commit_sha"] == old
+    ids = {r.id for r in await spec_index.indexed_requirements(db, project_id)}
+    assert ids == {"REQ-1", "REQ-2"}
+
+
+@pytest.mark.parametrize("failure", ["raises", "unreadable"])
+async def test_unread_commit_window_keeps_the_index_and_the_cursor(
+    client: AsyncClient,
+    db,
+    origin: Origin,
+    merger: Merger,
+    project_id: int,
+    monkeypatch,
+    failure: str,
+):
+    """Окно ``прежний..новый`` не прочиталось: список коммитов - не «одобрений нет».
+
+    Одобренное снятие REQ-1 слито, но git не назвал коммиты окна (исключение или
+    ``unreadable``). Индекс не переписывается, курсор стоит, ответ - не чистый
+    ``indexed``: 503 с причиной. Когда git снова отвечает, то же окно читается и
+    снятие применяется.
+    """
+    old = await _pending_removal(client, db, merger, project_id, origin)
+    real = plugins.git_ops.spec_range
+
+    async def broken(repo: str, a: str, b: str) -> dict[str, Any]:
+        if failure == "raises":
+            raise OSError("git is gone")
+        return {
+            "state": "unreadable",
+            "specs_changed": True,
+            "commits": [],
+            "truncated": False,
+            "reason": "git rev-list failed",
+        }
+
+    monkeypatch.setattr(plugins.git_ops, "spec_range", broken)
+    resp = await _reindex(client, project_id)
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"]["reason"] == "spec_reindex_unreadable"
+    await _assert_index_untouched(db, project_id, old)
+
+    monkeypatch.setattr(plugins.git_ops, "spec_range", real)
+    resp = await _reindex(client, project_id)
+    assert resp.status_code == 200, resp.text
+    ids = {r.id for r in await spec_index.indexed_requirements(db, project_id)}
+    assert ids == {"REQ-2"}
+
+
+async def test_truncated_commit_window_keeps_the_index_and_the_poller_retries(
+    client: AsyncClient,
+    db,
+    origin: Origin,
+    merger: Merger,
+    project_id: int,
+    monkeypatch,
+):
+    """Окно длиннее ``MAX_RANGE_COMMITS``: старые одобрения усечены, индекс не двигается.
+
+    Одобренное снятие - самый старый коммит окна, поверх него ещё коммит. С
+    пределом в один коммит снятие выпадает из списка: команда и поллер не
+    переписывают индекс и не двигают курсор, а когда окно снова помещается,
+    поллер читает его и снимает REQ-1.
+    """
+    old = await _pending_removal(client, db, merger, project_id, origin)
+    merger.merge(
+        {"specs/auth/spec.md": _without_req1().replace("# Auth\n", "# Auth\n\nr\n", 1)},
+        "tail",
+    )
+    monkeypatch.setattr(git_spec, "MAX_RANGE_COMMITS", 1)
+
+    resp = await _reindex(client, project_id)
+    assert resp.status_code == 503, resp.text
+    await _tick(db)
+    await _assert_index_untouched(db, project_id, old)
+
+    monkeypatch.setattr(git_spec, "MAX_RANGE_COMMITS", 1000)
+    await _tick(db)
+    ids = {r.id for r in await spec_index.indexed_requirements(db, project_id)}
+    assert ids == {"REQ-2"}

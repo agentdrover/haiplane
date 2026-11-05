@@ -21,7 +21,9 @@
 ревизия остаётся, а у нового id ревизии нет. Исчезнувший из файла блок снимается,
 только если последняя одобренная запись окна - ``removed``/``renamed`` с
 ревизией, которую индекс или одобренная цепочка окна знали; иначе он остаётся.
-Первая сборка индекса сверять не с чем и проходит без этого фильтра. Запись долга
+Окно ``прежний_коммит..новый`` должно быть прочитано целиком: если git его не
+назвал или список усечён, индекс не переписывается, курсор стоит, а ответ -
+``unreadable`` с причиной (поллер повторит ход). Первая сборка индекса сверять не с чем и проходит без этого фильтра. Запись долга
 по пропущенным id - #2220, ответ контекста при отставшем индексе - #2216.
 """
 
@@ -206,16 +208,40 @@ async def _indexed_commit(db: aiosqlite.Connection, project_id: int) -> str:
     return str(state["commit_sha"]) if state else ""
 
 
-async def _commits_since(read: SpecRead, old: str) -> list[str]:
-    """Коммиты ``old..новый``, старые первыми; не названные git - пусто, а пусто доверия не расширяет."""
+async def _commits_since(read: SpecRead, old: str) -> tuple[list[str], str]:
+    """``(коммиты old..новый старыми первыми, причина)``; причина пуста, только если окно прочитано целиком.
+
+    Непрочитанное или усечённое окно - не «одобрений нет»: по нему нельзя ни
+    принять новый текст, ни снять блок, и индекс с курсором оставляют как есть.
+    """
     if not old:
-        return []
+        return [], ""
     try:
         span = await plugins.git_ops.spec_range(read.workspace, old, read.commit)
-    except Exception as exc:  # noqa: BLE001 - сбой чтения сужает доверие, не роняет проход
+    except Exception as exc:  # noqa: BLE001 - сбой чтения не роняет проход, а отказывает его
         log.warning("spec range of %s not read: %s", read.workspace, exc)
-        return []
-    return list(span.get("commits") or []) if span.get("state") == "read" else []
+        return [], "the commit window was not read"
+    if span.get("state") != "read":
+        return (
+            [],
+            f"the commit window was not read: {span.get('reason') or 'git gave no answer'}",
+        )
+    if span.get("truncated"):
+        return (
+            [],
+            "the commit window is longer than git_spec.MAX_RANGE_COMMITS, older approvals are cut off",
+        )
+    return list(span.get("commits") or []), ""
+
+
+def _window_unread(read: SpecRead, why: str) -> SpecIndexResult:
+    return SpecIndexResult(
+        state="unreadable",
+        ref=read.ref,
+        commit=read.commit,
+        issues=[SpecIndexIssue(file="", reason=why)],
+        detail=f"spec index not rewritten, the cursor stays: {why}",
+    )
 
 
 async def _write(
@@ -261,6 +287,9 @@ async def reindex_project(
 ) -> SpecIndexResult:
     """Команда переиндексации: ветка по умолчанию -> индекс; отказ индекс не меняет.
 
+    Окно коммитов ``прежний..новый`` нужно прочитать целиком: не прочитанное или
+    усечённое окно возвращает ``unreadable`` без записи, курсор остаётся.
+
     Git читается до транзакции; под write-замком проверяется, что индекс не
     ушёл вперёд за время чтения, иначе сверка по ушедшему коммиту дала бы чужой
     набор одобренных хешей.
@@ -270,7 +299,9 @@ async def reindex_project(
         return read
     for _ in range(_ATTEMPTS):
         old = await _indexed_commit(db, project_id)
-        commits = await _commits_since(read, old)
+        commits, why = await _commits_since(read, old)
+        if why:
+            return _window_unread(read, why)
         async with write_transaction(db):
             if await _indexed_commit(db, project_id) == old:
                 return await _write(db, project_id, read, old, commits)
@@ -289,6 +320,8 @@ async def _announce(
     if result.state == "refused":
         log.warning("spec reindex of %s refused: %s", slug, result.detail)
         await log_activity(db, "spec_reindex_refused", f"{slug}: {result.detail}")
+    elif result.state == "unreadable":
+        log.warning("spec reindex of %s not done: %s", slug, result.detail)
     elif result.skipped:
         names = "; ".join(f"{i.file}: {i.reason}" for i in result.skipped)
         log.warning("spec reindex of %s skipped blocks: %s", slug, names)
