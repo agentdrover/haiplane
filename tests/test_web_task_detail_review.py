@@ -281,6 +281,25 @@ async def test_strip_names_incomplete_and_unresolved_review(client: AsyncClient,
     )
 
 
+async def test_card_names_a_refused_hub_access_as_its_own_cause(client, db):
+    """#2280: «access» не прячется под «причина неполноты не заявлена»."""
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+    await _machine_report(
+        client,
+        task_id,
+        findings_confirmed=[],
+        incomplete=True,
+        incomplete_reason="access",
+        lost_dimensions=["доступ к хабу не получен: 401"],
+    )
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+
+    assert "нет доступа к хабу" in page
+    assert "причина неполноты не заявлена" not in page
+    assert "отказ среды — смотреть было нечем" not in page
+
+
 async def test_the_card_page_prints_the_circle_before_the_threshold(client, db):
     """#1235: заходы стоят на СТРАНИЦЕ карточки, а не только в модели.
 

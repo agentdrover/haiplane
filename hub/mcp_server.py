@@ -3937,7 +3937,8 @@ async def hub_submit_machine_review(
             truncated, or a budget ran out.
         incomplete_reason: WHY (#1238): 'environment' — nothing to run tests
             with; a second run repeats it. 'profile' — budget ran out; a
-            top-up can help. Empty: not stated.
+            top-up can help. 'access' — hub code/brief refused. Empty: not
+            stated.
         findings_confirmed: [{title, severity, locator, category?, file?,
             start_line?, end_line?, detail?}]. locator is REQUIRED (#1007):
             'lines' (file + start_line), 'file' (module known, line not),
