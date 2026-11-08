@@ -98,7 +98,7 @@
     {% set mr_flags = [] %}
     {% if not mr.is_current %}{% if mr_flags.append('устарело, работа пересдана') %}{% endif %}{% endif %}
     {% if mr.self_reviewed %}{% if mr_flags.append('саморевью') %}{% endif %}{% endif %}
-    {% if mr.incomplete %}{% if mr_flags.append('прогон неполный') %}{% endif %}{% if mr.incomplete_reason == 'environment' %}{% if mr_flags.append('отказ среды: смотреть было нечем, второй прогон не лечит') %}{% endif %}{% elif mr.incomplete_reason == 'profile' %}{% if mr_flags.append('исчерпан профиль') %}{% endif %}{% else %}{% if mr_flags.append('причина неполноты не заявлена') %}{% endif %}{% endif %}{% elif mr.incomplete is none %}{% if mr_flags.append('полнота не заявлена') %}{% endif %}{% endif %}
+    {% if mr.incomplete %}{% if mr_flags.append('прогон неполный') %}{% endif %}{% if mr.incomplete_reason == 'environment' %}{% if mr_flags.append('отказ среды: смотреть было нечем, второй прогон не лечит') %}{% endif %}{% elif mr.incomplete_reason == 'profile' %}{% if mr_flags.append('исчерпан профиль') %}{% endif %}{% elif mr.incomplete_reason == 'access' %}{% if mr_flags.append('нет доступа к хабу') %}{% endif %}{% else %}{% if mr_flags.append('причина неполноты не заявлена') %}{% endif %}{% endif %}{% elif mr.incomplete is none %}{% if mr_flags.append('полнота не заявлена') %}{% endif %}{% endif %}
     {% if mr.unresolved %}{% if mr_flags.append((mr.unresolved|length ~ ' не проверено')) %}{% endif %}{% endif %}
     {% if mr.lost_dimensions %}{% if mr_flags.append('потеряно измерений: ' ~ mr.lost_dimensions|join(', ')) %}{% endif %}{% endif %}
     {% if mr_undisposed %}{% if mr_flags.append(mr_undisposed ~ ' из ' ~ mr_confirmed ~ ' без диспозиции') %}{% endif %}{% endif %}
@@ -570,6 +570,8 @@
         <span class="badge badge-failed">отказ среды — смотреть было нечем; второй прогон не лечит</span>
         {% elif machine_review.incomplete_reason == 'profile' %}
         <span class="badge badge-self-approved">исчерпан профиль — не хватило охвата</span>
+        {% elif machine_review.incomplete_reason == 'access' %}
+        <span class="badge badge-failed">нет доступа к хабу — бриф и харнесс не прочитаны</span>
         {% else %}
         <span class="badge badge-self-approved">причина неполноты не заявлена</span>
         {% endif %}
