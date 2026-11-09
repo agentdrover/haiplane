@@ -4638,7 +4638,10 @@ async def test_a_spoofed_steward_name_is_not_a_steward_verdict(
         f"/api/tasks/{spoofed}/review-verdict",
         json={"verdict": "approved", "agent": "steward"},
     )
-    assert resp.status_code == 200, resp.text
+    # #2147: the name is refused at the door (nothing written); the counter
+    # still trusts the applied mark, not the name.
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["reason"] == "reserved_actor_name"
     assert await steward_exit.actual_steward_verdicts(db) == {}
 
     project = await repo.resolve_project_for_task(db, real)
