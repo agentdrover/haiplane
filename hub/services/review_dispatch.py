@@ -2211,6 +2211,34 @@ def _report_instruction(http: bool, local: bool) -> str:
     return text
 
 
+def _pin_block(branch: str, generation: int, pinned_sha: str, http: bool) -> str:
+    """Просьба о пине сдачи (#2330): пара полей в сдаче по HTTP или MCP.
+
+    Закреплённый sha называется только для сверки. Подсказанный хабом, он
+    превратил бы пин в эхо хаба, а не в заявление ревьюера о том, что он видел.
+    """
+    where = (
+        "по HTTP (поля JSON-тела POST)"
+        if http
+        else "по MCP (аргументы hub_submit_machine_review)"
+    )
+    pinned = (
+        f"Хаб закрепил за сдачей sha {pinned_sha} — он дан ТОЛЬКО для сверки, не "
+        "как значение для отчёта. "
+        if pinned_sha
+        else "У сдачи нет закреплённого sha — сверять не с чем. "
+    )
+    return (
+        "ПИН СДАЧИ — ПАРОЙ, ОБА ПОЛЯ ИЛИ НИ ОДНОГО. Передай в сдаче "
+        f"{where} expected_generation={generation} (поколение этого "
+        "заказа) и reviewed_sha — полный sha из `git rev-parse HEAD` твоей "
+        f"рабочей копии, снятый после checkout ветки {branch}. {pinned}"
+        "Если твой HEAD не совпал — сообщи свой sha как есть: хаб откажет "
+        "review_pin_mismatch, и это правильный исход. Не копируй sha хаба "
+        "вместо проверки. В текстовый блок отчёта эти поля не входят.\n\n"
+    )
+
+
 def _review_prompt(
     task_id: int,
     branch: str,
@@ -2225,6 +2253,8 @@ def _review_prompt(
     inline_diff: bool = False,
     snapshot: SnapshotArchive | None = None,
     ci_integrity_block: str = "",
+    generation: int = 0,
+    pinned_sha: str = "",
 ) -> str:
     if inline_diff:
         # #1598: у локального ревьюера нет ни клона, ни права запускать — общее
@@ -2281,6 +2311,13 @@ def _review_prompt(
         # скобках, и форматирование прочитало бы "raw_count" как поле.
         + _report_instruction(bool(delivery_block), inline_diff)
         + "\n\n"
+        # Локальный ревьюер без клона не может снять HEAD; поколение 0 — заказ
+        # собран без сдачи, называть в нём нечего.
+        + (
+            ""
+            if inline_diff or generation < 1
+            else _pin_block(branch, generation, pinned_sha, bool(delivery_block))
+        )
     )
     if profile == LITE:
         # No token ceiling is stated (#893): the old figure bounded nothing (the bill
@@ -3840,6 +3877,8 @@ async def prepare_review_order(
             inline_diff=inline_diff,
             snapshot=snapshot,
             ci_integrity_block=await ci_integrity.order_section(db, task_id),
+            generation=generation,
+            pinned_sha=(task.get("submission_sha") or "").strip(),
         ),
         rules_note=rules_note,
         diff_note=diff_note,
