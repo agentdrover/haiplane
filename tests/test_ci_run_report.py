@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import itertools
 import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -1275,21 +1276,26 @@ async def test_the_audit_key_files_only_plain_parentless_drafts(ci_runner_hub):
 def _timing_body(
     run_id: str = "5001", attempt: str = "1", *, minutes: int = 10, **over
 ):
-    """The body the trusted workflow sends; GitHub's own times, no clock."""
+    """The body the trusted workflow sends; GitHub's own times, no clock.
+
+    The day is yesterday, not a fixed date: the metrics read a window that
+    ends now, and a fixed date falls out of it a month after it was written.
+    """
+    day = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
     body = {
         "run_id": run_id,
         "run_attempt": attempt,
         "head_sha": "sha-pinned",
         "event": "pull_request",
         "conclusion": "success",
-        "completed_at": "2026-10-15T12:30:00Z",
+        "completed_at": f"{day}T12:30:00Z",
         "state": "ok",
         "jobs": [
             {
                 "name": "Ruff and pytest",
                 "conclusion": "success",
-                "started_at": "2026-10-15T12:00:00Z",
-                "completed_at": f"2026-10-15T12:{minutes:02d}:00Z",
+                "started_at": f"{day}T12:00:00Z",
+                "completed_at": f"{day}T12:{minutes:02d}:00Z",
                 "steps": [{"key": "test", "conclusion": "success", "seconds": 60.0}],
             }
         ],
