@@ -36,6 +36,7 @@ from hub.review_checks import (
 from hub.services import review_brief_projection as proj
 from hub.services.review_dispatch import sweep_review_dispatches
 from hub.services import review_dispatch
+from hub.services.auto_verdict import checked_clean_report
 from hub.services.digest import _report_outcome_of
 from hub.services.steward_advisor import apply_advisor_outcomes
 from hub.services.steward_corridor import (
@@ -189,6 +190,30 @@ async def _verdict_of(client, db, monkeypatch, slug, *, usage, **overrides):
         await _settled_dispatch(db, task_id, usage_total=usage, monkeypatch=monkeypatch)
     await _post_review(client, task_id, raw_count=0, findings_rejected=[], **overrides)
     return (await client.get(f"/api/tasks/{task_id}")).json()["review_verdict"]
+
+
+def test_only_a_complete_clean_row_with_checks_is_a_checked_report():
+    """Строка отчёта: ступень та же, что на карточке; чужие признаки её не создают."""
+    row = {"raw_count": 0, "incomplete": 0, "checks_done": json.dumps(ONE)}
+    assert checked_clean_report(row) is True
+    for change in (
+        {"incomplete": 1},
+        {"checks_done": "[]"},
+        {"checks_done": json.dumps([{"what": "x"}])},
+        {"raw_count": 2},
+        {"findings_confirmed": json.dumps([{"title": "c"}])},
+        {"unresolved": json.dumps([{"title": "u"}])},
+    ):
+        assert checked_clean_report({**row, **change}) is False, change
+
+
+async def test_a_kept_run_text_is_never_replaced_by_the_store(
+    db: aiosqlite.Connection,
+):
+    review = await repo.insert_machine_review(db, task_id=1, submission_generation=1)
+    await repo.set_machine_review_run_text(db, review, "первый")
+    await repo.set_machine_review_run_text(db, review, "второй")
+    assert dict(await repo.get_machine_review(db, review))["run_text"] == "первый"
 
 
 async def test_the_proof_of_a_checked_report_is_the_bill_and_nothing_else(
