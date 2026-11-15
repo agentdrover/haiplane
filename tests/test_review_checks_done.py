@@ -150,14 +150,21 @@ async def test_a_checked_report_does_not_hide_a_later_empty_one(
     client: AsyncClient, db: aiosqlite.Connection
 ):
     """Алерт «нет данных» пишется по ПЕРВОЙ непроверенной нулевой строке поколения."""
-    task_id = await _reviewable_task(client, db)
     base = {"raw_count": 0, "incomplete": False, "harness_skill": "lite-diff-review"}
-    for body, alerts in (({"checks_done": CHECKS}, 0), ({}, 1), ({}, 1)):
-        resp = await client.post(
-            f"/api/tasks/{task_id}/machine-review", json={**base, **body}
-        )
-        assert resp.status_code == 200, resp.text
-        assert len(await _no_candidates_alerts(db, task_id)) == alerts, body
+    checked = {"checks_done": CHECKS}
+    # Проверенный, пустой, пустой - и пустой, проверенный, проверенный: алерт
+    # один, и проверенный отчёт после пустого второго алерта не вызывает.
+    for order in (
+        ((checked, 0), ({}, 1), ({}, 1)),
+        (({}, 1), (checked, 1), (checked, 1)),
+    ):
+        task_id = await _reviewable_task(client, db)
+        for body, alerts in order:
+            resp = await client.post(
+                f"/api/tasks/{task_id}/machine-review", json={**base, **body}
+            )
+            assert resp.status_code == 200, resp.text
+            assert len(await _no_candidates_alerts(db, task_id)) == alerts, order
 
 
 async def test_the_digest_names_a_checked_report_apart(db: aiosqlite.Connection):
