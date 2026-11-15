@@ -137,7 +137,7 @@ async def cloud_run_text_is_kept_scrubbed(
 ) -> None:
     """AC-6: текст прогона - без секретов, с потолком, в брифе с пометкой."""
     recorder = _DispatchRecorder({"agent": {"id": "bc-t"}, "run": {"id": "r-t"}})
-    _wire(monkeypatch, recorder)  # CURSOR_API_KEY = "test-key": известный секрет
+    _wire(monkeypatch, recorder)  # ключ облака, заданный здесь, - известный секрет
     task_id = await _submitted(client, db, "spike-run-text")
     resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=report())
     assert resp.status_code == 200, resp.text
