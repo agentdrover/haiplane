@@ -15,6 +15,7 @@ from typing import Any
 from hub import config
 from hub import cli_outcome_retire as outcome_retire_cli
 from hub import cli_owner_minutes as om_cli
+from hub import cli_spec_reindex as spec_cli
 from hub import cli_review_verdict as rv_cli
 from hub import cli_worktree_prune as wt_prune
 from hub import expected_sha as expected_sha_cli
@@ -3276,6 +3277,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_executor_stop_parser(sub)
     add_executor_host_parsers(sub)
     om_cli.add_parsers(sub)
+    spec_cli.add_parsers(sub)
 
     p_slots = sub.add_parser(
         "slots", help="Executor channels and slots: which task, since when (#1434)"

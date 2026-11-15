@@ -204,6 +204,7 @@ from hub.services.tree_output import (
 from hub.poller import start_poller
 from hub.decisions_api import router as decisions_router
 from hub.owner_minutes_api import router as owner_minutes_router
+from hub.spec_reindex_api import router as spec_reindex_router
 from hub.verdict_evidence_api import router as verdict_evidence_router
 from hub.web_executor_slot import router as executor_slot_web_router
 from hub.critic_host_api import router as critic_host_router
@@ -568,6 +569,7 @@ app.include_router(web_router)
 app.include_router(verdict_evidence_router)
 app.include_router(decisions_router)
 app.include_router(owner_minutes_router)
+app.include_router(spec_reindex_router)
 app.include_router(executor_host_router)
 app.include_router(role_host_router)
 app.include_router(critic_host_router)

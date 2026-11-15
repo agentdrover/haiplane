@@ -22,6 +22,7 @@
         "hub.cli_manual_recovery",
         "hub.cli_task_fields",
         "hub.cli_owner_minutes",
+        "hub.cli_spec_reindex",
         "hub.cli_outcome_retire",
         "hub.cli_delivery_rerun",
         "hub.cli_review_verdict",

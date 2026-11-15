@@ -469,6 +469,12 @@ SWEEP_COVERAGE: dict[str, Coverage] = {
             "test_a_release_that_did_not_reach_prod_is_reported_once",
         )
     ),
+    "spec_reindex": Coverage(
+        scenarios=(
+            "tests/test_behavior_spec_reindex.py::"
+            "test_poller_reindexes_after_default_branch_moves",
+        )
+    ),
     "orchestrator_queue": Coverage(removed_by=_NONE_YET),
     "messages_retention": Coverage(removed_by=_NONE_YET),
     "mcp_retention": Coverage(removed_by=_NONE_YET),

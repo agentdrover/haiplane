@@ -5060,6 +5060,29 @@ async def hub_provision_project(project_id: int) -> CallToolResult:
 
 
 @mcp.tool()
+async def hub_reindex_spec(project_id: int) -> CallToolResult:
+    """Re-read specs/ from the default-branch ref into the spec index (#2223).
+
+    Same command as REST and `oc-hub spec reindex`. A bad file or duplicate id
+    refuses it, names the file, keeps the old index.
+
+    Args:
+        project_id: Project id.
+    """
+    try:
+        result = await _api_post(f"/api/projects/{project_id}/spec/reindex")
+    except HubApiError as exc:
+        return _error_result(exc)
+    skipped = result.get("skipped") or []
+    return structured_echo_result(
+        f"Spec index of project {project_id}: {result.get('state')} at "
+        f"{str(result.get('commit', ''))[:12]}, {result.get('files', 0)} files, "
+        f"{result.get('requirements', 0)} requirements, {len(skipped)} skipped",
+        **result,
+    )
+
+
+@mcp.tool()
 async def hub_wait_events(
     since: int = 0,
     wait: int = 30,

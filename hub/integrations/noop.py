@@ -300,6 +300,16 @@ class NoopGitOps:
             "reason": "git не настроен",
         }
 
+    async def spec_range(self, repo: str, old: str, new: str) -> dict[str, Any]:
+        """No git here - "could not look", never "specs/ did not change" (#2223)."""
+        return {
+            "state": "unreadable",
+            "specs_changed": False,
+            "commits": [],
+            "truncated": False,
+            "reason": "git не настроен",
+        }
+
     async def files_naming_at_ref(
         self, repo: str, ref: str, word: str, pathspec: str = "*.py"
     ) -> set[str] | None:
