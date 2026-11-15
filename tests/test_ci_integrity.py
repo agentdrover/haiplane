@@ -29,10 +29,10 @@ from hub.services.ci_integrity import (
     Standing,
     scan_diff,
 )
+from tests.auto_verdict_support import _PinnedGitOps
 from tests.test_auto_verdict import (
     _CLEAN_REVIEW,
     _TIP,
-    _PinnedGitOps,
     _post_review,
     _submitted_task,
 )

@@ -184,12 +184,6 @@
       "removed_by": "unclaimed"
     },
     {
-      "path": "tests/test_auto_verdict.py",
-      "measured": 905,
-      "max": 951,
-      "removed_by": "unclaimed"
-    },
-    {
       "path": "tests/test_call_sites.py",
       "measured": 963,
       "max": 1012,
