@@ -12,6 +12,7 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 import hub.db as db_module
@@ -101,9 +102,27 @@ def test_only_well_named_entries_count_and_long_words_are_cut():
 
 
 def test_a_dropped_entry_is_named_in_the_receipt():
-    assert checks_receipt(0, 0) == ""
-    assert "принят: 2" in checks_receipt(2, 2)
-    assert "принято 1 из 3" in checks_receipt(3, 1)
+    bad = {"what": "без итога"}
+    assert checks_receipt([], 0) == ""
+    assert "принят: 2" in checks_receipt(ONE * 2, 2)
+    text = checks_receipt(ONE + [bad, bad], 1)
+    assert "принято 1 из 3" in text and "2 без одного из слов" in text
+    assert "сверх потолка" not in text
+
+
+def test_the_receipt_names_the_real_reason_when_the_ceiling_cut_the_tail():
+    """41 полная запись: хвост отрезан потолком, а слов хватало (находка 16b483a9)."""
+    full = [{"what": f"w{i}", "how": "h", "result": "r"} for i in range(CHECKS_MAX + 1)]
+    kept = len(clean_checks(full))
+    text = checks_receipt(full, kept)
+    assert f"принято {CHECKS_MAX} из {CHECKS_MAX + 1}" in text
+    assert f"1 сверх потолка {CHECKS_MAX}" in text
+    assert "без одного из слов" not in text, "слов хватало: причина названа неверно"
+    # Смешанные причины: одна запись без слова и одна сверх потолка.
+    mixed = full + [{"what": "x"}]
+    text = checks_receipt(mixed, len(clean_checks(mixed)))
+    assert f"принято {CHECKS_MAX} из {CHECKS_MAX + 2}" in text
+    assert "1 без одного из слов" in text and f"1 сверх потолка {CHECKS_MAX}" in text
 
 
 def test_the_run_text_cap_cuts_and_says_so():
@@ -294,11 +313,15 @@ async def test_the_steward_reads_the_same_proof_for_a_checked_report(
 # --- текст прогона --------------------------------------------------------------
 
 
-async def _report_then_run(client, db, monkeypatch, slug, *, status, text):
+async def _report_then_run(
+    client, db, monkeypatch, slug, *, status, text, **report_extra
+):
     recorder = _DispatchRecorder({"agent": {"id": "bc-w"}, "run": {"id": "r-w"}})
     _wire(monkeypatch, recorder)
     task_id = await _submitted(client, db, slug)
-    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=report())
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review", json=report(**report_extra)
+    )
     assert resp.status_code == 200, resp.text
     state = {"status": status, "text": text}
 
@@ -362,6 +385,58 @@ async def test_a_secret_on_the_cut_is_scrubbed_before_the_cap(
     kept = await _kept(db, task_id)
     assert kept.endswith(RUN_TEXT_CUT_MARK) and "tes" + RUN_TEXT_CUT_MARK not in kept
     assert "test-key" not in kept
+
+
+async def test_a_failure_before_the_dispatch_closes_leaves_nothing_committed(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Текст, счёт, алерт #757 и закрытие заказа - одна транзакция свипа (находка).
+
+    Сбой между сохранением текста и закрытием заказа, затем откат конца тика
+    (``_poll_once``): ни алерта, ни счёта на отчёте, заказ active; повторный
+    проход пишет ровно один алерт и закрывает заказ.
+    """
+    task_id, _ = await _report_then_run(
+        client,
+        db,
+        monkeypatch,
+        "run-atomic",
+        status="FINISHED",
+        text="итог прогона",
+        tokens_spent=120_000,
+    )
+    real = repo.set_review_dispatch_status
+    failing = {"on": True}
+
+    async def _flaky(conn, dispatch_id, status):
+        if failing["on"] and status == "done":
+            raise RuntimeError("сбой между текстом и закрытием")
+        return await real(conn, dispatch_id, status)
+
+    monkeypatch.setattr(repo, "set_review_dispatch_status", _flaky)
+    with pytest.raises(RuntimeError):
+        await sweep_review_dispatches(db)
+    await db.rollback()  # конец тика поллера: открытая транзакция откатывается
+
+    review = dict(await repo.get_latest_machine_review(db, task_id))
+    assert await _usage_alerts_of(db, task_id) == []
+    assert review["provider_tokens"] is None and review["run_text"] == ""
+    assert (await _any_dispatch_row(db, task_id))["status"] == "active"
+
+    failing["on"] = False
+    await sweep_review_dispatches(db)
+    assert len(await _usage_alerts_of(db, task_id)) == 1, "второго алерта нет"
+    assert (await _any_dispatch_row(db, task_id))["status"] == "done"
+    assert await _kept(db, task_id) == "итог прогона"
+
+
+async def _usage_alerts_of(db, task_id: int) -> list[str]:
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    return [
+        u["content"]
+        for u in updates
+        if "расходится с данными провайдера" in u["content"]
+    ]
 
 
 async def test_an_empty_or_failed_run_text_is_not_a_kept_text(
@@ -441,7 +516,7 @@ async def test_mcp_receipt_forwards_the_checks_and_names_dropped_entries():
     assert post.await_args.args[1]["checks_done"] == sent
     text = receipt.content[0].text
     assert outcome_label(OUTCOME_CHECKED_CLEAN) in text
-    assert "принято 1 из 2" in text
+    assert "принято 1 из 2" in text and "1 без одного из слов" in text
     with patch("hub.mcp_server._api_post", new_callable=AsyncMock) as post:
         post.return_value = {**stored, "checks_done": []}
         silent = await hub_submit_machine_review(7, raw_count=0, incomplete=False)

@@ -4023,10 +4023,8 @@ async def hub_submit_machine_review(
     outcome_label = str(result.get("outcome_label") or "")
     if outcome_label:
         outcome_note = f" Исход отчёта: {outcome_label}."
-    # #2336: сколько записей списка хаб принял - запись без трёх слов отбрасывается.
-    outcome_note += checks_receipt(
-        len(checks_done), len(result.get("checks_done") or [])
-    )
+    # #2336: сколько записей списка хаб принял и почему отбросил остальные.
+    outcome_note += checks_receipt(checks_done, len(result.get("checks_done") or []))
     return structured_echo_result(
         f"Machine review for task #{task_id} recorded (submission "
         f"#{result.get('submission_generation')}): {stored_raw} raw → "

@@ -6446,7 +6446,10 @@ async def _keep_run_text(
     (``_restamp_owed_usage``). Порядок значим: сначала ``scrub_secrets`` по
     всему тексту, потом потолок длины — секрет на границе обрезки не должен
     остаться своим началом. В логи текст не пишется. Сбой здесь не мешает
-    закрыть заказ: текст — справка, а не условие.
+    закрыть заказ: текст — справка, а не условие. Не коммитит: запись идёт в
+    транзакции вызывающего свипа вместе со счётом, алертом и закрытием заказа,
+    иначе сбой между ними фиксировал бы алерт при активном заказе, и повтор
+    прохода писал бы второй.
     """
     if not dispatch.get("agent_id") or not dispatch.get("run_id"):
         return
@@ -6469,7 +6472,6 @@ async def _keep_run_text(
             return
         kept = cap_run_text(cursor_cloud.scrub_secrets(text))
         await repo.set_machine_review_run_text(db, int(review["id"]), kept)
-        await db.commit()
     except Exception:  # noqa: BLE001 - degradation is the contract
         log.exception("could not keep the run text of dispatch #%s", dispatch.get("id"))
 
@@ -6521,9 +6523,9 @@ async def _restamp_owed_usage(db: aiosqlite.Connection) -> None:
     ):
         dispatch = dict(row)
         finished = await _agent_finished(dispatch)
+        total = await _agent_usage_total(dispatch["agent_id"]) if finished else None
         if finished:
             await _keep_run_text(db, dispatch)
-        total = await _agent_usage_total(dispatch["agent_id"]) if finished else None
         if total is None:
             await repo.mark_review_dispatch_usage(db, dispatch["id"], USAGE_OPEN)
         else:

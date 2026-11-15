@@ -107,17 +107,34 @@ def cap_run_text(text: str) -> str:
     return text[: RUN_TEXT_LIMIT - len(RUN_TEXT_CUT_MARK)] + RUN_TEXT_CUT_MARK
 
 
-def checks_receipt(sent: int, kept: int) -> str:
+def dropped_checks(sent: Any) -> tuple[int, int]:
+    """Сколько записей ``clean_checks`` отбросил и почему: ``(без слова, сверх потолка)``.
+
+    Считает по тому же ``_entry``, что и сам отбор: две причины не смешиваются,
+    и квитанция не называет нехватку слов там, где хвост срезал потолок.
+    """
+    if not isinstance(sent, list):
+        return 0, 0
+    named = sum(1 for raw in sent if _entry(raw) is not None)
+    return len(sent) - named, max(0, named - CHECKS_MAX)
+
+
+def checks_receipt(sent: Any, kept: int) -> str:
     """Фраза квитанции о списке проверок: сколько записей хаб принял (#2336).
 
-    Пусто, когда список не посылали. Запись, где нет одного из трёх слов, хаб
-    отбрасывает: молчание об этом оставило бы ревьюера уверенным, что «проверено».
+    ``sent`` - что послал ревьюер, ``kept`` - сколько хаб записал. Пусто, когда
+    список не посылали. Отброшенное названо по причинам: молчание об этом
+    оставило бы ревьюера уверенным, что «проверено».
     """
     if not sent:
         return ""
-    if kept == sent:
+    if kept == len(sent):
         return f" Список проверок принят: {kept} (слово ревьюера)."
-    return (
-        f" Список проверок: принято {kept} из {sent} — запись без одного из слов "
-        "what, how, result отбрасывается."
-    )
+    unnamed, over = dropped_checks(sent)
+    reasons = []
+    if unnamed:
+        reasons.append(f"{unnamed} без одного из слов what, how, result")
+    if over:
+        reasons.append(f"{over} сверх потолка {CHECKS_MAX}")
+    why = f" Отброшено: {'; '.join(reasons)}." if reasons else ""
+    return f" Список проверок: принято {kept} из {len(sent)}.{why}"
