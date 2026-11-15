@@ -85,23 +85,60 @@ def test_the_mcp_prompt_still_names_its_tools() -> None:
     assert set(_MCP_TOOL.findall(mcp)) >= {"hub_get_skill", "hub_submit_machine_review"}
 
 
+def _access_block(profile: str) -> str:
+    http = _prompt(profile, True)
+    block = http[http.index("ЕСЛИ ДОСТУП НЕ ПОЛУЧЕН") :]
+    return block[: block.index("\n\n")]
+
+
+def _access_cases(block: str) -> dict[str, str]:
+    """Случаи инструкции по номеру: строка, начинающаяся с «N) »."""
+    cases = {}
+    for line in block.split("\n"):
+        match = re.match(r"([1-9])\) ", line)
+        if match:
+            cases[match.group(1)] = line
+    return cases
+
+
 @pytest.mark.parametrize("profile", [LITE, DEEP])
 def test_the_prompt_names_the_reason_for_a_refused_redeem(profile: str) -> None:
-    """Отказ обмена кода — своя причина ``access``, а не ``environment``.
+    """Отказ доступа — своя причина ``access``, а не ``environment``.
 
     Промт говорит это в блоке доступа, ДО чтения кода: ран, которому код не
     подошёл, не должен выбирать между «нечем запустить проверки» и тишиной.
     """
-    http = _prompt(profile, True)
-    block = http[http.index("ЕСЛИ ДОСТУП НЕ ПОЛУЧЕН") :]
-    block = block[: block.index("\n\n")].replace("\n", " ")
-    assert 'incomplete_reason="access"' in block
-    assert "chat_pair_invalid" in block
-    assert "не отказ среды" in block
-    assert "lost_dimensions" in block
+    block = _access_block(profile)
+    flat = block.replace("\n", " ")
+    assert 'incomplete_reason="access"' in flat
+    assert "не отказ среды" in flat
+    assert "lost_dimensions" in flat
     # Сам код в отчёт не просится: он одноразовый, но лежит в чужом транскрипте.
-    assert "не пиши" in block and "код доступа" in block
+    assert "не пиши" in flat and "код доступа" in flat
     assert "ЕСЛИ ДОСТУП НЕ ПОЛУЧЕН" not in _prompt(profile, False)
+
+
+@pytest.mark.parametrize("profile", [LITE, DEEP])
+def test_the_access_instruction_splits_what_the_run_could_observe(profile: str) -> None:
+    """Три случая, и каждому — только то, что для него верно.
+
+    Обмен ответил ошибкой и хаб не ответил — сессии нет, HTTP-сдача закрыта.
+    Обмен прошёл, бриф не прочитался — сессия есть, и отчёт сдаётся POST'ом:
+    сказать там «HTTP-сдача закрыта» значило бы отнять у рана открытый путь.
+    """
+    cases = _access_cases(_access_block(profile))
+    assert sorted(cases) == ["1", "2", "3"]
+
+    refused, silent, brief = cases["1"], cases["2"], cases["3"]
+    assert "обмен кода HTTP" in refused
+    assert "закрыта" in refused and "блоком" in refused
+
+    assert "не ответил" in silent
+    assert "закрыта" in silent and "блоком" in silent
+
+    assert "бриф не прочитан" in brief
+    assert "закрыта" not in brief, "обмен прошёл — HTTP-сдача открыта"
+    assert "POST" in brief and "machine-review" in brief
 
 
 def test_the_block_without_a_code_is_still_empty() -> None:
@@ -122,6 +159,20 @@ def test_access_is_its_own_word_and_not_an_environment_refusal() -> None:
     assert is_environment_refusal(report) is False
     assert _ladder_cause_note(report) == ACCESS_REFUSAL_NOTE
     assert "не отказ среды" in ACCESS_REFUSAL_NOTE
+    _assert_audit_named_by_case(ACCESS_REFUSAL_NOTE)
+
+
+def _assert_audit_named_by_case(text: str) -> None:
+    """Текст не утверждает безусловно, что причина лежит в аудите отказа обмена.
+
+    Хаб не знает, какой из случаев был: аудит отказа пишет только 401, 429 и
+    недоступность хаба его не пишут, а прошедший обмен виден строкой
+    ``chat_pair_redeem``.
+    """
+    assert re.search(r"401[^.;]{0,80}chat_pair_redeem_refused", text), text
+    assert re.search(r"429[^.;]*недоступн[^.;]*не пиш", text), text
+    assert re.search(r"chat_pair_redeem(?!_)[^.;]*бриф", text), text
+    assert "Почему отказал обмен кода" not in text
 
 
 async def _reviewable_task(db) -> int:
@@ -171,7 +222,7 @@ async def test_a_refused_redeem_is_named_on_the_card_and_counted_apart(client, d
     access_alerts = [a for a in alerts if "НЕ ПОЛУЧИЛ ДОСТУП" in a]
     assert len(access_alerts) == 1, alerts
     assert "обмен кода дал 401" in access_alerts[0]
-    assert "chat_pair_redeem_refused" in access_alerts[0], "куда смотреть причину"
+    _assert_audit_named_by_case(access_alerts[0])
     assert not [a for a in alerts if "ОТКАЗУ СРЕДЫ" in a], "это не отказ среды"
 
     broken = await _reviewable_task(db)
