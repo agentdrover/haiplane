@@ -68,6 +68,7 @@ from hub.services import (
     project_policy,
     ci_green_proof,
     red_test_gate,
+    spec_archive,
     submission_contract,
     verdict_text,
 )
@@ -2627,6 +2628,8 @@ class SubmitContext:
     submission_sha: str = ""
     #: #2218: JSON снимка дельты без поколения; пусто — снимок не создаётся.
     behavior_snapshot: str = ""
+    #: #2220: что git ответил про specs/ на закреплённом head; None — сверка не относится.
+    spec_facts: spec_archive.SpecFacts | None = None
     sha_reason: str = ""
     discovered_pr: int | None = None
     pr_opened_by_hub: bool = False
@@ -3229,9 +3232,14 @@ async def _step_behavior_snapshot(state: SubmitContext) -> None:
     Стоит после пиннинга, потому что head_sha — это закреплённая вершина, и
     до распознавания повтора: «не сказано» внутри границы — отказ, а не no-op.
     """
-    state.behavior_snapshot = await behavior_snapshot.prepare(
+    payload = await behavior_snapshot.prepare(
         state.db, state.task, state.submission_sha
     )
+    # #2220: git читается здесь, до транзакции; сверка с diff specs/ — отказ до записей.
+    state.spec_facts = await spec_archive.read_facts(
+        state.db, state.task, state.submission_sha, payload
+    )
+    state.behavior_snapshot = spec_archive.stamp(state.spec_facts, payload)
 
 
 async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
@@ -4048,8 +4056,9 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
             )
         # #2218: дельту решали до лока. Пока сдача ждала, refine мог сменить её
         # своим соединением; снимок и отказ берём из строки, которую пишем.
-        state.behavior_snapshot = await behavior_snapshot.prepare(
-            db, live, submission_sha
+        state.behavior_snapshot = spec_archive.stamp(
+            state.spec_facts,
+            await behavior_snapshot.prepare(db, live, submission_sha),
         )
         # #1687: the CI gates decided before the lock; a report accepted since
         # then withdrew the evidence. They are asked again here, of the database.
