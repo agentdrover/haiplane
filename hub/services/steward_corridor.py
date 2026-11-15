@@ -60,6 +60,12 @@ OUTCOME_UNRESOLVED = "unresolved_findings"
 #: сдал шестьдесят таких отчётов (#745).
 OUTCOME_NO_DATA = "no_data"
 
+#: «Проверено, кандидатов нет» (#2336): кандидатов не было, но ревьюер назвал
+#: сделанные проверки (``checks_done``). Это его слово о себе, а не проверка хаба,
+#: поэтому ступень не чистота: ``names_clean`` на ней ложно. Тихая ступень «нет
+#: данных» отличается от неё тем, что список проверок есть.
+OUTCOME_CHECKED_CLEAN = "checked_clean"
+
 #: Единственная ступень, про которую правда, что находок нет.
 OUTCOME_CLEAN = "clean"
 
@@ -72,6 +78,7 @@ REPORT_OUTCOMES: tuple[str, ...] = (
     OUTCOME_CONFIRMED,
     OUTCOME_UNRESOLVED,
     OUTCOME_NO_DATA,
+    OUTCOME_CHECKED_CLEAN,
     OUTCOME_CLEAN,
 )
 
@@ -83,10 +90,15 @@ REPORT_OUTCOMES: tuple[str, ...] = (
 #: правила.
 CLEAN_OUTCOMES: frozenset[str] = frozenset({OUTCOME_CLEAN})
 
+#: Ступени «проверено со слов ревьюера» (#2336): не чистота, но и не «нет данных».
+#: Поверхность красит их своим цветом, а не цветом чистоты.
+CHECKED_OUTCOMES: frozenset[str] = frozenset({OUTCOME_CHECKED_CLEAN})
+
 #: Что поверхность печатает про ступень. Тексты здесь, а не в шаблонах, по
 #: той же причине, по которой здесь же лежит и сама ступень: три поверхности,
-#: одно правило. Ни один текст, кроме OUTCOME_CLEAN, не содержит слов о
-#: чистоте или об отсутствии находок — это проверяется тестом.
+#: одно правило. Ни один текст, кроме OUTCOME_CLEAN, не равен подписи чистоты
+#: «находок нет» — это проверяется тестом. OUTCOME_CHECKED_CLEAN называет
+#: «кандидатов нет» и тут же оговаривает, что это список самого ревьюера.
 _OUTCOME_LABELS: dict[str, str] = {
     OUTCOME_INCOMPLETE: "прогон неполный — не проверено, а не «чисто»",
     OUTCOME_CONFIRMED: "подтверждённые находки",
@@ -95,6 +107,10 @@ _OUTCOME_LABELS: dict[str, str] = {
         "вопрос, а не «чисто»"
     ),
     OUTCOME_NO_DATA: "кандидатов не было вовсе — нет данных, а не «находок нет»",
+    OUTCOME_CHECKED_CLEAN: (
+        "проверено, кандидатов нет — по списку проверок самого ревьюера, "
+        "хаб их не перепроверял"
+    ),
     OUTCOME_CLEAN: "находок нет",
 }
 
@@ -105,6 +121,7 @@ def report_outcome(
     unresolved: Sequence[Any],
     incomplete: bool = False,
     raw_count: int = 0,
+    checks_done: Sequence[Any] = (),
 ) -> str:
     """На какой ступени стоит отчёт машинного ревью.
 
@@ -124,7 +141,8 @@ def report_outcome(
     if unresolved:
         return OUTCOME_UNRESOLVED
     if (raw_count or 0) < 1:
-        return OUTCOME_NO_DATA
+        # #2336: ноль кандидатов со списком проверок - слово ревьюера, не пустота.
+        return OUTCOME_CHECKED_CLEAN if checks_done else OUTCOME_NO_DATA
     return OUTCOME_CLEAN
 
 
@@ -147,3 +165,8 @@ def names_clean(outcome: str) -> bool:
     неверный.
     """
     return outcome in CLEAN_OUTCOMES
+
+
+def names_checked(outcome: str) -> bool:
+    """Стоит ли ступень на «проверено ревьюером»: не чистота, но со списком проверок (#2336)."""
+    return outcome in CHECKED_OUTCOMES

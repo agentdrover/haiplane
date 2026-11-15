@@ -31,6 +31,7 @@ from hub.services.review_dispatch import (
     split_generated,
     sweep_review_dispatches,
 )
+from tests import review_checks_support as checks
 from tests.review_dispatch_support import (
     _DIFF_506,
     _TIP,
@@ -247,21 +248,7 @@ async def test_a_real_usage_mismatch_is_still_flagged_once(
     _wire(monkeypatch, recorder)
     task_id = await _submitted(client, db, "spike-usage")
 
-    review = {
-        "harness_skill": "multi-agent-review",
-        "harness_version": 8,
-        "raw_count": 3,
-        "findings_confirmed": [],
-        "findings_rejected": [
-            {"title": "x", "category": "correctness", "reason": "no"}
-        ],
-        "incomplete": False,
-        "unresolved": [],
-        "lost_dimensions": [],
-        "agent": "cursor-cloud-reviewer",
-        "model": "grok-4.6",
-        "tokens_spent": 1000,
-    }
+    review = _usage_review(tokens_spent=1000)
     resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=review)
     assert resp.status_code == 200, resp.text
 
@@ -1511,3 +1498,18 @@ async def test_a_regression_fix_gets_deep_within_caps(
     assert not any(f"#{cause}" in r for r in reasons), reasons
     notes = " ".join(await _dispatch_notes(db, second))
     assert f"#{cause}" not in notes, notes
+
+
+async def test_review_prompt_asks_for_checks_not_tokens(client, db, monkeypatch):
+    prompts = await checks.prompts_of_both_profiles(
+        client, db, monkeypatch, _pin_prompt
+    )
+    checks.asks_for_checks_not_tokens(prompts)
+
+
+async def test_undeclared_tokens_raise_no_usage_alert(client, db, monkeypatch):
+    await checks.undeclared_tokens_raise_no_usage_alert(client, db, monkeypatch)
+
+
+async def test_cloud_run_text_is_kept_scrubbed_for_the_brief(client, db, monkeypatch):
+    await checks.cloud_run_text_is_kept_scrubbed(client, db, monkeypatch)

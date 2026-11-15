@@ -116,6 +116,17 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
     "machine_review.outcome": (MANDATORY, ""),
     "machine_review.outcome_label": (MANDATORY, ""),
     "machine_review.outcome_names_clean": (MANDATORY, ""),
+    "machine_review.outcome_names_checked": (
+        FULL_ONLY,
+        "derived from outcome, which is carried; the label says it in words",
+    ),
+    "machine_review.checks_done": (MANDATORY, ""),
+    "machine_review.run_text": (
+        FULL_ONLY,
+        "the reviewer's own run text (#2336): free text the verdict does not read; "
+        "the default answer carries a short excerpt, section=machine_review the whole",
+    ),
+    "machine_review.run_text_note": (FULL_ONLY, "label of run_text, a constant"),
     "machine_review.second_door_channel": (MANDATORY, ""),
     "machine_review.second_door_reason": (MANDATORY, ""),
     "acceptance_criteria": (BLOCK, ""),
@@ -233,6 +244,12 @@ FIELD_CLASS: dict[str, tuple[str, str]] = {
         FULL_ONLY,
         "refuted finding; only the count is decision data",
     ),
+    "machine_review.checks_done.what": (MANDATORY, ""),
+    "machine_review.checks_done.result": (MANDATORY, ""),
+    "machine_review.checks_done.how": (
+        FULL_ONLY,
+        "how the reviewer checked, free text; what and result state the check",
+    ),
     "machine_review.unresolved.title": (MANDATORY, ""),
     "machine_review.unresolved.finding_uid": (MANDATORY, ""),
     "machine_review.unresolved.why": (
@@ -304,6 +321,7 @@ REDUCED: frozenset[str] = frozenset(
         "machine_review.findings_confirmed",
         "machine_review.findings_rejected",
         "machine_review.unresolved",
+        "machine_review.checks_done",
         "machine_review.dispositions",
         "machine_review.observation_closures",
         "machine_review.deferred_repeats",

@@ -20,6 +20,7 @@ from hub.cause_task_view import CauseTaskView
 from hub.expected_sha import ExpectedShaMixin, ReviewPinSubmit, ReviewPinView
 from hub.outcome_hint import OutcomeHintView
 from hub.owner_minutes_view import OwnerMinutesView
+from hub.review_checks import RUN_TEXT_NOTE, CheckList
 from hub.plain_summary import PlainSummaryInput, PlainSummaryView
 
 _models_log = logging.getLogger("hub")
@@ -4277,6 +4278,8 @@ class MachineReviewSubmit(ReviewPinSubmit):
     )
     lost_dimensions: list[str] = Field(default_factory=list, max_length=50)
     agent: str = Field("", max_length=100)
+    # #2336: what the reviewer checked (the reviewer's own word, never proof).
+    checks_done: CheckList = Field(default_factory=list)
     # #1688: the answer to the CI integrity question, asked only when the diff
     # shows signs. Absent = the reviewer did not answer.
     ci_integrity: CIIntegrityAnswer | None = None
@@ -4605,6 +4608,12 @@ class MachineReviewView(ReviewPinView):
     # могла бы разъехаться с содержимым, которое описывает.
     outcome: str = ""
     outcome_label: str = ""
+    #: «Проверено, кандидатов нет» (#2336): слово ревьюера, не чистота.
+    outcome_names_checked: bool = False
+    # #2336: список проверок и текст облачного прогона; оба - слово ревьюера.
+    checks_done: CheckList = Field(default_factory=list)
+    run_text: str = ""
+    run_text_note: str = ""
     #: Имеет ли эта ступень право называться чистотой. Отдельным полем, чтобы
     #: шаблон не сравнивал строки сам: сравнение, повторённое в трёх
     #: поверхностях, — это ровно то, как «0 подтверждённых» стало «чисто».
@@ -4659,6 +4668,7 @@ class MachineReviewView(ReviewPinView):
         и разъезжается тот, который мягче.
         """
         from hub.services.steward_corridor import (
+            names_checked,
             names_clean,
             outcome_label,
             report_outcome,
@@ -4673,9 +4683,12 @@ class MachineReviewView(ReviewPinView):
             unresolved=self.unresolved,
             incomplete=self.incomplete is True,
             raw_count=self.raw_count,
+            checks_done=self.checks_done,
         )
         self.outcome_label = outcome_label(self.outcome)
         self.outcome_names_clean = names_clean(self.outcome)
+        self.outcome_names_checked = names_checked(self.outcome)
+        self.run_text_note = RUN_TEXT_NOTE if self.run_text else ""
         return self
 
     @field_validator(

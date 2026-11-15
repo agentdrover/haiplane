@@ -1550,6 +1550,7 @@ async def insert_machine_review(
     principal_id: int | None = None,
     carried_from_review_id: int | None = None,
     ci_integrity: tuple[str, str] = ("", ""),  # (verdict, explanation) #1688
+    checks_done: str = "[]",  # JSON [{what, how, result}], the reviewer's word #2336
 ) -> int:
     cur = await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
@@ -1557,8 +1558,9 @@ async def insert_machine_review(
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
         "findings_rejected, submitted_by, incomplete, incomplete_reason, "
         "unresolved, lost_dimensions, profile, self_reviewed, principal_id, "
-        "carried_from_review_id, ci_integrity_verdict, ci_integrity_explanation) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "carried_from_review_id, ci_integrity_verdict, ci_integrity_explanation, "
+        "checks_done) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1582,9 +1584,25 @@ async def insert_machine_review(
             principal_id,
             carried_from_review_id,
             *ci_integrity,
+            checks_done,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
+
+
+async def set_machine_review_run_text(
+    db: aiosqlite.Connection, review_id: int, text: str
+) -> None:
+    """Keep the cloud run's final text on the report it produced (#2336).
+
+    The caller scrubs and caps it. Written once: a later pass never replaces a
+    text already kept, so a retry of the sweep cannot overwrite it with an
+    emptier one.
+    """
+    await db.execute(
+        "UPDATE machine_reviews SET run_text = ? WHERE id = ? AND run_text = ''",
+        (text, review_id),
+    )
 
 
 async def insert_steward_judgement(

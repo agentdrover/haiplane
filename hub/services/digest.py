@@ -40,7 +40,12 @@ from hub.services.orchestration import PRACTICE_METRICS_DEFAULT_DAYS
 from hub.services.project_policy import DELEGATED_VERDICTS
 from hub.services import triage_inbox
 from hub.services.release_alert import release_block_history
-from hub.services.steward_corridor import names_clean, outcome_label, report_outcome
+from hub.services.steward_corridor import (
+    names_checked,
+    names_clean,
+    outcome_label,
+    report_outcome,
+)
 
 log = logging.getLogger(__name__)
 
@@ -295,12 +300,15 @@ def _report_outcome_of(mr) -> dict:
         if row.get("incomplete") is not None
         else False,
         raw_count=int(row.get("raw_count") or 0),
+        checks_done=_list("checks_done"),
     )
     return {
         "state": "present",
         "outcome": outcome,
         "label": outcome_label(outcome),
         "names_clean": names_clean(outcome),
+        # #2336: «проверено» со слов ревьюера - не чистота, но и не «нет данных».
+        "names_checked": names_checked(outcome),
     }
 
 

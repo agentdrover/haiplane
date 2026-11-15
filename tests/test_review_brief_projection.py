@@ -785,8 +785,9 @@ async def test_mcp_brief_keeps_the_route_permissions(real_auth):
 # #2026: блок ci_evidence получил поле expectation, ProfileDowngradeView — rules: REST-бриф и payload пакета стюарда; packet_hash прежний.
 # #1933: machine_review получил поле ac_tests_unread ([] у этой задачи): REST-бриф и payload пакета стюарда; packet_hash прежний.
 # #2208: блок prepass получил validation_declared/validation_status/validation_reason (у этой задачи команд нет): переснят REST-бриф и payload пакета стюарда; packet_hash прежний.
-GOLDEN_REST_BRIEF = "90c1a164d7f89ebf5311bc6cf022db1bf26ab59168826d897211f1709134d985"  # pragma: allowlist secret
-GOLDEN_STEWARD_PACKET = "c95335969e7a70d830ce2b363febeabba5703f28cd2b6b28a5549ec59a82698a"  # pragma: allowlist secret
+# #2336: machine_review получил checks_done, run_text, run_text_note, outcome_names_checked (у этой задачи пусты): переснят REST-бриф и payload пакета стюарда; packet_hash прежний.
+GOLDEN_REST_BRIEF = "c8f4682fca3d78c2e213c9b7c0f749daa66bb82ac376d17d753c6bbdda71688c"  # pragma: allowlist secret
+GOLDEN_STEWARD_PACKET = "39a68b8241947a98304b9fbeb13820bdfe2768ccefd118a82fe68cff6542d6da"  # pragma: allowlist secret
 GOLDEN_PACKET_HASH = "0c8efa3186370f7c4b7f3f292de594595531006708519918658804d34e38d9c2"  # pragma: allowlist secret
 
 
@@ -1118,6 +1119,7 @@ def _clean() -> dict[str, Any]:
                     {"finding_uid": "u1", "live_check_id": 1, "hand": "h"}
                 ],
                 deferred_repeats=[{"finding_uid": "u1", "linked_task_id": 5}],
+                checks_done=[{"what": "w", "how": "h", "result": "r"}],
             ),
             "unresolved": [{"title": "u", "why": "w"}],
         },
@@ -1390,6 +1392,7 @@ _BAD: dict[str, tuple[str, Any]] = {
         [{"x": 1}],
     ),
     "machine_review.deferred_repeats": ("machine_review.deferred_repeats", [{"x": 1}]),
+    "machine_review.checks_done": ("machine_review.checks_done", []),
     "machine_review.outcome": ("machine_review.outcome", "clean_run"),
     "machine_review.outcome_label": ("machine_review.outcome_label", "иное"),
     "machine_review.outcome_names_clean": ("machine_review.outcome_names_clean", True),
@@ -1425,6 +1428,8 @@ _BAD |= dict(
         _child("machine_review.observation_closures", "hand", "other"),
         _child("machine_review.deferred_repeats", "finding_uid", "u2"),
         _child("machine_review.deferred_repeats", "linked_task_id", 6),
+        _child("machine_review.checks_done", "what", "другая проверка"),
+        _child("machine_review.checks_done", "result", "иной итог"),
         _child("latest_review.findings", "id", 2),
         _child("latest_review.findings", "severity", "high"),
         _child("latest_review.findings", "message", "другое"),

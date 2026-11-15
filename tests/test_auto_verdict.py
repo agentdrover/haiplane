@@ -239,6 +239,40 @@ async def test_empty_review_without_tokens_spent_is_not_proven(
     assert body["review_verdict"] is None
 
 
+async def test_checked_clean_report_auto_approves_within_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-3 (#2336): raw_count=0 with a list of checks and NO tokens_spent. The
+    # bill of the hub's own settled dispatch is the only proof; the class
+    # ceiling and the floor of the bill still hold.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "EMPTY_REVIEW_MIN_USAGE", 200_000)
+    checks = [{"what": "тесты", "how": "uv run pytest -q", "result": "rc 0"}]
+
+    async def _case(slug: str, usage: int, areas: list[str]) -> dict:
+        task_id = await _submitted_task(
+            client, db, slug, {"verdict": "auto"}, areas=areas
+        )
+        await _settled_dispatch(db, task_id, usage_total=usage, monkeypatch=monkeypatch)
+        await _post_review(
+            client, task_id, raw_count=0, findings_rejected=[], checks_done=checks
+        )
+        return (await client.get(f"/api/tasks/{task_id}")).json()
+
+    ok = await _case("checked-ok", 250_000, ["tests/test_x.py"])
+    assert ok["risk_class"] == "R1" and ok["review_verdict"] == "approved"
+    feed = [u["content"] for u in ok["updates"] or []]
+    assert any("списком проверок" in c and "usage=250000" in c for c in feed)
+
+    above = await _case("checked-above", 250_000, ["hub/services/auto_verdict.py"])
+    assert above["risk_class"] == "R2" and above["review_verdict"] is None
+    assert any("выше потолка класса" in (u["content"]) for u in above["updates"] or [])
+
+    below = await _case("checked-below", 150_000, ["tests/test_x.py"])
+    assert below["status"] == "review" and below["review_verdict"] is None
+
+
 async def test_proven_empty_above_class_ceiling_stays_human(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ) -> None:

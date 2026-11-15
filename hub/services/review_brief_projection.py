@@ -25,6 +25,7 @@ from typing import Any
 
 from mcp.types import CallToolResult
 
+from hub.review_checks import RUN_TEXT_NOTE
 from hub.services import evidence_states
 from hub.services.review_brief_fields import MANDATORY, TEXT, fields_of
 from hub.mcp_structured import structured_echo_result, structured_error_result
@@ -34,6 +35,8 @@ logger = logging.getLogger(__name__)
 MAX_CHARS = 12_000
 EXCEEDED_NOTE = "превышен потолок"
 FINDINGS_SHOWN = 10
+CHECKS_SHOWN = 5
+RUN_EXCERPT_CAP = 300
 TITLE_CAP = 200
 AC_SHOWN = 20
 SYMBOLS_SHOWN = 10
@@ -210,6 +213,35 @@ def _machine_review_part(mr: dict[str, Any] | None) -> dict[str, Any] | None:
         )
     for name in _ROW_LISTS:
         part[name] = _rows(mr.get(name) or [], f"machine_review.{name}")
+    part.update(_word_of_reviewer(mr))
+    return part
+
+
+def _word_of_reviewer(mr: dict[str, Any]) -> dict[str, Any]:
+    """The checks and the run text of the reviewer, shown short (#2336).
+
+    Present only when the report has them: an absent word adds no characters to
+    the part that is never cut. Free text is cut, ``how`` and the whole run text
+    stay in ``section=machine_review``.
+    """
+    part: dict[str, Any] = {}
+    checks = mr.get("checks_done") or []
+    if checks:
+        names = fields_of(MANDATORY, "machine_review.checks_done")
+        rows = [
+            {n: _cap(c.get(n), TITLE_CAP) for n in names} for c in checks[:CHECKS_SHOWN]
+        ]
+        part["checks_done"] = {
+            "total": len(checks),
+            "shown": len(rows),
+            "omitted": len(checks) - len(rows),
+            "hint": "section=machine_review" if len(checks) > len(rows) else "",
+            "items": rows,
+        }
+    run_text = str(mr.get("run_text") or "")
+    if run_text:
+        part["run_text_chars"] = len(run_text)
+        part["run_text_excerpt"] = _cap(run_text, RUN_EXCERPT_CAP)
     return part
 
 
@@ -620,6 +652,29 @@ def _decision_lines(mr: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _word_of_reviewer_lines(mr: dict[str, Any]) -> list[str]:
+    """The checks and the run text the reviewer wrote about itself (#2336).
+
+    Both are labelled as the reviewer's word: the hub did not verify them.
+    """
+    lines: list[str] = []
+    checks = mr.get("checks_done")
+    if checks:
+        lines.append(
+            f"  Checks done: {checks['total']} (the reviewer's own word, not "
+            "verified by the hub)"
+        )
+        lines.extend(f"    - {r['what']} -> {r['result']}" for r in checks["items"])
+        if checks["omitted"]:
+            lines.append(f"    … and {checks['omitted']} more ({checks['hint']})")
+    if mr.get("run_text_chars"):
+        lines.append(
+            f"  Run text kept ({mr['run_text_chars']} chars; {RUN_TEXT_NOTE}): "
+            f"{mr['run_text_excerpt']}"
+        )
+    return lines
+
+
 def _boundary_lines(proj: dict[str, Any]) -> list[str]:
     """Review boundaries: what the verdict is judged against."""
     lines = []
@@ -680,6 +735,7 @@ def _machine_lines(mr: dict[str, Any] | None) -> list[str]:
             f"{mr['ci_integrity_explanation']}".rstrip()
         )
     lines.extend(_decision_lines(mr))
+    lines.extend(_word_of_reviewer_lines(mr))
     if mr["findings_confirmed"]["total"]:
         lines.extend(_digest_lines("Confirmed findings", mr["findings_confirmed"]))
     if mr["unresolved"]["total"]:

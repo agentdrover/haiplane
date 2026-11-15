@@ -36,7 +36,11 @@ from hub.services import ci_integrity, report_binding, review_pin, watch_notices
 from hub.services.review_oversized import attach_ac_tests_unread, unread_for_task
 from hub.services.result_kind import automation_not_applicable
 from hub.services.review_dispatch import LITE
-from hub.services.steward_corridor import outcome_label, report_outcome
+from hub.services.steward_corridor import (
+    OUTCOME_CHECKED_CLEAN,
+    outcome_label,
+    report_outcome,
+)
 
 log = logging.getLogger("hub")
 
@@ -58,6 +62,7 @@ async def _alert_no_candidates(
     raw_count: int,
     generation: int,
     profile: str,
+    outcome: str = "",
 ) -> None:
     """Сказать на карточке, что кандидатов не было вовсе (#750).
 
@@ -76,13 +81,21 @@ async def _alert_no_candidates(
     форма «один агент без токенов» незапуска не означает: на #2328 такой
     отчёт пришёл от прогона, которому провайдер насчитал 2,35 млн токенов.
     Для lite карточка называет пустой отчёт пустым отчётом.
+
+    Отчёт со списком проверок (#2336) — не пустой: ноль кандидатов там названный
+    итог ревьюера, и алерта «нет данных» он не получает. Такая строка не входит и
+    в счёт «первая нулевая строка поколения» (условие ``checks_done<>'[]' AND
+    incomplete=0`` стоит дословно и здесь, и в отзыве алерта): иначе пустой отчёт,
+    пришедший после проверенного, остался бы без алерта. ``incomplete`` NULL —
+    «не заявлено», строка считается нулевой, как прежде.
     """
-    if raw_count != 0:
+    if raw_count != 0 or outcome == OUTCOME_CHECKED_CLEAN:
         return
     prior_zero = await fetchall(
         db,
         "SELECT COUNT(*) AS n FROM machine_reviews "
-        "WHERE task_id=? AND submission_generation=? AND raw_count=0",
+        "WHERE task_id=? AND submission_generation=? AND raw_count=0 "
+        "AND NOT (checks_done<>'[]' AND incomplete=0)",
         (task_id, generation),
     )
     if int(prior_zero[0]["n"]) != 1:
@@ -138,6 +151,7 @@ async def _retract_no_candidates_alert(
         db,
         "SELECT id, principal_id, carried_from_review_id FROM machine_reviews "
         "WHERE task_id=? AND submission_generation=? AND raw_count=0 "
+        "AND NOT (checks_done<>'[]' AND incomplete=0) "
         "ORDER BY id LIMIT 1",
         (task_id, generation),
     )
@@ -263,12 +277,15 @@ async def _intake_alerts(
     review_id: int,
     principal_id: int | None,
     profile: str,
+    outcome: str,
 ) -> None:
     """Ленты приёма: нет кандидатов, снятие прежнего алерта, отказ среды.
 
     Вынесено из ``record_machine_review`` (потолок по операторам, #1985).
     """
-    await _alert_no_candidates(db, task_id, body, raw_count, generation, profile)
+    await _alert_no_candidates(
+        db, task_id, body, raw_count, generation, profile, outcome
+    )
     await _retract_no_candidates_alert(
         db, task_id, generation, review_id, raw_count, principal_id
     )
@@ -469,6 +486,9 @@ async def _store_machine_review(
         # matches on this and on nothing self-reported.
         principal_id=principal_id,
         ci_integrity=await ci_integrity.answer_for_report(db, task, body),
+        checks_done=_json.dumps(
+            [c.model_dump() for c in body.checks_done], ensure_ascii=False
+        ),
     )
     await report_binding.stamp_report(db, new_review_id, bound_id, code_id)
     await review_pin.stamp(db, new_review_id, body)  # #1985, в той же транзакции
@@ -492,6 +512,7 @@ async def _store_machine_review(
         unresolved=body.unresolved,
         incomplete=body.incomplete is True,
         raw_count=raw_count,
+        checks_done=body.checks_done,
     )
     completed_id = await repo.insert_event(
         db,
@@ -518,7 +539,15 @@ async def _store_machine_review(
         review_id=new_review_id,
     )
     await _intake_alerts(
-        db, task_id, body, raw_count, generation, new_review_id, principal_id, profile
+        db,
+        task_id,
+        body,
+        raw_count,
+        generation,
+        new_review_id,
+        principal_id,
+        profile,
+        outcome,
     )
 
     # #1012/#1025: the hub may already have called a reviewer for this very

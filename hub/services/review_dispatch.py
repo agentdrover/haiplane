@@ -49,6 +49,7 @@ from hub.integrations import review_snapshot
 from hub.integrations.protocols import SnapshotArchive
 from hub.integrations import forge as forge_urls
 from hub.integrations.registry import plugins
+from hub.review_checks import cap_run_text
 from hub.models import (
     INCOMPLETE_REASON_ENVIRONMENT,
     INCOMPLETE_REASON_PROFILE,
@@ -1845,8 +1846,9 @@ REPORT_BLOCK_INSTRUCTION = (
     "РАННЯЯ сдача запрещена: пробная, «проверить доступ», заглушка или "
     "сдача до конца прохода — хаб принимает её за отчёт и закрывает по ней "
     "заказ. Доступ проверяй чтением брифа, не сдачей. Честный окончательный "
-    "отчёт с raw_count=0 и признаками охвата (incomplete, lost_dimensions) "
-    "разрешён. Блок ниже повторяет ТОТ ЖЕ результат, он не вторая сдача.\n"
+    "отчёт с raw_count=0 разрешён, но со списком checks_done (ниже): без него "
+    "хаб читает ноль как «нет данных». Блок ниже повторяет ТОТ ЖЕ результат, он "
+    "не вторая сдача.\n"
     "{main_path}"
     "2) НЕЗАВИСИМО от этого в САМОМ КОНЦЕ ответа повтори отчёт блоком:\n"
     f"```{REPORT_FENCE}\n"
@@ -1857,8 +1859,10 @@ REPORT_BLOCK_INSTRUCTION = (
     '"findings_rejected": [{"title": "...", "category": "...", "reason": "..."}], '
     '"unresolved": [{"title": "...", "why": "..."}], '
     '"lost_dimensions": ["..."], "incomplete_reason": "environment|profile|", '
+    '"checks_done": [{"what": "что проверено", "how": "команда с кодом возврата '
+    'или чтение кода", "result": "итог"}], '
     '"harness_skill": "...", "harness_version": <число или null>, '
-    '"tokens_spent": <число или null>, "model": "<твоя модель>"}\n'
+    '"model": "<твоя модель>"}\n'
     "```\n"
     "Правила блока: он ОДИН и он последний; incomplete обязателен и без "
     "дефолта — «0 подтверждённых» без него не значит ничего; находка, которую "
@@ -1869,6 +1873,15 @@ REPORT_BLOCK_INSTRUCTION = (
     "на объём диффа не хватило. Это РАЗНЫЕ ответы человека: первое лечится "
     "настройкой окружения, второе — ещё одним прогоном. Не заявишь — причина "
     "останется неизвестной, и угадывать её по твоему тексту никто не будет. "
+    "checks_done — список того, что ты РЕАЛЬНО проверил: «что» (свойство или "
+    "место), «чем» (команда с кодом возврата или «чтение кода») и «итог»; не "
+    "больше 20 записей, все три слова в каждой. Хаб покажет список человеку как "
+    "твоё слово и проверять его не будет, так что записи без выдумки. Кандидатов "
+    "не нашёл — сдай raw_count=0 с непустым checks_done: это честный "
+    "исход «проверено, кандидатов нет»; без списка ноль читается как «нет "
+    "данных». Замечание, которое оказалось не дефектом, клади в "
+    "findings_rejected с причиной в reason, а не в findings_confirmed. Расход "
+    "токенов не называй: его считает провайдер, твоя цифра хабу не нужна. "
     "Если инструменты хаба недоступны — этот блок единственный способ "
     "доставить работу, и без него прогон пропадёт целиком."
 )
@@ -2332,8 +2345,8 @@ def _review_prompt(
             "3) один проход по изменённым файлам: ищи дефекты корректности, "
             "потерянные граничные случаи, несоответствие заявленным AC; "
             f"4) {_submit_step(task_id, bool(delivery_block), 'lite-diff-review')}"
-            " с реальными raw_count, "
-            f"находками, tokens_spent и model='{model_id}'. "
+            " с raw_count, "
+            f"находками, checks_done и model='{model_id}'. "
             "ЧЕСТНОСТЬ ОХВАТА: если дифф прочитан не целиком — сдавай "
             "incomplete=true и перечисли непрочитанные файлы в "
             "lost_dimensions. Ноль находок при обрезанном диффе — это "
@@ -2363,7 +2376,7 @@ def _review_prompt(
             "3) исполни фазы измерений и адъюдикации ЧЕСТНО — отчёт без "
             "исполнения запрещён скиллом и виден серверу; "
             f"4) {_submit_step(task_id, http, harness_fields=_HARNESS_FROM_BRIEF_FIELDS)} с "
-            f"реальными raw_count, находками, tokens_spent и model='{model_id}'. "
+            f"raw_count, находками, checks_done и model='{model_id}'. "
             "Вердикт НЕ выноси — он не твой."
         )
     return (
@@ -2374,7 +2387,7 @@ def _review_prompt(
         "3) исполни фазы измерений и адъюдикации ЧЕСТНО — отчёт без "
         "исполнения запрещён скиллом v8 и виден серверу; "
         f"4) {_submit_step(task_id, http)} с "
-        f"реальными raw_count, находками, tokens_spent и model='{model_id}'. "
+        f"raw_count, находками, checks_done и model='{model_id}'. "
         "Вердикт НЕ выноси — он не твой."
     )
 
@@ -3579,6 +3592,7 @@ async def _carry_the_report_over(
             source.get("ci_integrity_verdict") or "",
             source.get("ci_integrity_explanation") or "",
         ),
+        checks_done=source.get("checks_done") or "[]",
     )
     await repo.add_task_update(
         db,
@@ -6418,6 +6432,48 @@ async def _stamp_dispatch_usage(
     return total
 
 
+async def _keep_run_text(
+    db: aiosqlite.Connection,
+    dispatch: dict[str, Any],
+    run: dict[str, Any] | None = None,
+) -> None:
+    """Сохранить финальный текст облачного прогона на строке его отчёта (#2336).
+
+    Текст нужен человеку и стюарду как слово ревьюера о том, что он делал: хаб
+    его не проверял и за факт не выдаёт. Берётся, только когда прогон кончился
+    и у заказа есть СВОЙ отчёт без текста; пока прогон идёт, провайдер молчит
+    или текста нет, ничего не пишется, и ту же попытку повторит пересъём счёта
+    (``_restamp_owed_usage``). Порядок значим: сначала ``scrub_secrets`` по
+    всему тексту, потом потолок длины — секрет на границе обрезки не должен
+    остаться своим началом. В логи текст не пишется. Сбой здесь не мешает
+    закрыть заказ: текст — справка, а не условие.
+    """
+    if not dispatch.get("agent_id") or not dispatch.get("run_id"):
+        return
+    try:
+        review = await _dispatch_report(
+            db,
+            int(dispatch["task_id"]),
+            int(dispatch["submission_generation"]),
+            dispatch,
+        )
+        if review is None or review.get("run_text"):
+            return
+        if run is None:
+            run = await cursor_cloud.get_run(dispatch["agent_id"], dispatch["run_id"])
+        run = run or {}
+        text = run.get("result")
+        if (run.get("status") or "").upper() not in _TERMINAL_RUN_STATUSES or not (
+            isinstance(text, str) and text.strip()
+        ):
+            return
+        kept = cap_run_text(cursor_cloud.scrub_secrets(text))
+        await repo.set_machine_review_run_text(db, int(review["id"]), kept)
+        await db.commit()
+    except Exception:  # noqa: BLE001 - degradation is the contract
+        log.exception("could not keep the run text of dispatch #%s", dispatch.get("id"))
+
+
 async def _write_bill(
     db: aiosqlite.Connection, dispatch: dict[str, Any], total: int, scope: str
 ) -> None:
@@ -6464,11 +6520,10 @@ async def _restamp_owed_usage(db: aiosqlite.Connection) -> None:
         db, USAGE_RESTAMP_EVERY_MINUTES, USAGE_RESTAMP_CEILING_HOURS
     ):
         dispatch = dict(row)
-        total = (
-            await _agent_usage_total(dispatch["agent_id"])
-            if await _agent_finished(dispatch)
-            else None
-        )
+        finished = await _agent_finished(dispatch)
+        if finished:
+            await _keep_run_text(db, dispatch)
+        total = await _agent_usage_total(dispatch["agent_id"]) if finished else None
         if total is None:
             await repo.mark_review_dispatch_usage(db, dispatch["id"], USAGE_OPEN)
         else:
@@ -6608,6 +6663,7 @@ async def _recover_report_from_run(
     stored = await _store_report(db, dispatch, report, ORIGIN_RUN_TEXT)
     if stored != _REPORT_STORED:
         return stored
+    await _keep_run_text(db, dispatch, run)
     await repo.add_task_update(
         db,
         task_id,
@@ -6814,6 +6870,7 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
                         "Сигнал аудиту — сверка по данным, не по дисциплине "
                         "(#757).",
                     )
+            await _keep_run_text(db, dispatch)
             await repo.set_review_dispatch_status(db, dispatch["id"], "done")
             await db.commit()
             continue

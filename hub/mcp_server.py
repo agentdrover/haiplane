@@ -24,6 +24,7 @@ from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
 from hub.expected_sha import put_expected_sha_in
 from hub.mcp_internal_auth import identity_context_get, identity_is_human
+from hub.review_checks import checks_receipt
 from hub.services.mcp_telemetry import record_call
 from hub.services.tree_output import (
     TreeOutputOptions,
@@ -3913,6 +3914,7 @@ async def hub_submit_machine_review(
     findings_rejected: ListOfDicts = [],
     unresolved: ListOfDicts = [],
     lost_dimensions: ListOfStrings = [],
+    checks_done: ListOfDicts = [],
     harness_skill: str = "multi-agent-review",
     harness_version: int | None = None,
     agent_count: int | None = None,
@@ -3946,6 +3948,9 @@ async def hub_submit_machine_review(
         findings_rejected: [{title, category?, reason?}] — actually refuted.
         unresolved: [{title, why}] — nobody could judge these. Never rejected.
         lost_dimensions: names of dimensions that returned nothing.
+        checks_done: [{what, how, result}] — your own word on what you
+            checked, with what (command or code read) and the outcome. raw_count=0
+            WITH it reads "checked, no candidates"; without it "no data".
         harness_skill: Skill used.
         harness_version: Skill version executed.
         agent_count: Total subagents in the run.
@@ -3967,6 +3972,7 @@ async def hub_submit_machine_review(
         "incomplete_reason": incomplete_reason,
         "unresolved": unresolved,
         "lost_dimensions": lost_dimensions,
+        "checks_done": checks_done,
         "harness_skill": harness_skill,
         "orchestrator": orchestrator,
         "model": model,
@@ -4017,6 +4023,10 @@ async def hub_submit_machine_review(
     outcome_label = str(result.get("outcome_label") or "")
     if outcome_label:
         outcome_note = f" Исход отчёта: {outcome_label}."
+    # #2336: сколько записей списка хаб принял - запись без трёх слов отбрасывается.
+    outcome_note += checks_receipt(
+        len(checks_done), len(result.get("checks_done") or [])
+    )
     return structured_echo_result(
         f"Machine review for task #{task_id} recorded (submission "
         f"#{result.get('submission_generation')}): {stored_raw} raw → "

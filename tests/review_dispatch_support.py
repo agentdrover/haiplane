@@ -140,6 +140,13 @@ def _wire(monkeypatch, recorder: _DispatchRecorder) -> None:
 
     monkeypatch.setattr(cursor_cloud, "get_usage", _no_usage)
 
+    async def _no_run(agent_id, run_id):
+        # #2336: the sweep reads the run's final text when it closes a dispatch;
+        # "the API did not answer" unless the test says what the run wrote.
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+
     async def _no_runs(agent_id):
         # #1413: счёт агента падает на сумму по его прогонам, когда /usage без
         # runId молчит — список прогонов тоже не должен уходить в сеть.

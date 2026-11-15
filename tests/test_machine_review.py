@@ -654,3 +654,89 @@ async def test_local_environment_refusal_handling_is_unchanged(client: AsyncClie
     stats = await count_environment_refusals(db, since_days=30)
     assert stats["environment_refusals"] == 1
     assert stats["reason_unstated"] == 1
+
+
+# --- #2336: честное «чисто» — список проверок вместо no_data ----------------
+
+_CHECKS = [
+    {
+        "what": "изменённые тесты проходят",
+        "how": "uv run pytest -q tests/test_x.py",
+        "result": "12 passed, rc 0",
+    },
+    {
+        "what": "места вызова новой функции",
+        "how": "чтение кода: grep по hub/",
+        "result": "три места, все передают аргумент",
+    },
+]
+
+
+async def _no_candidates_alerts(db, task_id: int) -> list[str]:
+    return [c for k, c in await _feed(db, task_id) if k == "alert" and "#750" in c]
+
+
+async def test_checked_clean_report_is_not_no_data(client: AsyncClient, db):
+    """AC-1 (#2336): ноль кандидатов + список проверок — «проверено», а не «нет данных».
+
+    Исход называется словом ревьюера (хаб проверок не перепроверял), алерт #750
+    не пишется, список виден в брифе. Мутация, убирающая ступень из
+    :func:`report_outcome`, возвращает no_data и роняет тест.
+    """
+    task_id = await _reviewable_task(client, db)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={**_report([]), "raw_count": 0, "checks_done": _CHECKS},
+    )
+    assert resp.status_code == 200, resp.text
+    stored = resp.json()
+    assert stored["outcome"] == "checked_clean"
+    assert stored["outcome"] != "no_data"
+    assert stored["outcome_names_clean"] is False, (
+        "это слово ревьюера, не проверка хаба"
+    )
+    assert stored["checks_done"] == _CHECKS
+    assert await _no_candidates_alerts(db, task_id) == []
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief["machine_review"]["outcome"] == "checked_clean"
+    assert brief["machine_review"]["checks_done"] == _CHECKS
+
+
+async def test_empty_report_without_checks_stays_no_data(client: AsyncClient, db):
+    """AC-2 (#2336): без checks_done поведение прежнее — no_data и один алерт #750.
+
+    Тот же отчёт с явным ``checks_done=[]`` и неполный отчёт со списком
+    проверок «проверенным» не становятся.
+    """
+    task_id = await _reviewable_task(client, db)
+    for _ in range(2):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/machine-review",
+            json={**_report([]), "raw_count": 0},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["outcome"] == "no_data"
+        assert resp.json()["checks_done"] == []
+    assert len(await _no_candidates_alerts(db, task_id)) == 1, "один на поколение"
+
+    explicit = await _reviewable_task(client, db)
+    resp = await client.post(
+        f"/api/tasks/{explicit}/machine-review",
+        json={**_report([]), "raw_count": 0, "checks_done": []},
+    )
+    assert resp.json()["outcome"] == "no_data"
+    assert len(await _no_candidates_alerts(db, explicit)) == 1
+
+    partial = await _reviewable_task(client, db)
+    resp = await client.post(
+        f"/api/tasks/{partial}/machine-review",
+        json={
+            **_report([]),
+            "raw_count": 0,
+            "incomplete": True,
+            "checks_done": _CHECKS,
+        },
+    )
+    assert resp.json()["outcome"] == "incomplete_run"
+    assert len(await _no_candidates_alerts(db, partial)) == 1

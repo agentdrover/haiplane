@@ -108,9 +108,11 @@
        своему выражению, все три считали одинаково и неверно — «0
        подтверждённых» при непустом unresolved. Флаги и цвет — разные вопросы,
        поэтому is_current и self_reviewed остаются рядом: ступень описывает
-       содержимое отчёта, а не его происхождение. #}
-    {% set mr_bad = not mr.outcome_names_clean or not mr.is_current or mr.self_reviewed %}
-    <div class="task-review-tile {{ 'task-review-tile--bad' if mr_bad else ('task-review-tile--warn' if mr_flags else 'task-review-tile--ok') }}">
+       содержимое отчёта, а не его происхождение. #2336: «проверено, кандидатов
+       нет» - слово ревьюера, не чистота: плитка жёлтая, а не красная и не зелёная,
+       пока хаб проверки не перепроверил. #}
+    {% set mr_bad = (not mr.outcome_names_clean and not mr.outcome_names_checked) or not mr.is_current or mr.self_reviewed %}
+    <div class="task-review-tile {{ 'task-review-tile--bad' if mr_bad else ('task-review-tile--warn' if (mr_flags or mr.outcome_names_checked) else 'task-review-tile--ok') }}">
         <div class="task-review-tile-label">Машинное ревью</div>
         <div class="task-review-tile-value">{{ mr.findings_confirmed|length }} / {{ mr.raw_count }}</div>
         <div class="task-review-tile-sub">{{ mr.outcome_label }}{% if mr.profile %} · {{ mr.profile }}{% endif %}{% if mr.model %} · {{ mr.model }}{% endif %}{% for flag in mr_flags %} · {{ flag }}{% endfor %}</div>
@@ -526,7 +528,7 @@
         {# #1234: три числа рядом читаются как итог, и при нуле подтверждённых
            этот итог читался как «находок нет». Ступень названа словами прямо
            здесь, потому что именно эту строку человек цитирует в гейт. #}
-        <span class="badge {{ 'badge--xs' if machine_review.outcome_names_clean else 'badge-failed' }}">{{ machine_review.outcome_label }}</span>
+        <span class="badge {{ 'badge--xs' if machine_review.outcome_names_clean else ('badge-self-approved' if machine_review.outcome_names_checked else 'badge-failed') }}">{{ machine_review.outcome_label }}</span>
         {% if not machine_review.is_current %}
         <span class="badge badge-failed">stale — работа пересдана</span>
         {% endif %}
@@ -605,6 +607,26 @@
             </ul>
         </details>
         {% endif %}
+        {#- #2336: что ревьюер проверил и что написал о себе в конце прогона. Оба
+           блока - его слово: хаб их не перепроверял, и пометка стоит рядом с
+           текстом, а не в подсказке. Текст экранируется шаблоном. Блоки без
+           данных не печатают ни пробела: страницы прежних отчётов не меняются. -#}
+        {%- if machine_review.checks_done %}
+        <details>
+            <summary class="project-edit-summary">проверки ревьюера ({{ machine_review.checks_done|length }}) — слово ревьюера, хаб их не проверял</summary>
+            <ul class="task-review-findings">
+                {% for c in machine_review.checks_done %}
+                <li>{{ c.what }} — {{ c.how }} → {{ c.result }}</li>
+                {% endfor %}
+            </ul>
+        </details>
+        {%- endif %}
+        {%- if machine_review.run_text %}
+        <details>
+            <summary class="project-edit-summary">текст прогона ревьюера — {{ machine_review.run_text_note }}</summary>
+            <pre class="code-sm">{{ machine_review.run_text }}</pre>
+        </details>
+        {%- endif %}
         {% if machine_review.findings_confirmed %}
         {# #876: находка без диспозиции — это находка, о судьбе
            которой никто не сказал. Пока её нет, precision и

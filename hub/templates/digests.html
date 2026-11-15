@@ -88,7 +88,7 @@
             {% if not mr %}
             <span class="text-muted">исход отчёта не измерялся — дайджест старше раздела</span>
             {% else %}
-            <span class="badge {{ 'badge-completed' if mr.names_clean else 'badge-failed' }}">{{ mr.label }}</span>
+            <span class="badge {{ 'badge-completed' if mr.names_clean else ('badge-self-approved' if mr.names_checked else 'badge-failed') }}">{{ mr.label }}</span>
             {% endif %}
             <span class="text-muted">{{ v.at }}</span></li>
         {% endfor %}

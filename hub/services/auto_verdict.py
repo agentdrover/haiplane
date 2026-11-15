@@ -26,7 +26,12 @@ human gate:
   free tier. So the proven-empty path applies only at or below
   ``config.PROVEN_EMPTY_MAX_CLASS``; above it the human keeps the verdict.
   A raw_count >= 1 report is untouched by the ceiling — candidates on the
-  table are capability shown, not inferred from a token counter;
+  table are capability shown, not inferred from a token counter.
+  A raw_count=0 report that carries a list of checks (``checks_done``, #2336)
+  is proven by the same two things and nothing else: the settled dispatch's
+  billed usage at or above the floor, and the class ceiling. The list is the
+  reviewer's word about itself; it opens no door the bill does not open, and
+  the reviewer cannot know its own spend, so ``tokens_spent`` is not compared;
 - green CI recorded for the PINNED submission_sha (#546/#572);
 - the branch tip still stands where it was submitted;
 - the actual diff stays inside declared areas and does not raise the
@@ -47,10 +52,12 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict, text_origin_of
+from hub.review_checks import clean_checks
 from hub.services import gate_grounds as grounds
 from hub.services import ci_integrity, ci_trust, verdict_owner
 from hub.services.ci_report import VALIDATION_PASS
 from hub.services.result_kind import task_automation_not_applicable
+from hub.services.steward_corridor import OUTCOME_CHECKED_CLEAN, report_outcome
 
 log = logging.getLogger(__name__)
 
@@ -159,6 +166,24 @@ async def _reviewer_model(
     return dispatched, alert
 
 
+def checked_clean_report(review: dict) -> bool:
+    """Is this stored report on the «checked, no candidates» step (#2336)?
+
+    The step is derived by the same ladder the card and the digest read, from
+    the stored row: no second definition of "a list of checks counts".
+    """
+    return (
+        report_outcome(
+            confirmed=_finding_dicts(review.get("findings_confirmed")),
+            unresolved=_finding_dicts(review.get("unresolved")),
+            incomplete=bool(review.get("incomplete")),
+            raw_count=int(review.get("raw_count") or 0),
+            checks_done=clean_checks(review.get("checks_done")),
+        )
+        == OUTCOME_CHECKED_CLEAN
+    )
+
+
 async def _proven_empty_usage(
     db: aiosqlite.Connection,
     task_id: int,
@@ -170,9 +195,12 @@ async def _proven_empty_usage(
 
     Proof requires ALL of: the hub's own settled dispatch for this
     generation (#757), a billed total at or above the configured floor,
-    and the report's tokens_spent agreeing with that total within the
-    same tolerance the sweep uses. Any missing piece is absence of data —
-    the #750 rule stands and the caller refuses silently.
+    and — for a report WITHOUT a list of checks — the report's tokens_spent
+    agreeing with that total within the same tolerance the sweep uses. A
+    report with a list of checks (#2336) skips only that last comparison: the
+    reviewer cannot know its own spend (#893), so the number it states is
+    not a condition. Any missing piece is absence of data — the #750 rule
+    stands and the caller refuses silently.
     """
     floor = config.EMPTY_REVIEW_MIN_USAGE
     if floor <= 0:
@@ -190,6 +218,8 @@ async def _proven_empty_usage(
     total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
     if not isinstance(total, int) or total < floor:
         return None
+    if checked_clean_report(review):
+        return total
     reported = review.get("tokens_spent")
     if reported is None or abs(total - reported) / total > _USAGE_MISMATCH_SHARE:
         return None
@@ -796,6 +826,7 @@ async def autopilot_stance(
             "implementer_model": ctx.implementer_model,
             "reviewer_model": ctx.reviewer_model,
             "proven_usage": ctx.proven_usage,
+            "checked": checked_clean_report(ctx.review),
             "self_reviewed": bool(ctx.review.get("self_reviewed")),
         },
         generation=ctx.generation,
@@ -878,7 +909,14 @@ async def _approve(db: aiosqlite.Connection, task_id: int, facts: dict) -> bool:
             f"{facts['reviewer_model']}."
             + (
                 f" Пустота доказана: usage={proven} (#769)."
-                if proven is not None
+                if proven is not None and not facts["checked"]
+                else ""
+            )
+            + (
+                f" Отчёт со списком проверок (слово ревьюера, хаб их не "
+                f"перепроверял); счёт провайдера по диспетчу хаба: usage={proven}"
+                " (#2336)."
+                if proven is not None and facts["checked"]
                 else ""
             )
         ),

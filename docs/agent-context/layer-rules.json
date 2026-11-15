@@ -82,6 +82,7 @@
         "hub.cause_task_view",
         "hub.owner_minutes_view",
         "hub.outcome_hint",
+        "hub.review_checks",
         "hub.expected_sha"
       ],
       "trees": []
