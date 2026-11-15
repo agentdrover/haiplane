@@ -2,6 +2,32 @@
 
 Pick the smallest useful validation set first, then widen only if the diff crosses boundaries.
 
+## Locally: `make check-fast`; the full suite is CI's (#2000)
+
+`make check-fast` is `make check` with the targeted tests instead of the whole
+suite: lint, format, mypy, the budgets, layers, migration steps and the security
+scans, then `scripts/changed_tests.py` runs
+
+- the `tests/test_*.py` files you changed or added;
+- the tree guards of `docs/agent-context/tree-guards.json` (tests that check a
+  property of the whole repository: a new long file, a leftover name, a broken
+  link, a hub-wide rule);
+- the test files that mention the path of a changed non-Python file (a template,
+  a JSON ledger, a doc).
+
+Up to 8 files it runs in-process (`-n 0`: every xdist worker imports
+`tests/conftest.py` again), more on `-n 4`. It is a convenience, not evidence: it
+does not follow imports or symbols (measured on 68 red CI runs: the author's own
+tests catch 28% of the failing files, plus the guards 75-82%, and names or the
+change-map add 7 points for ten times the selection). A test it misses is found
+by CI at the price of one cycle; dispatch CI before submitting, as always.
+
+A clone that ran `make hooks` also runs it before every push of a `task-*`,
+`fix/*`, `chore/*`, `docs/*` or `ci/*` branch (`haiplane.prePushCheck`; the result
+is remembered per tree, `HAIPLANE_SKIP_PREPUSH=1` skips it once). The hub never
+sets that key in the clones it prepares on its own host. A new test that walks the
+repository tree goes into the ledger (`tests/test_tree_guards.py` says when).
+
 ## Baseline Commands
 
 - Lint: `uv run ruff check hub tests`

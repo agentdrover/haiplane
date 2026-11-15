@@ -1,0 +1,201 @@
+{
+  "_comment": "Тесты-сторожа (#2000): проверяют свойство ВСЕГО репозитория, а не функции. walks_tree — сам обходит реальное дерево (hub/, tests/, docs/, .github/…); repo_checker — гоняет проверочный скрипт репозитория на реальном дереве. exempt — тесты, которые детектор находит как обходящие, но они обходят tmp-каталоги или узкий каталог данных. Состав определяется признаком по коду, не историей падений; полноту держит tests/test_tree_guards.py. make test-changed / check-fast гоняют сторожей всегда.",
+  "guards": [
+    {
+      "path": "tests/test_ac_locator_gate.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py: каждая функция locator-ворот"
+    },
+    {
+      "path": "tests/test_agent_approval_reserved.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py: резервирование одобрения агентом"
+    },
+    {
+      "path": "tests/test_ci_integrity.py",
+      "criterion": "walks_tree",
+      "reason": "читает .github/actions и входы CI целиком"
+    },
+    {
+      "path": "tests/test_ci_workflow_contract.py",
+      "criterion": "walks_tree",
+      "reason": "обходит .github/workflows, .github/actions и tests/conftest.py"
+    },
+    {
+      "path": "tests/test_cursor_cloud.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/ и tests/: упоминания удалённого имени"
+    },
+    {
+      "path": "tests/test_db_access_contract.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py: доступ к базе только через обёртку"
+    },
+    {
+      "path": "tests/test_delivery_gate.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py: инварианты гейта доставки"
+    },
+    {
+      "path": "tests/test_docs_links.py",
+      "criterion": "walks_tree",
+      "reason": "обходит *.md и *.html репозитория: ссылки не битые"
+    },
+    {
+      "path": "tests/test_csrf_templates.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/templates/*.html: токен CSRF во всех формах"
+    },
+    {
+      "path": "tests/test_effective_policy.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/services/*.py: все решатели читают политику через сводку"
+    },
+    {
+      "path": "tests/test_forge_selection.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py: выбор forge только через один вход"
+    },
+    {
+      "path": "tests/test_mcp_envelope.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py: конверт MCP во всех инструментах"
+    },
+    {
+      "path": "tests/test_no_host_pytest.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/: pytest стартует только в разрешённой функции"
+    },
+    {
+      "path": "tests/test_no_legacy_name.py",
+      "criterion": "walks_tree",
+      "reason": "git ls-files/grep по репозиторию: старое имя нигде не осталось"
+    },
+    {
+      "path": "tests/test_recommendations.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py: рекомендации не обходят свой вход"
+    },
+    {
+      "path": "tests/test_review_dispatch_pin_and_deploy_doc.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py и доки выката"
+    },
+    {
+      "path": "tests/test_steward_shadow.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py: стюард не пишет мимо слоя"
+    },
+    {
+      "path": "tests/test_watch_notices.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/*.py: уведомления наблюдателей"
+    },
+    {
+      "path": "tests/test_web_ui.py",
+      "criterion": "walks_tree",
+      "reason": "обходит hub/templates/*.html: разметка всех страниц"
+    },
+    {
+      "path": "tests/test_file_size_budget.py",
+      "criterion": "repo_checker",
+      "reason": "гоняет бюджет размера файлов на реальном дереве (test_repository_is_green_under_the_size_budget)"
+    },
+    {
+      "path": "tests/test_layer_rules.py",
+      "criterion": "repo_checker",
+      "reason": "гоняет правила слоёв на реальном hub/ (test_the_real_tree_matches_the_ledger)"
+    },
+    {
+      "path": "tests/test_complexity_budget.py",
+      "criterion": "repo_checker",
+      "reason": "гоняет бюджет сложности на реальном репозитории (test_the_repository_is_green_under_the_budget)"
+    },
+    {
+      "path": "tests/test_migration_steps.py",
+      "criterion": "repo_checker",
+      "reason": "проверяет реальный каталог hub/migrations/steps (test_real_steps_directory_is_valid_and_a_package)"
+    },
+    {
+      "path": "tests/test_wallclock_asserts.py",
+      "criterion": "repo_checker",
+      "reason": "гоняет учёт времени-ассертов на реальном дереве (wc.main([]))"
+    },
+    {
+      "path": "tests/test_mcp_catalog_budget.py",
+      "criterion": "repo_checker",
+      "reason": "гоняет бюджет каталога MCP на реальном репозитории (test_report_names_remaining_headroom)"
+    },
+    {
+      "path": "tests/test_tree_guards.py",
+      "criterion": "walks_tree",
+      "reason": "обходит tests/test_*.py: каждый обходящий дерево тест классифицирован"
+    }
+  ],
+  "exempt": [
+    {
+      "path": "tests/test_api_context.py",
+      "reason": "golden-каталог тестовых данных, не дерево репозитория"
+    },
+    {
+      "path": "tests/test_backup_install.py",
+      "reason": "обходит tmp-каталог теста"
+    },
+    {
+      "path": "tests/test_call_sites.py",
+      "reason": "строит и обходит tmp-проект теста"
+    },
+    {
+      "path": "tests/test_ci_report_script.py",
+      "reason": "обходит tmp-корень теста (_tree(root))"
+    },
+    {
+      "path": "tests/test_forge_gitverse_delivery.py",
+      "reason": "смотрит tmp-рабочие каталоги теста"
+    },
+    {
+      "path": "tests/test_gui_harness.py",
+      "reason": "обходит узкий каталог tests/gui и проверяет настройку обычного сбора, не дерево репозитория целиком"
+    },
+    {
+      "path": "tests/test_hub_snapshot.py",
+      "reason": "обходит tmp-состояние тестового мира"
+    },
+    {
+      "path": "tests/test_hub_wait_hook.py",
+      "reason": "смотрит tmp-каталог теста"
+    },
+    {
+      "path": "tests/test_local_reviewer.py",
+      "reason": "обходит tmp-рабочую копию теста"
+    },
+    {
+      "path": "tests/test_prod_unit_snapshot.py",
+      "reason": "каталог deploy/systemd/prod, а не дерево репозитория целиком"
+    },
+    {
+      "path": "tests/test_pytest_shard.py",
+      "reason": "читает tmp-записи воркеров теста"
+    },
+    {
+      "path": "tests/test_remote_deploy_script.py",
+      "reason": "смотрит tmp-каталог бэкапов теста"
+    },
+    {
+      "path": "tests/test_review_drain.py",
+      "reason": "spool во tmp теста; свойство скрипта, не дерева"
+    },
+    {
+      "path": "tests/test_skill_seeding.py",
+      "reason": "сборка wheel во tmp теста"
+    },
+    {
+      "path": "tests/test_steward_advisor.py",
+      "reason": "spool во tmp теста"
+    },
+    {
+      "path": "tests/test_steward_canaries.py",
+      "reason": "каталог фикстур канареек, не дерево репозитория"
+    }
+  ]
+}

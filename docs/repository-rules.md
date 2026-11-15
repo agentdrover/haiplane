@@ -295,6 +295,8 @@ uv run pytest -q
 
 - все production-relevant изменения проходят через PR/review и проходят CI;
 - release notes собирать из merged commits и task done reports;
-- перед merge в `main` запускать полный `uv run pytest -q` и ruff check;
+- перед merge в `main` полный набор должен быть зелёным в CI на PR (локально
+  `make check-fast`, полный `uv run pytest -q` — только если CI недоступен) и
+  ruff check;
 - ручной деплой и откат — по `docs/agent-deploy-runbook.md` раздел 4 (тот же
   `deploy/remote-deploy.sh`).

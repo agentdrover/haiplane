@@ -144,8 +144,10 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
    `local-executor-hub-repo`, этап 2, п. 6 (класс, признаки поверхностей,
    `kind=security`, таблица примеров). Здесь правило не повторяется. Это правило
    процесса, кодом хаба оно не проверяется.
-5. Локальные проверки до сдачи: `make lint types budget security` и `uv run pytest -q`
-   смотрите по коду возврата, не по хвосту вывода.
+5. Локальные проверки до сдачи: `make check-fast` (вся статика `make check` и целевые
+   тесты по диффу) смотрите по коду возврата, не по хвосту вывода. Полный набор
+   доказывает CI: dispatch перед сдачей (п. 3). Клон, где выполнен `make hooks`,
+   гонит `make check-fast` и перед пушем ветки задачи.
 
 ## 6. CLI называется `hp-hub`
 

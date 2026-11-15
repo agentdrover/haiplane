@@ -54,6 +54,11 @@ ACTIVATE_COMMAND = f"git config core.hooksPath {HOOKS_DIR}"
 #
 BASE_BRANCH_KEY = brand.GIT_BASE_BRANCH_KEY
 RELEASE_BRANCH_KEY = brand.GIT_RELEASE_BRANCH_KEY
+# #2000: the command this clone agreed to run before a push. Read here, shown by
+# ``doctor``; NEVER written by the hub's own arming (``activate_quietly``,
+# ``record_branch_policy``): the hub pushes from clones on its own host, where the
+# code of a branch must not run.
+PRE_PUSH_CHECK_KEY = brand.GIT_PRE_PUSH_CHECK_KEY
 
 
 def activate_command(repo: str) -> str:
@@ -459,6 +464,12 @@ def _recorded_base(repo: str) -> str:
     return out.strip() if rc == 0 else ""
 
 
+def pre_push_check(repo: str) -> str:
+    """The command this clone runs before a push, or '' when it did not agree to one."""
+    rc, out = _git(repo, "config", "--local", "--get", PRE_PUSH_CHECK_KEY)
+    return out.strip() if rc == 0 else ""
+
+
 def activate(repo: str) -> HookStatus:
     """Point git at the hook. Idempotent; returns the resulting status.
 
@@ -521,6 +532,13 @@ def main(argv: list[str] | None = None) -> int:
 
     repo = os.path.abspath(args.repo)
     status = inspect(repo) if args.command == "doctor" else activate(repo)
+    if args.command == "doctor":
+        # Separate from the hook's state: it says whether the hook would run a
+        # check, not whether the hook is armed. It does not run the command.
+        check = pre_push_check(repo)
+        print(
+            f"pre-push check: {'configured: ' + check if check else 'not configured'}"
+        )
 
     if status.canonical:
         print(f"pre-push hook: ACTIVE — {status.reason}")
