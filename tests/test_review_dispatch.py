@@ -10,6 +10,7 @@ from httpx import AsyncClient
 
 from hub import config
 from hub import repository as repo
+from hub.expected_sha import PIN_FIELDS
 from hub.integrations import cursor_cloud
 from hub.services.diff_scan import diff_lines
 from hub.services.project_policy import review_dispatch_enabled
@@ -17,8 +18,12 @@ from hub.services.review_dispatch import (
     DEEP,
     LITE,
     REGRESSION_FIX_REASON_MARK,
+    REPORT_BLOCK_INSTRUCTION,
+    REPORT_FENCE,
     pick_review_model,
     pick_review_profile,
+    _delivery_block,
+    _review_prompt,
     changed_paths,
     is_docs_only_diff,
     file_line_counts,
@@ -28,6 +33,7 @@ from hub.services.review_dispatch import (
 )
 from tests.review_dispatch_support import (
     _DIFF_506,
+    _TIP,
     _HARMLESS_DIFF,
     _any_dispatch_row,
     _cap_project,
@@ -548,6 +554,61 @@ async def test_lite_prompt_names_no_token_ceiling(
     assert "не исследуй репозиторий целиком" in prompt
     # Coverage honesty never rested on the number and must survive its removal.
     assert "incomplete=true" in prompt and "lost_dimensions" in prompt
+
+
+def _asks_for_pin(prompt: str, generation: int, sha: str, where: str) -> None:
+    assert f"expected_generation={generation}" in prompt, where
+    assert "reviewed_sha" in prompt and "git rev-parse HEAD" in prompt, where
+    assert sha in prompt and "для сверки" in prompt, where
+    assert f"reviewed_sha={sha}" not in prompt, f"sha хаба не подсказан: {where}"
+    assert "как есть" in prompt and "review_pin_mismatch" in prompt, where
+
+
+def _pin_prompt(profile: str, http: bool, **kwargs) -> str:
+    delivery = _delivery_block(2330, "CODE123", "https://hub.example") if http else ""
+    return _review_prompt(
+        2330, "task-2330/x", "grok-4.6", profile, "RULES", "DIFF", "PREPASS",
+        delivery_block=delivery, **kwargs,
+    )  # fmt: skip
+
+
+async def test_review_prompt_asks_for_the_submission_pin(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1/AC-2 (#2330): lite and deep, on the HTTP and the MCP path, ask for the
+    # pair and name the pinned sha for comparison, not as a value to copy.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-pin"}, "run": {"id": "r-pin"}})
+    _wire(monkeypatch, recorder)
+    lite = await _submitted(client, db, "spike-pin-lite")
+    deep = await _submitted(
+        client, db, "spike-pin-deep", areas=["hub/db.py"], diff=_CODE_DIFF
+    )
+    for task_id, call, profile in zip((lite, deep), recorder.calls, (LITE, DEEP)):
+        assert (await _dispatch_row(db, task_id))["profile"] == profile
+        task = dict(await repo.get_task(db, task_id))
+        assert task["submission_sha"] == _TIP
+        _asks_for_pin(call["prompt_text"], task["submission_generation"], _TIP, profile)
+
+    for profile in (LITE, DEEP):
+        for http in (False, True):
+            prompt = _pin_prompt(profile, http, generation=3, pinned_sha=_TIP)
+            _asks_for_pin(prompt, 3, _TIP, f"{profile} http={http}")
+    local = _pin_prompt(LITE, False, generation=3, pinned_sha=_TIP, inline_diff=True)
+    assert "git rev-parse" not in local, "локальный ревьюер без клона пин не просит"
+
+
+async def test_report_block_carries_no_pin():
+    # AC-3 (#2330): from_run_text drops the pin on purpose, so the JSON template
+    # of the text block must not invite one — in the constant and in the prompt.
+    for template in (
+        REPORT_BLOCK_INSTRUCTION,
+        _pin_prompt(LITE, True, generation=3, pinned_sha=_TIP),
+        _pin_prompt(DEEP, False, generation=3, pinned_sha=_TIP),
+    ):
+        fenced = template.split(f"```{REPORT_FENCE}\n")[1].split("\n```")[0]
+        assert fenced.startswith("{"), "в ограде лежит JSON-шаблон"
+        for field in PIN_FIELDS:
+            assert field not in fenced
 
 
 async def test_self_reported_overspend_follows_the_recorded_decision(
