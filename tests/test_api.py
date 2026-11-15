@@ -3715,6 +3715,47 @@ async def test_zero_raw_machine_review_warns_but_is_accepted(client: AsyncClient
     assert len(alerts) == 1, "a repeated stub must not repeat the alert"
 
 
+async def test_zero_raw_lite_review_is_not_called_a_harness_that_never_ran(
+    client: AsyncClient, db
+):
+    # A lite run is one pass, so agent_count=1 is its normal shape; an empty
+    # report from it is named empty, not "the harness did not run" (#2328).
+    task_id = await _running_pair_task(client, "Zero raw lite review")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={"agent": "dev"})
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-lite",
+        run_id="run-lite",
+        model="grok-4.7",
+        profile="lite",
+    )
+    await db.commit()
+
+    body = {
+        "harness_skill": "lite-diff-review",
+        "agent_count": 1,
+        "raw_count": 0,
+        "findings_confirmed": [],
+        "findings_rejected": [],
+        "incomplete": False,
+        "agent": "cursor_cloud",
+    }
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=body)
+    assert resp.status_code == 200, resp.text
+
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    alerts = [
+        u["content"]
+        for u in data["updates"] or []
+        if u["kind"] == "alert" and "raw_count=0" in u["content"]
+    ]
+    assert len(alerts) == 1, "an empty lite report is still named"
+    assert "харнесс не запускался" not in alerts[0]
+    assert "пустой отчёт" in alerts[0]
+
+
 # ---- #806: declared size stops excusing a change to code ----
 #
 # The cascade let XS/S out before it ever looked at what the work touches.

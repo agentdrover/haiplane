@@ -35,6 +35,7 @@ from hub.models import (
 from hub.services import ci_integrity, report_binding, review_pin, watch_notices
 from hub.services.review_oversized import attach_ac_tests_unread, unread_for_task
 from hub.services.result_kind import automation_not_applicable
+from hub.services.review_dispatch import LITE
 from hub.services.steward_corridor import outcome_label, report_outcome
 
 log = logging.getLogger("hub")
@@ -56,6 +57,7 @@ async def _alert_no_candidates(
     body: MachineReviewSubmit,
     raw_count: int,
     generation: int,
+    profile: str,
 ) -> None:
     """Сказать на карточке, что кандидатов не было вовсе (#750).
 
@@ -69,6 +71,11 @@ async def _alert_no_candidates(
     фильтрации, а следом и автовердикт (#745 уже отказывает на raw_count=0).
     Предупреждение одно на поколение и никогда не отказ: сам отчёт всё ещё
     ценен как свидетельство.
+
+    Профиль lite — один проход по диффу, agent_count=1 у него штатный, и
+    форма «один агент без токенов» незапуска не означает: на #2328 такой
+    отчёт пришёл от прогона, которому провайдер насчитал 2,35 млн токенов.
+    Для lite карточка называет пустой отчёт пустым отчётом.
     """
     if raw_count != 0:
         return
@@ -82,11 +89,16 @@ async def _alert_no_candidates(
         return
     single_agent = (body.agent_count or 0) <= 1
     no_tokens = body.tokens_spent is None
-    detail = (
-        "похоже, харнесс не запускался (agent_count≤1, токены не посчитаны)"
-        if single_agent and no_tokens
-        else "проверьте, что фазы измерений и адъюдикации исполнялись"
-    )
+    if profile == LITE:
+        detail = (
+            "лёгкий профиль — один проход, agent_count=1 у него штатный, так "
+            "что это пустой отчёт, а не признак незапуска; проверьте, что "
+            "дифф прочитан целиком"
+        )
+    elif single_agent and no_tokens:
+        detail = "похоже, харнесс не запускался (agent_count≤1, токены не посчитаны)"
+    else:
+        detail = "проверьте, что фазы измерений и адъюдикации исполнялись"
     await repo.add_task_update(
         db,
         task_id,
@@ -250,12 +262,13 @@ async def _intake_alerts(
     generation: int,
     review_id: int,
     principal_id: int | None,
+    profile: str,
 ) -> None:
     """Ленты приёма: нет кандидатов, снятие прежнего алерта, отказ среды.
 
     Вынесено из ``record_machine_review`` (потолок по операторам, #1985).
     """
-    await _alert_no_candidates(db, task_id, body, raw_count, generation)
+    await _alert_no_candidates(db, task_id, body, raw_count, generation, profile)
     await _retract_no_candidates_alert(
         db, task_id, generation, review_id, raw_count, principal_id
     )
@@ -505,7 +518,7 @@ async def _store_machine_review(
         review_id=new_review_id,
     )
     await _intake_alerts(
-        db, task_id, body, raw_count, generation, new_review_id, principal_id
+        db, task_id, body, raw_count, generation, new_review_id, principal_id, profile
     )
 
     # #1012/#1025: the hub may already have called a reviewer for this very
