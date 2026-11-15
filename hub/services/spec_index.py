@@ -33,6 +33,7 @@ from hub.models import (
     SpecIndexResult,
     SpecRequirement,
 )
+from hub.services import spec_debt
 from hub.services.spec_format import (
     SpecParseError,
     capability_of,
@@ -175,6 +176,10 @@ async def index_project(db: aiosqlite.Connection, project_id: int) -> SpecIndexR
         return _refused(ref, commit, issues)
     file_rows, req_rows = _rows(files, parsed)
     async with write_transaction(db):
+        # #2220: блок id из долга слит мимо проверенного снимка - индекс его не берёт.
+        file_rows, req_rows = await spec_debt.hold_index(
+            db, project_id, file_rows, req_rows
+        )
         await store.replace_index(
             db,
             project_id,

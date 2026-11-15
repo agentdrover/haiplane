@@ -70,7 +70,7 @@ async def refuse_if_unspecified(db: aiosqlite.Connection, task: dict[str, Any]) 
     пишет и записей не читает: это дверь для сдачи, где снимка нет.
     """
     kind, _records = parse_delta(task.get("behavior_delta"))
-    if kind in _UNANSWERED and await _inside_gate(db, task):
+    if kind in _UNANSWERED and await inside_gate(db, task):
         raise _unspecified()
 
 
@@ -220,7 +220,7 @@ def _base_missing(requirement_id: str) -> HTTPException:
     )
 
 
-async def _inside_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+async def inside_gate(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
     if str(task.get("task_type") or "task") not in _GATED_TYPES:
         return False
     project = await repo.resolve_project_for_task(db, int(task["id"]))

@@ -945,9 +945,11 @@ def _snapshot_line(snap: Any) -> list[str]:
         return []
     mark = " explicit_no_delta" if snap.get("explicit_no_delta") else ""
     count = len(snap.get("records") or [])
+    check = snap.get("spec_check")
+    spec = f" spec_check {check['state']}" if isinstance(check, dict) else ""
     return [
         f"BEHAVIOR SNAPSHOT gen {snap.get('generation')} "
-        f"head {snap['head_sha']} records {count}{mark}"
+        f"head {snap['head_sha']} records {count}{mark}{spec}"
     ]
 
 

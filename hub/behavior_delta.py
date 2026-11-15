@@ -60,6 +60,20 @@ class BehaviorSnapshotRecord(BaseModel):
     scenarios: list[DeltaScenario] = Field(default_factory=list)
 
 
+class SpecCheck(BaseModel):
+    """The diff of ``specs/`` against the snapshot, bound to one head (#2220).
+
+    ``matched``: blocks at ``head_sha`` equal the snapshot, measured from
+    ``base_sha``. ``unchecked``: the hub could not read the commit; the reason
+    says why. The check covers ``head_sha`` only: a later commit is not covered.
+    """
+
+    state: Literal["matched", "unchecked"]
+    head_sha: str = ""
+    base_sha: str = ""
+    reason: str = ""
+
+
 class BehaviorSnapshot(BaseModel):
     """The delta frozen on a submission: generation, head and records."""
 
@@ -67,6 +81,7 @@ class BehaviorSnapshot(BaseModel):
     head_sha: str
     records: list[BehaviorSnapshotRecord] = Field(default_factory=list)
     explicit_no_delta: bool = False
+    spec_check: SpecCheck | None = None
 
 
 def coerce_behavior_delta(value: Any) -> Any:
