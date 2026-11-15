@@ -14,10 +14,14 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 from httpx import AsyncClient
 
+import hub.db as db_module
 from hub import config
 from hub import repository as repo
 from hub.db import _migrate
 from hub.integrations import cursor_cloud
+from hub.mcp_server import hub_submit_machine_review
+from hub.migrations import FROZEN_MIGRATIONS, assemble
+from hub.migrations.steps import load_step_files
 from hub.models import ReviewVerdict
 from hub.review_checks import (
     CHECK_RESULT_LIMIT,
@@ -32,6 +36,7 @@ from hub.review_checks import (
 from hub.services import review_brief_projection as proj
 from hub.services.review_dispatch import sweep_review_dispatches
 from hub.services import review_dispatch
+from hub.services.digest import _report_outcome_of
 from hub.services.steward_advisor import apply_advisor_outcomes
 from hub.services.steward_corridor import (
     CLEAN_OUTCOMES,
@@ -63,6 +68,7 @@ from tests.review_dispatch_support import (
 from tests.steward_double_clean_support import build_case, judge_and_advise, policy_of
 from tests.steward_empty_report_support import PROVEN, add_report, settle_dispatch
 from tests.test_db_migrations import _make_db
+from tests.test_machine_review import _no_candidates_alerts, _reviewable_task
 from tests.test_review_brief_projection import _brief, _machine
 from tests.web_support import _web_task_in_review_with_test_ac
 
@@ -139,9 +145,21 @@ def test_the_ladder_puts_a_list_of_checks_between_no_data_and_clean():
     assert "не перепроверял" in outcome_label(OUTCOME_CHECKED_CLEAN)
 
 
-async def test_the_digest_names_a_checked_report_apart(db: aiosqlite.Connection):
-    from hub.services.digest import _report_outcome_of
+async def test_a_checked_report_does_not_hide_a_later_empty_one(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Алерт «нет данных» пишется по ПЕРВОЙ непроверенной нулевой строке поколения."""
+    task_id = await _reviewable_task(client, db)
+    base = {"raw_count": 0, "incomplete": False, "harness_skill": "lite-diff-review"}
+    for body, alerts in (({"checks_done": CHECKS}, 0), ({}, 1), ({}, 1)):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/machine-review", json={**base, **body}
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(await _no_candidates_alerts(db, task_id)) == alerts, body
 
+
+async def test_the_digest_names_a_checked_report_apart(db: aiosqlite.Connection):
     ids = {}
     for label, checks in (("checked", ONE), ("empty", [])):
         ids[label] = await repo.insert_machine_review(
@@ -374,8 +392,6 @@ async def test_the_card_shows_the_checks_and_the_run_text_as_the_reviewers_word(
 
 
 async def test_mcp_receipt_forwards_the_checks_and_names_dropped_entries():
-    from hub.mcp_server import hub_submit_machine_review
-
     stored = {
         "raw_count": 0,
         "findings_confirmed": [],
@@ -437,10 +453,6 @@ def test_the_brief_projection_shows_five_checks_and_pages_the_rest():
 async def test_the_columns_arrive_by_the_step_and_old_rows_read_as_not_attached(
     monkeypatch,
 ):
-    import hub.db as db_module
-    from hub.migrations import FROZEN_MIGRATIONS, assemble
-    from hub.migrations.steps import load_step_files
-
     steps = [s for s in load_step_files() if "_2336_" in s.name]
     assert len(steps) == 1 and steps[0].name.startswith("m")
 
