@@ -6806,6 +6806,23 @@ async def _store_report(
 
 
 async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
+    """Poller pass over active dispatches; a failed one leaves nothing open (#2336).
+
+    Заказ коммитится целиком в конце своей ветки. Упавший оставляет открытую
+    транзакцию (алерт #757, счёт, текст прогона без ``done``), а обёртка поллера
+    глотает исключение без отката, и следующий шаг тика с безусловным коммитом
+    зафиксировал бы её при активном заказе. Откат снимает только недописанное:
+    закрытые заказы уже закоммичены. Исключение идёт дальше - поллер его назовёт.
+    """
+    try:
+        await _settle_review_dispatches(db)
+    except Exception:
+        if db.in_transaction:
+            await db.rollback()
+        raise
+
+
+async def _settle_review_dispatches(db: aiosqlite.Connection) -> None:
     """Poller pass over active dispatches: settle finished runs.
 
     - report arrived → cross-check tokens against the provider's usage

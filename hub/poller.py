@@ -1684,12 +1684,6 @@ async def _sweep_review_dispatches(db) -> None:
         await sweep_review_dispatches(db)
     except Exception:  # noqa: BLE001 - the sweep must not kill the loop
         log.exception("review dispatch sweep failed")
-        # #2336: заказ коммитится целиком в конце своей ветки; упавший оставил
-        # открытую транзакцию (алерт #757, счёт, текст прогона без done), а
-        # следующий шаг тика коммитит безусловно и зафиксировал бы её. Откат
-        # снимает только недописанное: закрытые заказы уже закоммичены.
-        if db.in_transaction:
-            await db.rollback()
 
 
 async def _sweep_steward_runs(db) -> None:
