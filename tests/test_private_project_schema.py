@@ -422,14 +422,28 @@ async def test_nested_failed_import_preserves_callers_work(db):
 async def test_special_key_permission_ceiling_is_preserved(db, role):
     alice, _, a, _ = await setup_owners(db)
     pid = await project(db, alice, a)
+    task = await db.execute(
+        "INSERT INTO tasks(title,project_id) VALUES ('scoped',?)", (pid,)
+    )
+    await db.commit()
     key = identity(
         alice,
         role,
         ("tasks.read", "tasks.update", "projects.self.create", "projects.self.manage"),
     )
+    grant = Delegation(
+        alice,
+        pid,
+        task.lastrowid,
+        1,
+        frozenset({"tasks.update"}),
+        datetime.now(timezone.utc) + timedelta(hours=1),
+    )
     assert not key.has_permission("tasks.update")
     assert not (
-        await decide(db, key, project_id=pid, permission="tasks.update")
+        await decide(
+            db, key, task_id=task.lastrowid, permission="tasks.update", delegation=grant
+        )
     ).allowed
     assert not await self_service_capabilities(db, key)
 
