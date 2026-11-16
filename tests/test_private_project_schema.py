@@ -416,3 +416,75 @@ async def test_nested_failed_import_preserves_callers_work(db):
     assert (
         await decide(db, identity(alice), project_id=pid, permission="tasks.read")
     ).allowed
+
+
+@pytest.mark.parametrize("role", ["watcher", "ci_reader", "ci_auditor", "slot_runner"])
+async def test_special_key_permission_ceiling_is_preserved(db, role):
+    alice, _, a, _ = await setup_owners(db)
+    pid = await project(db, alice, a)
+    key = identity(
+        alice,
+        role,
+        ("tasks.read", "tasks.update", "projects.self.create", "projects.self.manage"),
+    )
+    assert not key.has_permission("tasks.update")
+    assert not (
+        await decide(db, key, project_id=pid, permission="tasks.update")
+    ).allowed
+    assert not await self_service_capabilities(db, key)
+
+
+@pytest.mark.parametrize(
+    "role", ["agent", "steward", "watcher", "ci_reader", "ci_auditor", "slot_runner"]
+)
+async def test_machine_key_on_human_principal_still_needs_delegation(db, role):
+    alice, _, a, _ = await setup_owners(db)
+    pid = await project(db, alice, a)
+    key = identity(
+        alice, role, ("tasks.read", "tasks.human_gate", "projects.self.create")
+    )
+    assert not (await decide(db, key, project_id=pid, permission="tasks.read")).allowed
+    assert not (
+        await decide(db, key, project_id=pid, permission="tasks.human_gate")
+    ).allowed
+    assert not await self_service_capabilities(db, key)
+
+
+async def test_chat_pair_key_on_human_principal_is_not_a_human_actor(db):
+    alice, _, a, _ = await setup_owners(db)
+    pid = await project(db, alice, a)
+    task = await db.execute(
+        "INSERT INTO tasks(title,project_id) VALUES ('pair',?)", (pid,)
+    )
+    await db.commit()
+    key = identity(
+        alice, "admin", ("tasks.read", "tasks.human_gate", "projects.self.create")
+    )
+    key.chat_pair_kind = "implementer"
+    key.chat_pair_task_id = task.lastrowid
+    assert not (
+        await decide(db, key, task_id=task.lastrowid, permission="tasks.read")
+    ).allowed
+    grant = Delegation(
+        alice,
+        pid,
+        task.lastrowid,
+        1,
+        frozenset({"tasks.read", "tasks.human_gate"}),
+        datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    assert (
+        await decide(
+            db, key, task_id=task.lastrowid, permission="tasks.read", delegation=grant
+        )
+    ).allowed
+    assert not (
+        await decide(
+            db,
+            key,
+            task_id=task.lastrowid,
+            permission="tasks.human_gate",
+            delegation=grant,
+        )
+    ).allowed
+    assert not await self_service_capabilities(db, key)

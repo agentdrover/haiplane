@@ -35,6 +35,32 @@ MEMBER_PERMISSIONS = READ_PERMISSIONS | frozenset(
 OWNER_PERMISSIONS = MEMBER_PERMISSIONS | frozenset(
     {"tasks.delete", "projects.self.manage"}
 )
+HUMAN_ROLES = frozenset(
+    {
+        "human",
+        "admin",
+        "super_admin",
+        "operator",
+        "developer",
+        "viewer",
+        "security_admin",
+    }
+)
+
+
+def _human_actor(identity: TokenIdentity, principal_kind: str) -> bool:
+    # Chat-pair can act under its issuing human's principal ID.
+    return (
+        principal_kind == "human"
+        and identity.role in HUMAN_ROLES
+        and identity.chat_pair_kind is None
+        and identity.chat_pair_task_id is None
+    )
+
+
+def _holds(identity: TokenIdentity, permission: str) -> bool:
+    # Stored role unions must not lift ceilings on watcher, CI or host keys.
+    return permission in identity.permissions and identity.has_permission(permission)
 
 
 @dataclass(frozen=True)
@@ -63,9 +89,11 @@ async def self_service_capabilities(
     rows = await fetchall(
         db, "SELECT kind,status FROM principals WHERE id=?", (identity.principal_id,)
     )
-    if not rows or rows[0]["kind"] != "human" or rows[0]["status"] != "active":
+    if not rows or rows[0]["status"] != "active" or identity.scopes_damaged:
         return frozenset()
-    return SELF_SERVICE_CAPABILITIES & identity.permissions
+    if not _human_actor(identity, rows[0]["kind"]):
+        return frozenset()
+    return frozenset(cap for cap in SELF_SERVICE_CAPABILITIES if _holds(identity, cap))
 
 
 async def _task_project(db: aiosqlite.Connection, task_id: int) -> int | None:
@@ -126,7 +154,7 @@ async def decide(
         project_id = resolved
     if (
         project_id is None
-        or permission not in identity.permissions
+        or not _holds(identity, permission)
         or identity.scopes_damaged
     ):
         return AccessDecision(False)
@@ -156,7 +184,7 @@ async def decide(
     }[row["role"]]
     if permission not in permissions:
         return AccessDecision(False)
-    if row["kind"] != "human":
+    if not _human_actor(identity, row["kind"]):
         if permission in {"tasks.human_gate", "tasks.decision", "projects.self.manage"}:
             return AccessDecision(False)
         if not _delegation_allows(

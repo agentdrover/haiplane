@@ -48,6 +48,8 @@ generation, recipient-bound acceptance and permission checks are implemented in
 `hub/services/project_access.py::decide` consumes the authenticated
 `TokenIdentity`. The permission is an intersection of its system permissions,
 the active DB principal's membership and the allowed project-role verbs.
+The effective role's `TokenIdentity.has_permission` ceiling is retained even
+when the stored permission set contains grants from several roles.
 Global roles, including admin, do not grant membership. An owner with developer
 system permissions cannot acquire human-gate privileges through ownership.
 Viewer membership remains read-only even for a system operator.
@@ -58,6 +60,9 @@ timezone-aware expiry. A delegation is an in-process server contract, **not** a
 client payload or a bearer credential. Issuance/persistence and order delivery
 belong to #2352. Agents cannot execute human gates or manage project ownership.
 API-key project scopes and task-bound chat-pair scopes further narrow access.
+The actor's effective role and chat-pair identity are checked separately from
+`principals.kind`: an implementer acting under a human issuer's principal ID
+still requires delegation and cannot use human gates or self-service controls.
 
 Task ancestry is resolved from the database, with cycle/depth guards and no
 default-project fallback. A supplied project must equal the server result.
