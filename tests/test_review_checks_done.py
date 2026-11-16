@@ -12,7 +12,6 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
-import pytest
 from httpx import AsyncClient
 
 import hub.db as db_module
@@ -24,6 +23,7 @@ from hub.mcp_server import hub_submit_machine_review
 from hub.migrations import FROZEN_MIGRATIONS, assemble
 from hub.migrations.steps import load_step_files
 from hub.models import ReviewVerdict
+from hub.poller import _sweep_events_retention, _sweep_review_dispatches
 from hub.review_checks import (
     CHECK_RESULT_LIMIT,
     CHECK_WHAT_LIMIT,
@@ -392,9 +392,11 @@ async def test_a_failure_before_the_dispatch_closes_leaves_nothing_committed(
 ):
     """Текст, счёт, алерт #757 и закрытие заказа - одна транзакция свипа (находка).
 
-    Сбой между сохранением текста и закрытием заказа, затем откат конца тика
-    (``_poll_once``): ни алерта, ни счёта на отчёте, заказ active; повторный
-    проход пишет ровно один алерт и закрывает заказ.
+    Путь настоящий, без ручного отката: упавший ``set_review_dispatch_status``
+    глотает обёртка поллера, следом идёт соседний шаг тика с безусловным
+    коммитом (``_sweep_events_retention``). Обёртка обязана откатить
+    недописанное до возврата в тик, иначе соседний коммит зафиксирует алерт,
+    счёт и текст при активном заказе, а повторный проход напишет второй алерт.
     """
     task_id, _ = await _report_then_run(
         client,
@@ -414,9 +416,8 @@ async def test_a_failure_before_the_dispatch_closes_leaves_nothing_committed(
         return await real(conn, dispatch_id, status)
 
     monkeypatch.setattr(repo, "set_review_dispatch_status", _flaky)
-    with pytest.raises(RuntimeError):
-        await sweep_review_dispatches(db)
-    await db.rollback()  # конец тика поллера: открытая транзакция откатывается
+    await _sweep_review_dispatches(db)
+    await _sweep_events_retention(db)
 
     review = dict(await repo.get_latest_machine_review(db, task_id))
     assert await _usage_alerts_of(db, task_id) == []
@@ -424,7 +425,7 @@ async def test_a_failure_before_the_dispatch_closes_leaves_nothing_committed(
     assert (await _any_dispatch_row(db, task_id))["status"] == "active"
 
     failing["on"] = False
-    await sweep_review_dispatches(db)
+    await _sweep_review_dispatches(db)
     assert len(await _usage_alerts_of(db, task_id)) == 1, "второго алерта нет"
     assert (await _any_dispatch_row(db, task_id))["status"] == "done"
     assert await _kept(db, task_id) == "итог прогона"
