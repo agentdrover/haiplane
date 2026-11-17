@@ -46,6 +46,18 @@ class GithubKeyring:
             os.close(parent)
 
     @staticmethod
+    def _sync_ancestors(path: Path) -> None:
+        # An existing directory can be left by a failed mkdir/fsync attempt.
+        # Reestablish durability for the entire chain before writing any key.
+        absolute = path.absolute()
+        for ancestor in (absolute, *absolute.parents):
+            fd = os.open(ancestor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+    @staticmethod
     def _directory(path: Path, create: bool = False) -> int:
         try:
             fd = GithubKeyring._open_directory(path.parent, create)
@@ -53,6 +65,12 @@ class GithubKeyring:
             if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
                 os.close(fd)
                 raise CredentialError("key_unreadable")
+            if create:
+                try:
+                    GithubKeyring._sync_ancestors(path.parent)
+                except BaseException:
+                    os.close(fd)
+                    raise
             return fd
         except FileNotFoundError:
             raise CredentialError("key_missing") from None

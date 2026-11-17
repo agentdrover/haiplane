@@ -122,6 +122,16 @@ async def test_first_bootstrap_persists_new_key_directory_parents(
     with pytest.raises(CredentialError, match="key_unreadable"):
         await GithubVault(db_dsn, failed).bootstrap()
     assert not failed.exists()
+    # The failed mkdir remains. A retry must sync its original parent too,
+    # rather than trusting existence as evidence of durability.
+    assert failed.parent.parent.exists()
+    synced.clear()
+    monkeypatch.setattr(os, "fsync", record)
+    await GithubVault(db_dsn, failed).bootstrap()
+    assert failed.exists()
+    assert tmp_path.stat().st_ino in synced
+    assert failed.parent.parent.stat().st_ino in synced
+    assert failed.parent.stat().st_ino in synced
 
 
 async def test_cached_token_requires_live_owner_and_exact_repo_proof(
