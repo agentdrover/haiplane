@@ -167,7 +167,8 @@ class GithubVault:
         for _ in range(1500):
             state, old, expires = await self._reserve(slot, kind, lease)
             if state == "ready":
-                assert old is not None
+                if old is None or expires <= self.clock() + 30:
+                    raise CredentialError("credential_expired")
                 return old, expires
             if state == "blocked":
                 raise CredentialError(
@@ -176,7 +177,10 @@ class GithubVault:
                     else "refresh_reauthorization_required"
                 )
             if state == "renew":
-                return await self._renew(slot, kind, lease, old, renew)
+                token, expires = await self._renew(slot, kind, lease, old, renew)
+                if expires <= self.clock() + 30:
+                    raise CredentialError("credential_expired")
+                return token, expires
             await asyncio.sleep(0.02)
         raise CredentialError("refresh_pending")
 
@@ -193,6 +197,8 @@ class GithubVault:
                 raise CredentialError("invalid_provider_response")
             async with self._transaction() as db:
                 ring = GithubKeyring.load(self.key_path)
+                if expires <= self.clock() + 30:
+                    raise CredentialError("credential_expired")
                 cur = await db.execute(
                     "UPDATE github_credential_slots SET ciphertext=?,expires_at=?,version=version+1,state='active',lease_id=NULL,lease_until=NULL,failure_code='' WHERE slot=? AND kind=? AND state='refreshing' AND lease_id=? AND lease_until>?",
                     (

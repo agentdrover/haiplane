@@ -15,6 +15,115 @@ from datetime import datetime, timedelta, timezone
 from tests.test_github_credentials import setup
 
 
+@pytest.mark.parametrize("purpose", ["read", "git_write"])
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"protected_path_policy": ["mutable"]},
+        {"expected_sha": ["mutable"]},
+        {"refs": (["refs/heads/mutable"],)},
+        {"permissions": (("contents", ["read"]),)},
+    ],
+)
+def test_operation_context_rejects_mutable_fields_for_every_purpose(purpose, override):
+    from hub.integrations.github_credentials import CredentialContext
+
+    values = dict(
+        project_id=1,
+        binding_id=1,
+        repository_id=201,
+        actor_id=1,
+        purpose=purpose,
+        auth_epoch=1,
+        permissions=(("contents", "read"),),
+        refs=("refs/heads/feature",),
+        expected_sha="a" * 40,
+        protected_path_policy="deny-protected",
+    )
+    values.update(override)
+    with pytest.raises(CredentialError, match="invalid_context"):
+        CredentialContext(**values)
+
+
+async def test_token_expiring_during_final_owner_proof_is_not_published(
+    db, db_dsn, tmp_path, monkeypatch
+):
+    vault, service, provider, contexts, identities, _ = await setup(
+        db, db_dsn, tmp_path
+    )
+    clock = [1000.0]
+    vault.clock = service.clock = lambda: clock[0]
+    verify = provider.verify_owner
+    calls = []
+
+    async def verify_after_wait(*args):
+        calls.append(True)
+        proof = await verify(*args)
+        if len(calls) == 2:
+            clock[0] = 4601.0
+        return proof
+
+    monkeypatch.setattr(provider, "verify_owner", verify_after_wait)
+    with pytest.raises(CredentialError, match="credential_expired"):
+        await service.credential(identities[0], contexts[0])
+    assert len(calls) == 2
+
+
+async def test_token_expiring_while_waiting_for_publication_lock_is_blocked(
+    db, db_dsn, tmp_path, monkeypatch
+):
+    vault, _, _, _, _, _ = await setup(db, db_dsn, tmp_path)
+    clock = [1000.0]
+    vault.clock = lambda: clock[0]
+    original = GithubKeyring.load
+    calls = []
+
+    def advance_at_publication(path):
+        calls.append(True)
+        ring = original(path)
+        if len(calls) == 2:
+            clock[0] = 4990.0
+        return ring
+
+    async def renew(_old):
+        return Secret("synthetic-installation"), 5000.0
+
+    monkeypatch.setattr(GithubKeyring, "load", advance_at_publication)
+    with pytest.raises(CredentialError, match="credential_expired"):
+        await vault.refresh("expiring", "installation", renew)
+
+
+async def test_first_bootstrap_persists_new_key_directory_parents(
+    db, db_dsn, tmp_path, monkeypatch
+):
+    import os
+
+    original = os.fsync
+    synced = []
+
+    def record(fd):
+        synced.append(os.fstat(fd).st_ino)
+        original(fd)
+
+    monkeypatch.setattr(os, "fsync", record)
+    path = tmp_path / "fresh-parent" / "keys" / "credential.keys"
+    await GithubVault(db_dsn, path).bootstrap()
+    assert tmp_path.stat().st_ino in synced
+    assert path.parent.parent.stat().st_ino in synced
+    assert path.parent.stat().st_ino in synced
+
+    def fail(fd):
+        if os.fstat(fd).st_ino == tmp_path.stat().st_ino:
+            raise OSError("injected parent fsync failure")
+        original(fd)
+
+    monkeypatch.setattr(os, "fsync", fail)
+    failed = tmp_path / "failed-parent" / "keys" / "credential.keys"
+    with pytest.raises(CredentialError, match="key_unreadable"):
+        await GithubVault(db_dsn, failed).bootstrap()
+    assert not failed.exists()
+
+
 async def test_cached_token_requires_live_owner_and_exact_repo_proof(
     db, db_dsn, tmp_path, monkeypatch
 ):

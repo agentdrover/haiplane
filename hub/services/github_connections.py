@@ -243,7 +243,7 @@ class GithubConnections:
         except CredentialError as error:
             reason = str(error)
         except Exception:
-            pass
+            reason = "credential_unavailable"
         # Outside the except block: the public error retains neither provider
         # exception context nor traceback frames containing plaintext material.
         raise CredentialError(reason)
@@ -267,6 +267,8 @@ class GithubConnections:
         fresh, _ = await self._resolve(identity, ctx, delegation)
         if fresh != grant:
             raise CredentialError("access_changed")
+        if expires <= self.clock() + 30:
+            raise CredentialError("credential_expired")
         return CredentialLease(ctx, token, expires)
 
     async def status(

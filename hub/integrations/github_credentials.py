@@ -18,6 +18,7 @@ class CredentialError(RuntimeError):
             "connection_unavailable",
             "context_mismatch",
             "credential_unavailable",
+            "credential_expired",
             "credential_unreadable",
             "delegation_denied",
             "invalid_app",
@@ -120,8 +121,17 @@ class CredentialContext:
     def __post_init__(self):
         if (
             type(self.permissions) is not tuple
-            or any(type(p) is not tuple for p in self.permissions)
+            or any(
+                type(p) is not tuple
+                or len(p) != 2
+                or any(type(v) is not str for v in p)
+                for p in self.permissions
+            )
             or type(self.refs) is not tuple
+            or any(type(ref) is not str for ref in self.refs)
+            or type(self.purpose) is not str
+            or type(self.expected_sha) is not str
+            or type(self.protected_path_policy) is not str
         ):
             raise CredentialError("invalid_context")
         if self.task_id is not None and (

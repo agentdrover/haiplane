@@ -10,7 +10,8 @@
 `GithubConnections.credential(identity, context, delegation)` принимает
 неизменяемый `CredentialContext`: project, binding, repository, actor, task,
 purpose, auth_epoch, permissions. Для write добавляются refs, expected SHA
-и protected path policy. Это контекст решения, а не enforcement Git-команд:
+и protected path policy. Типы всех полей проверяются для каждого purpose;
+изменяемые элементы не допускаются. Это контекст решения, а не enforcement Git-команд:
 диспетчер #2358 обязан проверить конкретную команду, refs, SHA и защищённые
 пути перед запуском. Токен GitHub сам не ограничивает refs.
 
@@ -30,6 +31,8 @@ App material и user material входят в cache key вместе со все
 Hub records и свежие GitHub owner/admin/repository/installation proof.
 Внешний отказ и невозможность получить доказательство не дают credential.
 Изменение доступа в ходе запроса блокирует публикацию lease.
+Срок токена повторно проверяется после завершающего network proof и перед
+публикацией ciphertext под DB lock; недостаточный остаток даёт `credential_expired`.
 Отзыв уже выданного внешнего токена и остановка процесса требуют #2359/#2354.
 
 `configure_app`, `set_user_credentials`, `set_grant` — внутренние trusted
@@ -46,6 +49,8 @@ ciphertext, key id, nonce и служебные поля. AAD связывает
 slot/kind; перестановка между записями не проходит аутентификацию.
 Отдельный JSON keyring имеет каталог 0700 и файл 0600 текущего service user;
 symlink последнего каталога/файла, hardlink, неверные owner/mode отвергаются.
+При первом создании каждого каталога выполняется fsync его родителя;
+перед готовностью ключа fsync выполняется для файла и конечного каталога.
 Keyring не входит в SQLite backup. Доступ к обоим — полномочие service user.
 
 Каждое изменение slots идёт под `BEGIN IMMEDIATE`; сеть выполняется после

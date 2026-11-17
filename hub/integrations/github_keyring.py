@@ -17,11 +17,38 @@ class GithubKeyring:
         self.path, self.active, self.keys = path, active, keys
 
     @staticmethod
+    def _open_directory(path: Path, create: bool) -> int:
+        try:
+            return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            if not create:
+                raise
+        parent = GithubKeyring._open_directory(path.parent, create=True)
+        try:
+            try:
+                os.mkdir(path.name, mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                # Another bootstrap may have created this directory.
+                os.fsync(parent)
+            else:
+                # Persist every new ancestor entry, not only the key file.
+                os.fsync(parent)
+            fd = os.open(
+                path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+            )
+            try:
+                os.fsync(fd)
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd
+        finally:
+            os.close(parent)
+
+    @staticmethod
     def _directory(path: Path, create: bool = False) -> int:
         try:
-            if create:
-                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = GithubKeyring._open_directory(path.parent, create)
             info = os.fstat(fd)
             if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
                 os.close(fd)
