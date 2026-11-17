@@ -14,6 +14,8 @@ services:
       - "8080:8080"
     volumes:
       - ./data:/data
+      # Separate persistent storage: a DB-only restore has no decryption key.
+      - github_keys:/keys
     environment:
       # Demo data (project "demo" with sample tasks) is seeded on first
       # start. Set to "0" — or delete the line — to start with an empty hub.
@@ -23,3 +25,6 @@ services:
       # for a local demo, unsafe on a shared host. For real use set
       # HAIPLANE_HUB_TOKENS=name:token[:role] and remove this override.
       HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK: "1"
+
+volumes:
+  github_keys:
