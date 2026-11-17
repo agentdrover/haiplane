@@ -35,7 +35,7 @@ def fixtures(private_key):
         json.dumps(
             {
                 "private_key": pem,
-                "client_secret": "synthetic-client-secret",
+                "client_secret": "synthetic-client-secret",  # pragma: allowlist secret
                 "client_id": "client1",
             }
         )

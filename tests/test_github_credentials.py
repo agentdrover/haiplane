@@ -77,7 +77,7 @@ async def setup(db, db_dsn, tmp_path):
         1,
         "client-id",
         Secret(
-            '{"private_key":"synthetic-key","client_secret":"synthetic-client-secret"}'
+            '{"private_key":"synthetic-key","client_secret":"synthetic-client-secret"}'  # pragma: allowlist secret
         ),
         dict(PERMS),
     )
@@ -191,7 +191,7 @@ async def test_secret_values_absent_from_projections_logs_and_argv(
             "PATH": "/usr/bin:/bin",
             "GH_TOKEN": "host-secret",
             "SSH_AUTH_SOCK": "host-socket",
-            "AWS_SECRET_ACCESS_KEY": "host-secret",
+            "AWS_SECRET_ACCESS_KEY": "host-secret",  # pragma: allowlist secret
         },
     )
     assert os.environ == before
@@ -226,7 +226,7 @@ async def test_secret_values_absent_from_projections_logs_and_argv(
     with pytest.raises(CredentialError):
         command_environment(lease, contexts[1], tmp_path / "wrong", {})
     for bad in (
-        "https://user:token@github.com/org/repo",
+        "https://user:token@github.com/org/repo",  # pragma: allowlist secret
         "../repo",
         "org/repo?token=x",
     ):
