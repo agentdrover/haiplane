@@ -22,12 +22,6 @@
       "removed_by": "unclaimed"
     },
     {
-      "path": "hub/db.py",
-      "measured": 1645,
-      "max": 1728,
-      "removed_by": "unclaimed"
-    },
-    {
       "path": "hub/integrations/forge/github.py",
       "measured": 1504,
       "max": 1580,
