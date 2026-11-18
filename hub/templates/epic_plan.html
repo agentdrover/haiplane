@@ -67,14 +67,14 @@
 {% if plan.can_decide %}
     {% if not plan.decision or plan.decision.version != plan.version %}
     <form method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {{ csrf_field() }}
         <input type="hidden" name="version" value="{{ plan.version }}">
         <button name="action" value="approve" type="submit">Утвердить версию</button>
     </form>
     {% endif %}
     {% if plan.decision and plan.decision.state != "revoked" %}
     <form method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {{ csrf_field() }}
         <input type="hidden" name="version" value="{{ plan.decision.version }}">
         <label>Причина <input name="reason" type="text" required maxlength="500"></label>
         <button name="action" value="stopped" type="submit">Остановить</button>
