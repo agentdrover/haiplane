@@ -412,6 +412,74 @@ def _independent(checks: list[Facts], statuses: list[Facts]) -> CIProbeResult | 
     return None
 
 
+async def _commit_ci(get: Get, api: str, sha: str) -> tuple[list[Facts], list[Facts]]:
+    checks, statuses = await asyncio.gather(
+        pages(get, f"{api}/commits/{sha}/check-runs?filter=all", "check_runs"),
+        pages(get, f"{api}/commits/{sha}/statuses"),
+    )
+    return checks, statuses
+
+
+async def _dispatch_check_ids(
+    get: Get, api: str, sha: str, runs: list[Facts], checks: dict[Any, Facts]
+) -> set[int]:
+    dispatches = [run for run in runs if run.get("event") == "workflow_dispatch"]
+    if not all(
+        run.get("head_sha") == sha
+        and _repo_name(run.get("repository")) == PILOT_REPO
+        and _repo_name(run.get("head_repository")) == PILOT_REPO
+        and type(run.get("id")) is int
+        and run["id"] > 0
+        and type(run.get("run_attempt")) is int
+        and run["run_attempt"] > 0
+        for run in dispatches
+    ):
+        raise Unverified("unrelated dispatch identity is unreadable")
+    histories = await asyncio.gather(
+        *(attempt_jobs(get, api, run) for run in dispatches)
+    )
+    ids: set[int] = set()
+    for run, jobs in zip(dispatches, histories, strict=True):
+        for job in jobs.values():
+            job_id = job["id"]
+            if job_id in ids:
+                raise Unverified("dispatch check belongs to several attempts")
+            if job_id in checks:
+                _match_action_check(checks[job_id], run, job)
+            ids.add(job_id)
+    return ids
+
+
+async def _ordinary_proof(
+    get: Get,
+    api: str,
+    refs: tuple[str, str, str, str],
+    runs: list[Facts],
+    selected: Facts,
+) -> CIProbeResult:
+    _, sha, base_ref, base = refs
+    jobs, snapshot, _ = await asyncio.gather(
+        attempt_jobs(get, api, selected),
+        _commit_ci(get, api, sha),
+        branch_proof(get, api, base, base_ref),
+    )
+    checks, statuses = snapshot
+    by_id = index(checks, "id")
+    if not all(_job_completed(jobs.get(name, {}), "success") for name in CORE_JOBS):
+        raise Unverified("ordinary PR test job coverage is not proved")
+    for job in jobs.values():
+        _match_action_check(by_id.get(job["id"], {}), selected, job)
+    optional = await _dispatch_check_ids(get, api, sha, runs, by_id)
+    if optional.intersection(job["id"] for job in jobs.values()):
+        raise Unverified("ordinary PR check overlaps an unrelated dispatch")
+    independent = [
+        check for check_id, check in by_id.items() if check_id not in optional
+    ]
+    return _independent(independent, statuses) or CIProbeResult(
+        CIProbeOutcome.passed, "ci_ordinary_pr_proved", label(selected)
+    )
+
+
 async def equivalent_probe(
     get: Get, pr: int, contract_fingerprint: str
 ) -> CIProbeResult | None:
@@ -452,15 +520,17 @@ async def _equivalent(
     run_path = f"{api}/actions/runs?head_sha={sha}"
     runs = await pages(get, run_path, "workflow_runs")
     selection = _select(runs, ref, sha, pr)
-    if selection is None:
-        if any(run.get("event") == "workflow_dispatch" for run in runs):
-            await _recheck(get, pull_path, run_path, refs, runs)
-            await branch_proof(get, api, base, base_ref)
-        return None
-    if isinstance(selection, CIProbeResult):
+    if selection is None or isinstance(selection, CIProbeResult):
         return selection
     if contract_fingerprint != PILOT_CONTRACT:
         raise Unverified("project CI contract is outside the audited dispatch profile")
+    if isinstance(selection, dict):
+        snapshot = await _ordinary_proof(get, api, refs, runs, selection)
+        if snapshot.outcome == CIProbeOutcome.passed:
+            await _recheck(get, pull_path, run_path, refs, runs)
+            confirmed = await _ordinary_proof(get, api, refs, runs, selection)
+            return confirmed
+        return snapshot
     old, new = selection
     billing = old.get("conclusion") == "failure"
     policy, old_jobs, new_jobs, previous, checks, statuses = await asyncio.gather(
@@ -511,29 +581,31 @@ def _blocking_run(runs: list[Facts]) -> CIProbeResult | None:
 
 def _ordinary_pr(
     runs: list[Facts], dispatches: list[Facts], ref: str, sha: str, pr: int
-) -> CIProbeResult | None:
+) -> Facts | CIProbeResult | None:
     if not dispatches:
         return _blocking_run(runs)
     regular = [run for run in runs if run.get("event") != "workflow_dispatch"]
     if blocked := _blocking_run(regular):
         return blocked
-    if any(
-        canonical(run, ref, sha)
+    eligible = [
+        run
+        for run in regular
+        if canonical(run, ref, sha)
         and run.get("event") == "pull_request"
         and run.get("conclusion") == "success"
         and any(
             isinstance(ref, dict) and ref.get("number") == pr
             for ref in (run.get("pull_requests") or [])
         )
-        for run in regular
-    ):
-        return None  # the caller proves branch policy before deferring to legacy checks
-    raise Unverified("no successful ordinary PR or canonical dispatch")
+    ]
+    if not eligible:
+        raise Unverified("no successful ordinary PR or canonical dispatch")
+    return max(eligible, key=lambda run: run["id"])
 
 
 def _select(
     runs: list[Facts], ref: str, sha: str, pr: int
-) -> tuple[Facts, Facts] | CIProbeResult | None:
+) -> tuple[Facts, Facts] | Facts | CIProbeResult | None:
     index(runs, "id")
     dispatches = [run for run in runs if run.get("event") == "workflow_dispatch"]
     manual = [run for run in dispatches if canonical(run, ref, sha)]

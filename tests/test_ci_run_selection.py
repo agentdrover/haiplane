@@ -465,25 +465,42 @@ async def test_collector_enabled_profile_requires_proof_and_preserves_trust_boun
 async def test_unrelated_dispatch_does_not_close_ordinary_pr_ci(monkeypatch, changes):
     e = Evidence()
     e.old["conclusion"] = "success"
+    for job in e.jobs[OLD]:
+        if job["conclusion"] == "failure":
+            job["conclusion"] = "success"
     e.native.update(changes)
-    result = await e.probe(
-        monkeypatch, primary=(0, '[{"name":"tests","state":"SUCCESS"}]', "")
+    if e.native["status"] == "in_progress":
+        e.jobs[NEW][0].update(status="in_progress", conclusion=None)
+    e.checks = [e._as_check(run, job) for run in e.runs for job in e.jobs[run["id"]]]
+    green = (0, '[{"name":"tests","state":"SUCCESS"}]', "")
+    forbidden = (1, "", "HTTP 403")
+
+    async def both(expected):
+        primary = await e.probe(monkeypatch, primary=green)
+        fallback = await e.probe(monkeypatch, primary=forbidden)
+        assert primary == fallback
+        assert primary.outcome is expected
+        return primary
+
+    await both(CIProbeOutcome.passed)
+    e.checks.append(
+        {
+            **e._as_check(e.old, e.jobs[OLD][0]),
+            "id": 777,
+            "check_suite": {"id": 555},
+            "name": "independent",
+            "conclusion": "failure",
+        }
     )
-    assert result.outcome is CIProbeOutcome.passed
-    assert result.reason == "checks_passed"
-    blocked = await e.probe(
-        monkeypatch, primary=(0, '[{"name":"independent","state":"FAILURE"}]', "")
-    )
-    assert blocked.outcome is CIProbeOutcome.failed
-    pending = await e.probe(
-        monkeypatch, primary=(0, '[{"name":"independent","state":"PENDING"}]', "")
-    )
-    assert pending.outcome is CIProbeOutcome.pending
+    await both(CIProbeOutcome.failed)
+    e.checks[-1].update(status="in_progress", conclusion=None)
+    await both(CIProbeOutcome.pending)
+    e.checks.pop()
+    e.missing.add((f"commits/{HEAD}/check-runs", "1"))
+    await both(CIProbeOutcome.unavailable)
+    e.missing.clear()
     e.rules = [{"type": "required_status_checks"}]
-    protected = await e.probe(
-        monkeypatch, primary=(0, '[{"name":"tests","state":"SUCCESS"}]', "")
-    )
-    assert protected.outcome is CIProbeOutcome.unavailable
+    protected = await both(CIProbeOutcome.unavailable)
     assert protected.details and "branch requirements" in protected.details
 
 
