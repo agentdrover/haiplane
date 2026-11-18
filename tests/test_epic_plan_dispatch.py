@@ -620,3 +620,16 @@ async def test_merge_plan_gate_uses_locked_last_task_read(db, prepared, monkeypa
         "plan_revoked",
     )
     assert authorization_seen
+
+
+async def test_pilot_sweep_remembers_the_reserved_order(db, db_dsn, prepared):
+    from hub.poller import _sweep_epic_plan
+
+    await _sweep_epic_plan(db)
+    [order] = await _rows(db, "executor_orders")
+    async with _new_connection(db_dsn) as restarted:
+        await _sweep_epic_plan(restarted)
+        [same] = await _rows(restarted, "executor_orders")
+    assert same["id"] == order["id"]
+    [work] = await _rows(db, "epic_plan_work")
+    assert work["executor_order_id"] == order["id"] and work["charged_cents"] is None

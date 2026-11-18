@@ -439,6 +439,11 @@ SWEEP_COVERAGE: dict[str, Coverage] = {
     "executor_runs": Coverage(removed_by=_NONE_YET),
     "executor_slots": Coverage(removed_by=_NONE_YET),
     "executor_orders": Coverage(removed_by=_NONE_YET),
+    "epic_plan": Coverage(
+        scenarios=(
+            "tests/test_epic_plan_dispatch.py::test_pilot_sweep_remembers_the_reserved_order",
+        )
+    ),
     "rework_launches": Coverage(
         scenarios=(
             "tests/test_rework_dispatch_once.py::"

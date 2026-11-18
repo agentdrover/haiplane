@@ -9,8 +9,8 @@ import pytest
 from hub import db as hub_db
 from hub import repository as repo
 from hub.services import executor_launch
-from hub.services import executor_orders as orders
 from hub.services import executor_skill_bundle as skills
+from hub.services import executor_slot_launch
 from tests.test_executor_orders import (  # noqa: F401 - shared pytest fixtures
     _launch,
     _launch_redeem,
@@ -77,7 +77,7 @@ async def test_bundle_snapshot_uses_consistent_versions(skill_world, monkeypatch
     world = skill_world
     task_id = await _task(world)
     waiting_for_writer = asyncio.Event()
-    write_transaction = orders.write_transaction
+    write_transaction = executor_slot_launch.write_transaction
 
     @asynccontextmanager
     async def observe_slot_writer(db):
@@ -85,7 +85,7 @@ async def test_bundle_snapshot_uses_consistent_versions(skill_world, monkeypatch
         async with write_transaction(db):
             yield
 
-    monkeypatch.setattr(orders, "write_transaction", observe_slot_writer)
+    monkeypatch.setattr(executor_slot_launch, "write_transaction", observe_slot_writer)
     publisher = await hub_db.connect(world.dsn)
     try:
         await publisher.execute("BEGIN IMMEDIATE")
