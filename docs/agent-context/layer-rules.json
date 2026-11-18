@@ -30,6 +30,7 @@
         "hub.cli_worktree_purge",
         "hub.cli_worktree_trash",
         "hub.cli_executor_host",
+        "hub.cli_agent_outbox",
         "hub.mcp_server",
         "hub.mcp_catalog",
         "hub.mcp_http_compat",
@@ -78,6 +79,7 @@
     "models": {
       "modules": [
         "hub.models",
+        "hub.agent_outbox_models",
         "hub.epic_plan_view",
         "hub.behavior_delta",
         "hub.plain_summary",

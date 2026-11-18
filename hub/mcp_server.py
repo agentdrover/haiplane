@@ -5070,6 +5070,29 @@ async def hub_provision_project(project_id: int) -> CallToolResult:
 
 
 @mcp.tool()
+async def hub_agent_outbox(
+    host: str,
+    order_id: int,
+    delivery_id: int | None = None,
+    payload: dict[str, Any] | None = None,
+) -> CallToolResult:
+    """Publish a role delivery, read its status, or read the order scope."""
+    from urllib.parse import quote
+
+    path = f"/api/executor-hosts/{quote(host, safe='')}/role-orders/{order_id}/outbox"
+    try:
+        if payload is None:
+            result = await _api_get(
+                f"{path}/{delivery_id}" if delivery_id is not None else path
+            )
+        else:
+            result = await _api_post(path, payload)
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result("Role outbox", delivery=result)
+
+
+@mcp.tool()
 async def hub_wait_events(
     since: int = 0,
     wait: int = 30,

@@ -28,6 +28,7 @@ addressing in SQL, so no filter can widen it into someone else's mail.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import aiosqlite
@@ -622,3 +623,19 @@ async def thread(
                 "participants and for a human identity.",
             )
     return [MessageView(**message_view(row)) for row in rows]
+
+
+async def sweep_retention(db: aiosqlite.Connection) -> None:
+    # Message retention (#773): the channel is for coordinating work in
+    # flight, and the tasks themselves keep the record of what was done.
+    pruned_messages = await repo.prune_agent_messages(
+        db, keep_days=config.MESSAGE_RETENTION_DAYS
+    )
+    # Even an empty DELETE starts an IMMEDIATE transaction. Release it before the next sweep.
+    await db.commit()
+    if pruned_messages:
+        logging.getLogger(__name__).info(
+            "Poll: pruned %d messages older than %d days",
+            pruned_messages,
+            config.MESSAGE_RETENTION_DAYS,
+        )

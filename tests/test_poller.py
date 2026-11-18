@@ -2738,6 +2738,7 @@ async def test_the_sweep_order_is_pinned(db):
         "owner_minutes",
         # #1973: заказы ролей читают events ДО очистки.
         "role_orders",
+        "agent_outbox",
         "events_retention",
         "stale_worktrees",
         "sessions_retention",
