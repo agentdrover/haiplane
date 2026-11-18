@@ -39,6 +39,7 @@ import httpx
 import pytest
 
 from hub import brand
+from tests.executor_slot_support import seed_slot_skills
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -270,6 +271,7 @@ class Stand:
         human_id = self.human_id
 
         async def world(conn: Any) -> tuple[int, str]:
+            await seed_slot_skills(conn)
             project_id = await repo.create_project(conn, slug="k8-gui", name="k8-gui")
             await repo.update_project(
                 conn,

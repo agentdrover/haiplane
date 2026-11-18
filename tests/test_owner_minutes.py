@@ -37,6 +37,7 @@ from hub.integrations import cursor_cloud
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as cp
 from tests.state_support import make_state_task
+from tests.executor_slot_support import seed_slot_skills
 
 AGENT_TOKEN = "agent-token-1874"  # pragma: allowlist secret
 ENV_HUMAN_TOKEN = "env-human-token-1874"  # pragma: allowlist secret
@@ -274,6 +275,7 @@ async def _launch_cloud_web(world, slug: str) -> int:
 
 async def _slot_world(world, host_keys, slug: str) -> dict:
     """Проект manual, два хоста; возвращает проект."""
+    await seed_slot_skills(world.db)
     pid = await repo.create_project(world.db, slug=slug, name=slug)
     await repo.update_project(
         world.db,
