@@ -49,6 +49,7 @@ from hub.models import _SLOT_NAME
 from hub.services import admin as admin_svc
 from hub.services import (
     chat_pair,
+    executor_skill_bundle as skills,
     executor_triage,
     host_redeem,
     launch_feedback,
@@ -59,9 +60,6 @@ from hub.services import (
 )
 
 log = logging.getLogger("hub.services.executor_orders")
-
-#: Подстановка кода в тексте заказа: хост меняет её на расшифрованный код.
-PAIR_CODE_PLACEHOLDER: Final[str] = "{{PAIR_CODE}}"
 
 STATE_PENDING = "pending"
 STATE_DELIVERED = "delivered"
@@ -739,7 +737,10 @@ async def _slot_busy(db: aiosqlite.Connection, host: str, slots: int = 1) -> str
 
 
 async def _order_text(
-    db: aiosqlite.Connection, project: Any, task: dict[str, Any], skill: Any
+    db: aiosqlite.Connection,
+    project: Any,
+    task: dict[str, Any],
+    bundle: skills.SkillBundle,
 ) -> tuple[str, str]:
     """(текст заказа с плейсхолдером кода, ссылка старта).
 
@@ -757,9 +758,9 @@ async def _order_text(
     text = el._prompt(
         task,
         base,
-        PAIR_CODE_PLACEHOLDER,
+        skills.PAIR_CODE_PLACEHOLDER,
         instance_base_url().rstrip("/"),
-        str(skill["content"]),
+        f"{skills.TASK_IMPLEMENTER_RULES}\n\n{bundle.text}",
         extra,
     )
     return text, el._pushed_branch(task) or base
@@ -778,7 +779,7 @@ async def _code_row(db: aiosqlite.Connection, code: str) -> dict[str, Any]:
 class _Booking:
     task: dict[str, Any]
     host: dict[str, Any]
-    skill: Any
+    bundle: skills.SkillBundle
     #: Круг починки running-задачи (#1998): возврат в open — в SAVEPOINT выпуска.
     returning: bool = False
 
@@ -788,7 +789,7 @@ async def _book(
     project: Any,
     host_name: str,
     task_id: int | None,
-    skill: Any,
+    bundle: skills.SkillBundle,
 ) -> _Booking | str:
     """Проверки запуска под write-блокировкой; ``str`` — причина отказа."""
     await settle(db, host=host_name)
@@ -817,7 +818,7 @@ async def _book(
         why = await rework_admission.refusal(db, task)
         if why:
             return f"{REASON_NOT_OPEN}: #{task['id']} в статусе running, {why}"
-    return _Booking(task, host, skill, returning=task["status"] == "running")
+    return _Booking(task, host, bundle, returning=task["status"] == "running")
 
 
 async def launch_on_slot(
@@ -840,14 +841,12 @@ async def launch_on_slot(
 
     if el.launch_mode_of(project_policy.gate_policy_of(project)) != el.LAUNCH_MANUAL:
         return _refused(el.REASON_OFF)
-    skill = await repo.get_active_skill(db, el.DISCIPLINE_SKILL)
-    if skill is None:
-        return _refused(f"{el.REASON_NO_SKILL} ({el.DISCIPLINE_SKILL})")
     if await chat_pair.get_acting_agent(db) is None:
         return _refused(f"{el.REASON_NO_ACTING_AGENT} (CHAT_PAIR_AGENT)")
     try:
         async with write_transaction(db):
-            booked = await _book(db, project, host, task_id, skill)
+            bundle = await skills.read_active_bundle(db)
+            booked = await _book(db, project, host, task_id, bundle)
             if isinstance(booked, str):
                 return _refused(booked, task_id)
             order_id, row_id = await _issue_atomically(
@@ -857,6 +856,8 @@ async def launch_on_slot(
                 issuer_principal_id=issuer_principal_id,
                 issuer_human=issuer_human,
             )
+    except skills.SkillBundleError as exc:
+        return _refused(str(exc), task_id)
     except aiosqlite.IntegrityError:
         # Второе соединение заняло последнее место раньше: триггер слотов хоста.
         return _refused(f"{REASON_SLOT_BUSY}: {host}", task_id)
@@ -941,7 +942,7 @@ async def _issue(
     task, host = booked.task, booked.host
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0) + 1
-    text, starting_ref = await _order_text(db, project, task, booked.skill)
+    text, starting_ref = await _order_text(db, project, task, booked.bundle)
     row_id = await repo.create_executor_run(
         db,
         task_id=task_id,
@@ -954,7 +955,7 @@ async def _issue(
         launched_by=issuer_principal_id,
     )
     await repo.set_executor_run_starting_ref(
-        db, row_id, starting_ref, int(booked.skill["version"])
+        db, row_id, starting_ref, booked.bundle.discipline_version
     )
     code, _ttl = await chat_pair.issue_run_code(
         db,

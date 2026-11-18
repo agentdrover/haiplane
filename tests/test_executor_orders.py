@@ -38,6 +38,7 @@ from hub.services import admin as admin_svc
 from hub.services import chat_pair as cp
 from hub.services import executor_launch as el
 from hub.services import executor_orders as orders
+from hub.services.executor_skill_bundle import SKILL_NAMES
 from hub.services.executor_dispatch import poll_executor_runs
 
 AGENT_TOKEN = "agent-token-1712"  # pragma: allowlist secret
@@ -118,6 +119,20 @@ def _no_cloud(monkeypatch):
     return calls
 
 
+async def _seed_slot_skills(db):
+    await seed_default_skills(db)
+    for name in SKILL_NAMES[1:]:
+        if await repo.get_active_skill(db, name) is not None:
+            continue
+        await repo.create_skill_version(
+            db,
+            name=name,
+            kind="skill",
+            content=f"Instructions for {name}",
+            status="active",
+        )
+
+
 @pytest.fixture
 async def world(client, db, db_dsn, keys, monkeypatch):
     monkeypatch.setattr(
@@ -125,7 +140,7 @@ async def world(client, db, db_dsn, keys, monkeypatch):
     )
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
     monkeypatch.setenv(brand.ENV_PREFIX + "HUB_URL", HUB_URL)
-    await seed_default_skills(db)
+    await _seed_slot_skills(db)
     human = await admin_svc.create_principal(
         db, kind="human", username="owner1712", role_slug="operator"
     )
