@@ -501,6 +501,19 @@ async def test_unsuccessful_unrelated_dispatch_blocks_ordinary_pr(
     assert result.details and str(NEW) in result.details
 
 
+async def test_optional_pending_dispatch_does_not_hide_completed_failure(monkeypatch):
+    e = Evidence()
+    _prove_hosted(e)
+    e.native.update(
+        path=".github/workflows/other.yml", status="in_progress", conclusion=None
+    )
+    e.jobs[NEW][0]["conclusion"] = "failure"
+    e.checks = [e._as_check(run, job) for run in e.runs for job in e.jobs[run["id"]]]
+    result = await e.probe(monkeypatch)
+    assert result.outcome is CIProbeOutcome.failed
+    assert result.details == e.jobs[NEW][0]["name"]
+
+
 @pytest.mark.parametrize(
     "case", ["ordinary_pr", "optional_dispatch", "pr_before_native"]
 )
