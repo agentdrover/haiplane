@@ -4,6 +4,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from hub.models import AcceptanceCriterion
+
 PlanState = Literal["draft", "active", "stopped", "expired", "revoked"]
 
 
@@ -25,6 +27,9 @@ class PlanNode(BaseModel):
     revision: int
     fingerprint: str
     areas: list[str]
+    scope_in: list[str]
+    scope_out: list[str]
+    acceptance_criteria: list[AcceptanceCriterion]
     blocked_by: list[int]
     allowed: bool
     leaf: bool
@@ -36,6 +41,7 @@ class PlanSnapshot(BaseModel):
     project: str
     owner_principal_id: int | None
     project_policy_version: str
+    execution_target_fingerprint: str
     project_leaf_ceiling_cents: float | None
     project_wip_limit: int | None
     terms: PlanTerms

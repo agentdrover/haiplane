@@ -24,16 +24,46 @@
         · {{ plan.decision.terminal_at }}{% endif %}</dd>
     {% endif %}
 </dl>
+{% macro plan_nodes(nodes) %}
 <ul>
-    {% for node in plan.snapshot.nodes %}
+    {% for node in nodes %}
     <li><a href="/tasks/{{ node.task_id }}">#{{ node.task_id }} {{ node.title }}</a>
         · ревизия {{ node.revision }} · {{ "допущен к утверждению" if node.allowed else "исключён" }}
         {% if node.parent_id %}· родитель #{{ node.parent_id }}{% endif %}
         {% if node.blocked_by %}· после доставки {{ node.blocked_by | join(", ") }}{% endif %}
         {% if node.areas %}· {{ node.areas | join(", ") }}{% endif %}
+        {% if node.scope_in or node.scope_out or node.acceptance_criteria %}
+        <details>
+            <summary>Объём и критерии</summary>
+            {% if node.scope_in %}
+            <p>В объёме</p>
+            <ul>{% for line in node.scope_in %}<li>{{ line }}</li>{% endfor %}</ul>
+            {% endif %}
+            {% if node.scope_out %}
+            <p>За пределами</p>
+            <ul>{% for line in node.scope_out %}<li>{{ line }}</li>{% endfor %}</ul>
+            {% endif %}
+            {% if node.acceptance_criteria %}
+            <p>Критерии приёмки</p>
+            <ul>{% for ac in node.acceptance_criteria %}
+                <li>{{ ac.id }} · {{ ac.given }} · {{ ac.when }} · {{ ac.then }}
+                    · {{ ac.verifiable_by.value }}{% if ac.test_ref %} · {{ ac.test_ref }}{% endif %}</li>
+            {% endfor %}</ul>
+            {% endif %}
+        </details>
+        {% endif %}
     </li>
     {% endfor %}
 </ul>
+{% endmacro %}
+{{ plan_nodes(plan.snapshot.nodes) }}
+{% if plan.decision and plan.decision.version != plan.version %}
+<details>
+    <summary>Предыдущий подписанный снимок</summary>
+    <p><code style="overflow-wrap:anywhere">{{ plan.decision.version }}</code></p>
+    {{ plan_nodes(plan.decision.snapshot.nodes) }}
+</details>
+{% endif %}
 {% if plan.can_decide %}
     {% if not plan.decision or plan.decision.version != plan.version %}
     <form method="post">

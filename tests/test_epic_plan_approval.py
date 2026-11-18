@@ -152,7 +152,20 @@ async def test_owner_approves_exact_plan_once(client, db, pilot, monkeypatch):
 
 @pytest.mark.parametrize(
     "change",
-    ["criterion", "areas", "project", "budget", "revision", "descendant", "graph"],
+    [
+        "criterion",
+        "areas",
+        "project",
+        "budget",
+        "revision",
+        "descendant",
+        "graph",
+        "repo",
+        "forge",
+        "base",
+        "release_base",
+        "workspace",
+    ],
 )
 async def test_revised_work_requires_new_decision(
     client, db, pilot, monkeypatch, change
@@ -168,6 +181,18 @@ async def test_revised_work_requires_new_decision(
             await repo.update_task(db, 2377, affected_areas='["new/"]')
         case "project":
             await db.execute("UPDATE tasks SET project_id=1 WHERE id=2373")
+        case "repo" | "forge" | "base" | "release_base" | "workspace":
+            project_id, _ = pilot
+            changes = {
+                "repo": {"repo": "other/receipt"},
+                "forge": {"forge": "gitverse"},
+                "base": {"default_branch": "other-base"},
+                "release_base": {
+                    "default_branch_policy": '{"release_base":"other-release"}'
+                },
+                "workspace": {"workspace_path": "/private/pilot-location"},
+            }
+            await repo.update_project(db, project_id, **changes[change])
         case "budget":
             monkeypatch.setattr(
                 epic_plan,
@@ -394,3 +419,58 @@ async def test_explicit_new_version_keeps_completed_history(client, db, pilot):
         len(await fetchall(db, "SELECT id FROM events WHERE kind='epic_plan_approved'"))
         == 2
     )
+
+
+async def test_preview_and_signed_snapshot_keep_product_scope(client, db, pilot):
+    await repo.update_task(
+        db, 2377, scope_in='["Approved scope"]', scope_out='["Excluded scope"]'
+    )
+    await db.execute(
+        "INSERT INTO acceptance_criteria(task_id,ac_id,given,when_clause,then_clause,verifiable_by) "
+        "VALUES (2377,'AC-1','before','action','Original criterion','manual')"
+    )
+    await db.commit()
+    owner, approved = await _approved(client, pilot)
+    await db.execute(
+        "UPDATE acceptance_criteria SET then_clause='Changed criterion' WHERE task_id=2377"
+    )
+    await db.commit()
+    view = (await client.get(PLAN, headers=owner)).json()
+    assert view["version"] != approved["version"]
+    before = next(n for n in approved["snapshot"]["nodes"] if n["task_id"] == 2377)
+    current = next(n for n in view["snapshot"]["nodes"] if n["task_id"] == 2377)
+    assert before["areas"] == current["areas"] and before["title"] == current["title"]
+    assert before["acceptance_criteria"][0]["then"] == "Original criterion"
+    assert current["acceptance_criteria"][0]["then"] == "Changed criterion"
+    html = (await client.get("/tasks/2373/epic-plan", headers=owner)).text
+    for snippet in (
+        "Approved scope",
+        "Excluded scope",
+        "Original criterion",
+        "Changed criterion",
+    ):
+        assert snippet in html
+
+
+async def test_plan_does_not_expose_foreign_project_descendants_or_edges(
+    client, db, pilot
+):
+    _, actors = pilot
+    _, owner = actors["plan-owner"]
+    other = await repo.get_project_by_slug(db, "default")
+    await db.execute(
+        "INSERT INTO tasks(id,title,task_type,project_id) VALUES (2399,'CANARY from other project','epic',?)",
+        (other["id"],),
+    )
+    await repo.add_task_dependency(db, 2377, 2399)
+    await db.commit()
+    response = await client.get(PLAN, headers=owner)
+    assert response.status_code == 409
+    assert response.json()["detail"]["reason"] == "plan_cross_project"
+    assert "CANARY" not in response.text
+    await repo.remove_task_dependency(db, 2377, 2399)
+    await db.execute("UPDATE tasks SET parent_id=2376 WHERE id=2399")
+    await db.commit()
+    response = await client.get(PLAN, headers=owner)
+    assert response.status_code == 409
+    assert "CANARY" not in response.text

@@ -23,6 +23,7 @@ from hub.epic_plan_view import (
 from hub.models import ACTIVE_STATUSES, QUEUED_STATUSES
 from hub.services import policy_change, project_policy
 from hub.services.delivery_state import with_cached_delivery
+from hub.services.refinement import row_to_ac
 from hub.services.statement_generation import statement_fingerprint
 
 EPIC_ID = 2373
@@ -92,30 +93,61 @@ def _refuse(reason: str, status: int = 409) -> NoReturn:
     raise PlanRefusal(reason, status)
 
 
-def _version(snapshot: PlanSnapshot) -> str:
-    payload = json.dumps(snapshot.model_dump(), sort_keys=True, ensure_ascii=False)
+def _digest(data: Any) -> str:
+    payload = json.dumps(data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _version(snapshot: PlanSnapshot) -> str:
+    return _digest(snapshot.model_dump())
+
+
+def _execution_target(project: aiosqlite.Row) -> str:
+    # The URI and workspace can be sensitive. Approve their exact binding
+    # without publishing their raw values in the card or stored snapshot.
+    return _digest(
+        {
+            "repository": project["repo"],
+            "workspace": project["workspace_path"],
+            "forge": project_policy.forge_of(project),
+            "base_branch": project_policy.base_branch_of(project),
+            "release_branch": project_policy.release_base_of(project),
+        }
+    )
+
+
+async def _check_project(
+    db: aiosqlite.Connection, task_id: int, project_id: int
+) -> None:
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None or int(project["id"]) != project_id:
+        _refuse("plan_cross_project")
 
 
 async def _node(
     db: aiosqlite.Connection, row: aiosqlite.Row, project_id: int
 ) -> PlanNode:
     task_id = int(row["id"])
+    await _check_project(db, task_id, project_id)
     deps = await repo.list_task_dependencies(db, task_id)
-    project = await repo.resolve_project_for_task(db, task_id)
+    blockers = [int(blocker["task_id"]) for blocker in deps["blocked_by"]]
+    for blocker_id in blockers:
+        await _check_project(db, blocker_id, project_id)
+    ac_rows = await repo.list_acceptance_criteria(db, task_id)
     return PlanNode(
         task_id=task_id,
         parent_id=row["parent_id"],
-        project_id=int(project["id"]) if project else 0,
+        project_id=project_id,
         task_type=row["task_type"],
         title=row["title"],
         revision=int(row["statement_generation"] or 0),
         fingerprint=await statement_fingerprint(db, task_id),
         areas=deserialize_str_list(row["affected_areas"]),
-        blocked_by=[int(blocker["task_id"]) for blocker in deps["blocked_by"]],
-        allowed=task_id in INCLUDED
-        and bool(project and project["id"] == project_id)
-        and not row["archived"],
+        scope_in=deserialize_str_list(row["scope_in"]),
+        scope_out=deserialize_str_list(row["scope_out"]),
+        acceptance_criteria=[row_to_ac(ac) for ac in ac_rows],
+        blocked_by=blockers,
+        allowed=task_id in INCLUDED and not row["archived"],
         leaf=task_id in LEAVES,
     )
 
@@ -157,6 +189,7 @@ async def snapshot(db: aiosqlite.Connection, epic_id: int) -> PlanSnapshot:
         project=PROJECT,
         owner_principal_id=await _owner(db),
         project_policy_version=policy_change.policy_version(project),
+        execution_target_fingerprint=_execution_target(project),
         project_leaf_ceiling_cents=leaf_ceiling,
         project_wip_limit=wip_limit,
         terms=TERMS,
