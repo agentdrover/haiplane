@@ -368,6 +368,10 @@ def _match_action_check(check: Facts, run: Facts, job: Facts) -> None:
         raise Unverified("Actions job does not match its exact check run")
 
 
+def _genuinely_pending(row: Facts) -> bool:
+    return row.get("status") in PENDING and row.get("conclusion") is None
+
+
 class CheckSnapshot:
     """Commit checks with explicit ownership for any job we can match."""
 
@@ -403,20 +407,22 @@ class CheckSnapshot:
             if check is not None and job.get("status") == "completed":
                 del self.by_id[job["id"]]
 
-    def optional(self, run: Facts, jobs: dict[str, Facts]) -> None:
+    def optional(self, run: Facts, jobs: dict[str, Facts]) -> CIProbeResult | None:
         for job in jobs.values():
             result = verdict(job, job["name"])
-            pending = result.outcome == CIProbeOutcome.pending
-            if pending and (
-                run.get("status") not in PENDING or job.get("conclusion") is not None
+            if result.outcome == CIProbeOutcome.pending and not (
+                _genuinely_pending(run) and _genuinely_pending(job)
             ):
                 raise Unverified(
                     f"pending job conflicts with dispatch state: {label(run)}"
                 )
-            benign = pending or result.outcome == CIProbeOutcome.passed
+            benign = result.outcome in {CIProbeOutcome.passed, CIProbeOutcome.pending}
             check = self.match(run, job, required=not benign)
-            if check is not None and benign:
+            if not benign:
+                return result
+            if check is not None:
                 del self.by_id[job["id"]]
+        return None
 
 
 def _independent(checks: list[Facts], statuses: list[Facts]) -> CIProbeResult | None:
@@ -452,7 +458,7 @@ async def _commit_ci(get: Get, api: str, sha: str) -> tuple[list[Facts], list[Fa
 
 async def _optional_dispatch_checks(
     get: Get, api: str, sha: str, runs: list[Facts], checks: CheckSnapshot
-) -> None:
+) -> CIProbeResult | None:
     dispatches = [run for run in runs if run.get("event") == "workflow_dispatch"]
     if not all(
         run.get("head_sha") == sha
@@ -467,9 +473,12 @@ async def _optional_dispatch_checks(
         raise Unverified("unrelated dispatch identity is unreadable")
     for run in dispatches:
         jobs = await attempt_jobs(get, api, run)
-        checks.optional(run, jobs)
-        if _job_completed(run, "success"):
-            checks.superseded(run, await previous_attempt_jobs(get, api, run))
+        if blocked := checks.optional(run, jobs):
+            return blocked
+        # The ordinary route permits a pending, successful, skipped or neutral
+        # dispatch. Its historical check IDs are stale in all four states.
+        checks.superseded(run, await previous_attempt_jobs(get, api, run))
+    return None
 
 
 def _ordinary_profile(jobs: dict[str, Facts], run: Facts, collector: bool) -> str:
@@ -514,7 +523,8 @@ async def _ordinary_proof(
     profile = _ordinary_profile(jobs, selected, WORKFLOW_BLOBS[policy[0]])
     bound.current(selected, jobs)
     bound.superseded(selected, previous)
-    await _optional_dispatch_checks(get, api, sha, runs, bound)
+    if blocked := await _optional_dispatch_checks(get, api, sha, runs, bound):
+        return blocked
     return _independent(list(bound.by_id.values()), statuses) or CIProbeResult(
         CIProbeOutcome.passed, "ci_ordinary_pr_proved", f"{label(selected)}: {profile}"
     )
@@ -637,9 +647,7 @@ def _ordinary_pr(
     relevant = [
         run
         for run in runs
-        if run not in dispatches
-        or run.get("status") not in PENDING
-        or run.get("conclusion") is not None
+        if run.get("event") != "workflow_dispatch" or not _genuinely_pending(run)
     ]
     if blocked := _blocking_run(relevant):
         return blocked
