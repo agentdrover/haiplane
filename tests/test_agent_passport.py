@@ -85,7 +85,12 @@ async def test_project_isolation_and_secret_redaction(
     monkeypatch.setattr(
         config,
         "HUB_TOKENS",
-        {"project-only": TokenIdentity("reader", role="agent", scopes=("default",))},
+        {
+            "project-only": TokenIdentity("reader", role="agent", scopes=("default",)),
+            "without-read": TokenIdentity(
+                "blind", permissions=frozenset({"tasks.create"})
+            ),
+        },
     )
     assert (
         await client.get(f"/api/projects/{a}/agent-passport", headers=alice)
@@ -99,6 +104,13 @@ async def test_project_isolation_and_secret_redaction(
         absent = await client.get(f"{prefix}/does-not-exist/{suffix}", headers=alice)
         assert result.status_code == absent.status_code == 404
         assert result.text == absent.text
+        restricted = {"Authorization": "Bearer without-read"}
+        denied = await client.get(f"{prefix}/{b}/{suffix}", headers=restricted)
+        missing = await client.get(
+            f"{prefix}/does-not-exist/{suffix}", headers=restricted
+        )
+        assert denied.status_code == missing.status_code == 404
+        assert denied.text == missing.text
         bob_result = await client.get(f"{prefix}/{b}/{suffix}", headers=bob)
         assert bob_result.status_code == 200
         assert "private-projects" not in bob_result.text

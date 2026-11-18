@@ -73,7 +73,7 @@ _PERMISSION_FIELDS = {
 }
 _BUDGET_FIELDS = {
     "executor_task_cents_ceiling": "Потолок затрат, центы",
-    "executor_task_token_ceiling": "Потолок токенов",
+    "executor_task_token_ceiling": "Потолок токенов",  # nosec B105 — UI label
     "review_limit": "Лимит ревью",
     "deep_daily_cap": "Суточный лимит deep review",
 }

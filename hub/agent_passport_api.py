@@ -16,10 +16,10 @@ async def check_project_reader(
     db: aiosqlite.Connection, request: Request, project: aiosqlite.Row
 ) -> None:
     identity = current_identity(request)
-    if not identity.has_permission("tasks.read"):
-        raise HTTPException(403, "project read permission required")
-    if identity.scopes_damaged or (
-        identity.scopes is not None and project["slug"] not in identity.scopes
+    if (
+        not identity.has_permission("tasks.read")
+        or identity.scopes_damaged
+        or (identity.scopes is not None and project["slug"] not in identity.scopes)
     ):
         raise HTTPException(404, "project not found")
     private = await fetchall(
