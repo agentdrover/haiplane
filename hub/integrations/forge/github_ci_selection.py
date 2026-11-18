@@ -371,7 +371,7 @@ def _independent(checks: list[Facts], statuses: list[Facts]) -> CIProbeResult | 
                 "pending": CIProbeOutcome.pending,
                 "failure": CIProbeOutcome.failed,
                 "error": CIProbeOutcome.failed,
-            }.get(state, CIProbeOutcome.unavailable)
+            }.get(str(state), CIProbeOutcome.unavailable)
             return CIProbeResult(outcome, "independent_commit_status", context)
     return None
 
