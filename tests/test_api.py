@@ -4961,7 +4961,7 @@ async def test_agent_bootstrap_never_contains_credentials(
     assert set(data) == {
         "project_slug", "project_name", "repo", "base_branch", "mcp", "first_calls",
         "skills", "policy_brief", "rules_files", "ci_before_submit", "submit_order",
-        "human_only", "text",
+        "human_only", "text", "agent_passport",
     }  # fmt: skip
 
     agent_auth = {"Authorization": f"Bearer {env_canary}"}

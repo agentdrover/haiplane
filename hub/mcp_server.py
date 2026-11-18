@@ -4062,6 +4062,17 @@ async def hub_effective_policy(project: str) -> CallToolResult:
 
 
 @mcp.tool()
+async def hub_agent_passport(project: str) -> CallToolResult:
+    """Read a project's agent passport and evidence sources."""
+    slug = urllib.parse.quote(project, safe="")
+    try:
+        data = await _api_get(f"/api/projects/{slug}/agent-passport")
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result(data["text"], **data)
+
+
+@mcp.tool()
 async def hub_policy_schedule(project: str) -> CallToolResult:
     """Scheduled policy changes of a project (read)."""
     from hub.services.policy_change import format_schedule

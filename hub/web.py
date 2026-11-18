@@ -29,6 +29,7 @@ from hub.actionable_errors import (
     agent_create_forbidden_detail,
     human_only_gate_detail,
 )
+from hub.agent_passport_api import get_agent_passport
 from hub.auth import (
     CSRF_COOKIE_NAME,
     client_ip,
@@ -1132,6 +1133,22 @@ async def _review_reach_by_project(db, rows) -> dict[int, Any]:
             by_forge[forge] = await review_reach(db, forge)
         out[int(project["id"])] = by_forge[forge]
     return out
+
+
+@router.get("/projects/{slug}/agent-passport", response_class=HTMLResponse)
+async def web_agent_passport(slug: str, request: Request):
+    passport = await get_agent_passport(request, slug)
+    template = (
+        "partials/agent_passport.html"
+        if request.headers.get("HX-Request") == "true"
+        else "agent_passport.html"
+    )
+    return TEMPLATES.TemplateResponse(
+        request,
+        template,
+        {"passport": passport},
+        headers={"Cache-Control": "no-store", "Vary": "HX-Request"},
+    )
 
 
 @router.get("/projects", response_class=HTMLResponse)

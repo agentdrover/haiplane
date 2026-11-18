@@ -202,6 +202,7 @@ from hub.services.tree_output import (
     truncate_text,
 )
 from hub.poller import start_poller
+from hub.agent_passport_api import check_project_reader, router as agent_passport_router
 from hub.decisions_api import router as decisions_router
 from hub.epic_plan_api import router as epic_plan_router
 from hub.owner_minutes_api import router as owner_minutes_router
@@ -569,6 +570,7 @@ app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 app.include_router(web_router)
 app.include_router(verdict_evidence_router)
 app.include_router(decisions_router)
+app.include_router(agent_passport_router)
 app.include_router(epic_plan_router)
 app.include_router(owner_minutes_router)
 app.include_router(executor_host_router)
@@ -1270,13 +1272,13 @@ async def api_effective_policy(slug: str, request: Request) -> dict:
 async def api_agent_bootstrap(slug: str, request: Request) -> AgentBootstrap:
     """Стартовый пакет проекта: первое сообщение агенту без credentials (#1631).
 
-    Запрос здесь не читается — ни bearer, ни cookie: пакет строится из
-    проекта, навыков и политики. Доступ — по существующим гейтам ролей.
+    Пакет строится из проекта, навыков и политики после проверки доступа.
     """
     from hub.services import agent_bootstrap
 
     db = _db(request)
     project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
+    await check_project_reader(db, request, project)
     return await agent_bootstrap.build_agent_bootstrap(db, project)
 
 

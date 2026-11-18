@@ -24,6 +24,7 @@ import concurrent.futures
 import hashlib
 import os
 import secrets
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -446,11 +447,16 @@ def stand(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stand]:
 def browser() -> Iterator[Any]:
     from playwright.sync_api import sync_playwright
 
-    # Локально можно взять установленный Chrome и ничего не скачивать:
-    # HAIPLANE_GUI_CHANNEL=chrome. В CI ставится Chromium Playwright.
     channel = os.environ.get("HAIPLANE_GUI_CHANNEL") or None
     with sync_playwright() as playwright:
-        launched = playwright.chromium.launch(headless=True, channel=channel)
+        executable = None
+        if channel is None and not Path(playwright.chromium.executable_path).is_file():
+            # The Hub's validation collector has system Chrome. The GUI job
+            # installs Playwright Chromium and uses it by default.
+            executable = shutil.which("google-chrome")
+        launched = playwright.chromium.launch(
+            headless=True, channel=channel, executable_path=executable
+        )
         try:
             yield launched
         finally:

@@ -80,6 +80,7 @@
       "modules": [
         "hub.models",
         "hub.agent_outbox_models",
+        "hub.agent_passport_contract",
         "hub.epic_plan_view",
         "hub.behavior_delta",
         "hub.plain_summary",
