@@ -151,23 +151,32 @@ async def resume(db: aiosqlite.Connection) -> None:
             return
         answer = cases[0]
         order = await agent_outbox.live_order(db, answer["order_id"], answer["host"])
-        if await agent_outbox.continuation_refusal(db, answer, order):
-            return
+        reason = await agent_outbox.continuation_refusal(db, answer, order)
         choice = str(answer["answer"] or "").strip().lower()
         if choice not in {"retry", "stop"}:
-            return
-        await db.execute(
-            "UPDATE epic_plan_escalations SET answer_event_id=? WHERE id=?",
-            (answer["answer_event_id"], answer["case_id"]),
+            reason = reason or "invalid_choice"
+        await _record_answer(db, answer, choice, reason)
+
+
+async def _record_answer(
+    db: aiosqlite.Connection, answer: Any, choice: str, reason: str
+) -> None:
+    await db.execute(
+        "UPDATE epic_plan_escalations SET answer_event_id=? WHERE id=?",
+        (answer["answer_event_id"], answer["case_id"]),
+    )
+    if not reason and choice == "retry":
+        await repo.update_task(
+            db, int(answer["task_id"]), status=answer["resume_status"]
         )
-        if choice == "retry":
-            await repo.update_task(
-                db, int(answer["task_id"]), status=answer["resume_status"]
-            )
-        await repo.insert_event(
-            db,
-            kind="epic_plan_owner_answer_consumed",
-            task_id=int(answer["task_id"]),
-            actor="hub",
-            payload={"answer_event_id": answer["answer_event_id"], "choice": choice},
-        )
+    await repo.insert_event(
+        db,
+        kind="epic_plan_owner_answer_consumed",
+        task_id=int(answer["task_id"]),
+        actor="hub",
+        payload={
+            "answer_event_id": answer["answer_event_id"],
+            "choice": choice if not reason else "ignored",
+            "reason": reason,
+        },
+    )

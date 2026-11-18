@@ -26,6 +26,7 @@ class WorkBinding(BaseModel):
     host: Literal["k8", "cloud", "local"]
     model: str = Field(min_length=1, max_length=128)
     principal_id: int = Field(gt=0)
+    actor_principal_id: int = Field(gt=0)
     attempt: int = Field(gt=0, le=2)
 
 

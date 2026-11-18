@@ -177,6 +177,7 @@ def _dispatch_authority() -> PlanDispatchAuthority | None:
     if (
         not source
         or not model
+        or len(model) > 128
         or not issuer.isascii()
         or not issuer.isdecimal()
         or len(issuer) > 18
@@ -531,6 +532,12 @@ async def active_decision(db: aiosqlite.Connection) -> PlanDecision:
     current = await snapshot(db, EPIC_ID)
     if current.owner_principal_id is None:
         _refuse("owner_unassigned")
+    from hub.services.admin import get_principal_permissions
+
+    if "tasks.human_gate" not in await get_principal_permissions(
+        db, current.owner_principal_id
+    ):
+        _refuse("owner_authority_revoked")
     row = await _decision_row(db, EPIC_ID)
     if row is None:
         _refuse("plan_not_approved")

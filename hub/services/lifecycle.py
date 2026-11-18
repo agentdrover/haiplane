@@ -4384,6 +4384,7 @@ async def _vstep_pilot_approval(state: VerdictContext) -> None:
 
     if not await managed(state.db, state.task_id):
         return
+    await _require_pilot_verdict_actor(state)
     fresh = await repo.get_task(state.db, state.task_id)
     if (
         fresh is None
@@ -4401,6 +4402,30 @@ async def _vstep_pilot_approval(state: VerdictContext) -> None:
     reason = await approval_refusal(state.db, fresh, automatic=not state.human_caller)
     if reason:
         raise HTTPException(409, detail={"reason": reason, "task_id": state.task_id})
+
+
+async def _require_pilot_verdict_actor(state: VerdictContext) -> None:
+    from hub.services import epic_plan
+    from hub.services.auto_verdict import _POLICY_ACTOR
+
+    if state.human_caller:
+        try:
+            decision = await epic_plan.active_decision(state.db)
+        except epic_plan.PlanRefusal:
+            return  # The plan gate returns the more specific blocking cause.
+        if state.principal_id == decision.approved_principal_id:
+            return
+    elif not state.agent_caller and (
+        state.applied_by_steward or state.body.agent == _POLICY_ACTOR
+    ):
+        return
+    raise HTTPException(
+        403,
+        detail={
+            "reason": "pilot_verdict_actor_not_authorized",
+            "task_id": state.task_id,
+        },
+    )
 
 
 async def _vstep_default_approval_is_the_stewards(state: VerdictContext) -> None:

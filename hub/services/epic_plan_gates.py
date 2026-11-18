@@ -46,7 +46,7 @@ async def managed(db: aiosqlite.Connection, task_id: int) -> bool:
 async def by_order_refusal(db: aiosqlite.Connection, order_id: int) -> str:
     work = await _one(
         db,
-        "SELECT plan_version,grant_expires_at FROM epic_plan_work WHERE executor_order_id=?",
+        "SELECT plan_version,grant_expires_at,charged_cents FROM epic_plan_work WHERE executor_order_id=?",
         (order_id,),
     )
     if work is None:
@@ -59,6 +59,8 @@ async def by_order_refusal(db: aiosqlite.Connection, order_id: int) -> str:
         return "plan_version_moved"
     if datetime.fromisoformat(work["grant_expires_at"]) <= datetime.now(UTC):
         return "spending_grant_expired"
+    if work["charged_cents"] is not None:
+        return "spending_grant_settled"
     return ""
 
 
@@ -98,6 +100,18 @@ async def can_prepare_review(db: aiosqlite.Connection, task: Any) -> bool:
     )
 
 
+async def independent_reviewer(
+    db: aiosqlite.Connection, principal_id: int | None, excluded: set[int]
+) -> bool:
+    if principal_id is None or principal_id in excluded:
+        return False
+    reviewer = await admin.get_principal(db, principal_id)
+    if not reviewer or reviewer["kind"] != "agent" or reviewer["status"] != "active":
+        return False
+    perms = await admin.get_principal_permissions(db, principal_id)
+    return "tasks.read" in perms and "tasks.human_gate" not in perms
+
+
 @dataclass(frozen=True)
 class ReviewPermit:
     id: int
@@ -120,22 +134,16 @@ async def reserve_review(
     if decision is None or reason or not await can_prepare_review(db, task):
         return False, None
     acting = await chat_pair.get_acting_agent(db)
-    if (
-        principal_id is None
-        or acting is None
-        or principal_id
-        in {
-            work["principal_id"],
-            work["actor_principal_id"],
-            acting["id"],
-            decision.approved_principal_id,
-        }
+    excluded = {
+        work["principal_id"],
+        work["actor_principal_id"],
+        decision.approved_principal_id,
+    }
+    if acting is not None:
+        excluded.add(int(acting["id"]))
+    if principal_id is None or not await independent_reviewer(
+        db, principal_id, excluded
     ):
-        return False, None
-    reviewer = await admin.get_principal(db, principal_id)
-    if not reviewer or reviewer["kind"] != "agent" or reviewer["status"] != "active":
-        return False, None
-    if "tasks.human_gate" in await admin.get_principal_permissions(db, principal_id):
         return False, None
     if not 1 <= attempt <= decision.snapshot.terms.technical_retries + 1:
         return False, None
@@ -149,6 +157,7 @@ async def reserve_review(
         host=channel,
         model=model,
         principal_id=principal_id,
+        actor_principal_id=principal_id,
         attempt=attempt,
     )
     grant = await authority.get_grant(binding)

@@ -22,7 +22,12 @@ from hub.services import (
     orchestrator_queue,
     project_policy,
 )
-from hub.services.epic_plan_authority import SpendingGrant, WorkBinding, get_grant
+from hub.services.epic_plan_authority import (
+    SpendingGrant,
+    WorkBinding,
+    configured_source_fingerprint,
+    get_grant,
+)
 
 HOST: Literal["k8"] = "k8"
 _SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -72,6 +77,27 @@ async def preflight(db: aiosqlite.Connection) -> str:
     if not await checkpoint_available(db, int(project["id"])):
         return "pilot_checkpoint_unavailable"
     return ""
+
+
+async def review_route_ready(
+    db: aiosqlite.Connection, project: Any, excluded: set[int]
+) -> bool:
+    from hub.integrations import cursor_cloud
+    from hub.services import epic_plan_gates, review_dispatch
+
+    routes = await review_dispatch.review_reach(db, project_policy.forge_of(project))
+    if "local" in routes.ways and await epic_plan_gates.independent_reviewer(
+        db, await review_dispatch.local_reviewer_principal_id(db), excluded
+    ):
+        return True
+    return (
+        "cloud" in routes.ways
+        and cursor_cloud.is_configured()
+        and bool(project["repo"])
+        and await epic_plan_gates.independent_reviewer(
+            db, await review_dispatch.reviewer_principal_id(db), excluded
+        )
+    )
 
 
 async def _starting_sha(db: aiosqlite.Connection, task: Any) -> str:
@@ -150,7 +176,9 @@ async def _selection(db: aiosqlite.Connection, project: Any) -> Any:
             and row["review_verdict"] == "changes_requested"
         ):
             return row
-    queue = await orchestrator_queue.next_task(db, project, exclude_state=True)
+    queue = await orchestrator_queue.next_task(
+        db, project, exclude_state=True, candidate_ids=epic_plan.LEAVES
+    )
     task_id = queue["next_task_id"]
     return await repo.get_task(db, task_id) if task_id in epic_plan.LEAVES else None
 
@@ -232,8 +260,18 @@ async def _write_order(
             if not await checkpoint_available(db, int(project["id"])):
                 return None, "pilot_checkpoint_unavailable"
             acting = await chat_pair.get_acting_agent(db)
-            if acting is None:
+            if acting is None or int(acting["id"]) != binding.actor_principal_id:
                 return None, "pilot_acting_agent_unavailable"
+            if not await review_route_ready(
+                db,
+                project,
+                {
+                    binding.principal_id,
+                    binding.actor_principal_id,
+                    decision.approved_principal_id,
+                },
+            ):
+                return None, "independent_review_unavailable"
             bundle = await skills.read_active_bundle(db)
             booked = await orders._book(
                 db, project, binding.host, binding.task_id, bundle
@@ -259,7 +297,6 @@ async def _write_order(
                 grant,
                 executor_order_id=order_id,
                 repair_causes=causes,
-                actor_principal_id=int(acting["id"]),
             )
             await repo.insert_event(
                 db,
@@ -332,10 +369,13 @@ async def _binding(
     principal_id = await _agent(db)
     if principal_id is None or principal_id == decision.approved_principal_id:
         return None, "pilot_issuer_unavailable"
+    acting = await chat_pair.get_acting_agent(db)
+    if acting is None:
+        return None, "pilot_acting_agent_unavailable"
     if HOST not in await orders.enabled_host_names(db):
         return None, "pilot_host_unavailable"
-    model = config.env_get("EPIC_PLAN_EXECUTOR_MODEL", "") or ""
-    if not model:
+    authority = decision.snapshot.dispatch_authority
+    if authority is None or authority.issuer_principal_id != principal_id:
         return None, "pilot_model_unavailable"
     sha = await _starting_sha(db, task)
     if not sha:
@@ -348,8 +388,9 @@ async def _binding(
         generation=generation,
         sha=sha,
         host=HOST,
-        model=model,
+        model=authority.executor_model,
         principal_id=principal_id,
+        actor_principal_id=int(acting["id"]),
         attempt=attempt,
     ), ""
 
@@ -357,7 +398,10 @@ async def _binding(
 async def sweep(db: aiosqlite.Connection) -> None:
     unresolved = await fetchall(
         db,
-        "SELECT * FROM epic_plan_work WHERE charged_cents IS NULL ORDER BY id LIMIT 16",
+        """SELECT * FROM epic_plan_work WHERE charged_cents IS NULL AND authority_source=?
+           AND (last_charge_check IS NULL OR last_charge_check < datetime('now','-1 minute'))
+           ORDER BY last_charge_check,id LIMIT 1""",
+        (configured_source_fingerprint(),),
     )
     for work in unresolved:
         await spend.settle(db, work)

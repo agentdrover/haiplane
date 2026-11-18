@@ -96,6 +96,10 @@ async def prepared(
     async def no_charge(binding, reference):
         return None
 
+    async def route_ready(db, project, excluded):
+        return reviewer_id not in excluded
+
+    monkeypatch.setattr(dispatch, "review_route_ready", route_ready)
     monkeypatch.setattr(dispatch, "_starting_sha", origin)
     monkeypatch.setattr(authority, "get_grant", grant)
     monkeypatch.setattr(dispatch, "get_grant", grant)
@@ -207,7 +211,7 @@ async def test_rework_round_is_bound_to_new_sha(db, prepared, monkeypatch):
     owner_id, _, reviewer_id, _ = prepared
 
     async def trusted(db, task):
-        return task["submission_sha"] == repaired_sha
+        return task["submission_sha"] in {HEAD, repaired_sha}
 
     monkeypatch.setattr(gates, "_trusted_ci", trusted)
     stale = await _put_submission(db, 2377, 2, HEAD)
@@ -412,6 +416,7 @@ async def test_authority_refuses_redirect_and_foreign_binding(monkeypatch):
         host="k8",
         model="codex-fixture",
         principal_id=8,
+        actor_principal_id=9,
         attempt=1,
     )
     client_class = httpx.AsyncClient
@@ -450,3 +455,25 @@ async def test_authority_refuses_redirect_and_foreign_binding(monkeypatch):
 
     monkeypatch.setattr(authority, "_call", wrong_scope)
     assert await authority.get_grant(binding) is None
+
+
+async def test_agent_cannot_impersonate_pilot_policy(db, prepared):
+    from hub.models import TaskReviewVerdict
+    from hub.services import lifecycle
+    from hub.services.auto_verdict import _POLICY_ACTOR
+
+    _, _, reviewer_id, _ = prepared
+    task = await _put_submission(db, 2377, 1, HEAD)
+    body = TaskReviewVerdict(verdict="approved", agent=_POLICY_ACTOR)
+    state = lifecycle.VerdictContext(
+        db=db,
+        task_id=2377,
+        task=dict(task),
+        body=body,
+        principal_id=reviewer_id,
+        agent_caller=True,
+    )
+    with pytest.raises(HTTPException) as rejected:
+        await lifecycle._vstep_pilot_approval(state)
+    assert rejected.value.status_code == 403
+    assert rejected.value.detail["reason"] == "pilot_verdict_actor_not_authorized"

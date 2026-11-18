@@ -20,6 +20,7 @@ MIGRATIONS = [
             grant_expires_at TEXT NOT NULL,
             send_count INTEGER NOT NULL DEFAULT 1 CHECK(send_count BETWEEN 1 AND 2),
             ceiling_cents INTEGER NOT NULL CHECK(ceiling_cents > 0),
+            last_charge_check TEXT,
             charged_cents INTEGER CHECK(charged_cents >= 0),
             repair_causes TEXT NOT NULL DEFAULT '[]',
             executor_order_id INTEGER UNIQUE,

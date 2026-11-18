@@ -58,7 +58,6 @@ async def record(
     grant: authority.SpendingGrant,
     *,
     executor_order_id: int | None = None,
-    actor_principal_id: int | None = None,
     repair_causes: tuple[str, ...] = (),
 ) -> int:
     binding = grant.binding
@@ -78,7 +77,7 @@ async def record(
             binding.host,
             binding.model,
             binding.principal_id,
-            actor_principal_id or binding.principal_id,
+            binding.actor_principal_id,
             authority.configured_source_fingerprint(),
             grant.reference,
             grant.expires_at.isoformat(),
@@ -103,6 +102,7 @@ def binding_of(row: Any) -> authority.WorkBinding:
         host=row["host"],
         model=row["model"],
         principal_id=row["principal_id"],
+        actor_principal_id=row["actor_principal_id"],
         project="receipt-split-calculator",
     )
 
@@ -116,10 +116,10 @@ async def settle(db: aiosqlite.Connection, row: Any) -> None:
     ):
         return
     received = await authority.get_charge(binding_of(row), row["authority_ref"])
-    if received is None:
-        return
     async with write_transaction(db):
         await db.execute(
-            "UPDATE epic_plan_work SET charged_cents=? WHERE id=? AND charged_cents IS NULL",
-            (received.charged_cents, row["id"]),
+            """UPDATE epic_plan_work SET
+                   charged_cents=COALESCE(?,charged_cents),last_charge_check=datetime('now')
+               WHERE id=? AND charged_cents IS NULL""",
+            (received.charged_cents if received is not None else None, row["id"]),
         )
