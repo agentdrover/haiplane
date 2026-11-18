@@ -558,12 +558,12 @@ async def _equivalent(
     if contract_fingerprint != PILOT_CONTRACT:
         raise Unverified("project CI contract is outside the audited dispatch profile")
     if isinstance(selection, dict):
-        snapshot = await _ordinary_proof(get, api, refs, runs, selection)
-        if snapshot.outcome == CIProbeOutcome.passed:
+        ordinary_result = await _ordinary_proof(get, api, refs, runs, selection)
+        if ordinary_result.outcome == CIProbeOutcome.passed:
             await _recheck(get, pull_path, run_path, refs, runs)
             confirmed = await _ordinary_proof(get, api, refs, runs, selection)
             return confirmed
-        return snapshot
+        return ordinary_result
     old, new = selection
     billing = old.get("conclusion") == "failure"
     (
