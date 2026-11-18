@@ -454,16 +454,7 @@ async def test_collector_enabled_profile_requires_proof_and_preserves_trust_boun
     assert not any("/artifacts" in evidence for evidence in e.requests)
 
 
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"path": ".github/workflows/other.yml"},
-        {"workflow_id": 7, "status": "in_progress", "conclusion": None},
-        {"head_branch": "task-2225/other"},
-    ],
-)
-async def test_unrelated_dispatch_does_not_close_ordinary_pr_ci(monkeypatch, changes):
-    e = Evidence()
+def _prove_hosted(e):
     e.old["conclusion"] = "success"
     for job in e.jobs[OLD]:
         if job["conclusion"] != "failure":
@@ -479,6 +470,66 @@ async def test_unrelated_dispatch_does_not_close_ordinary_pr_ci(monkeypatch, cha
             runner_id=800,
             steps=[step(selection.CHECKOUT), step(required)],
         )
+
+
+def _retry_with_old_failure(e, run):
+    run_id = run["id"]
+    previous = deepcopy(e.jobs[run_id])
+    previous[0]["conclusion"] = "failure"
+    e.previous_jobs[(run_id, 1)] = previous
+    run["run_attempt"] = 2
+    for job in e.jobs[run_id]:
+        job["id"] += 50
+        job["run_attempt"] = 2
+        job["labels"] = [
+            label.replace(f"{run_id}-1-", f"{run_id}-2-") for label in job["labels"]
+        ]
+    return previous
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out"])
+async def test_unsuccessful_unrelated_dispatch_blocks_ordinary_pr(
+    monkeypatch, conclusion
+):
+    e = Evidence()
+    _prove_hosted(e)
+    e.native.update(path=".github/workflows/other.yml", conclusion=conclusion)
+    e.jobs[NEW][0]["conclusion"] = conclusion
+    e.checks = [e._as_check(run, job) for run in e.runs for job in e.jobs[run["id"]]]
+    result = await e.probe(monkeypatch)
+    assert result.outcome is CIProbeOutcome.failed
+    assert result.details and str(NEW) in result.details
+
+
+@pytest.mark.parametrize(
+    "case", ["ordinary_pr", "optional_dispatch", "pr_before_native"]
+)
+async def test_proved_current_attempt_ignores_exact_previous_checks(monkeypatch, case):
+    e = Evidence()
+    _prove_hosted(e)
+    if case != "pr_before_native":
+        e.native["path"] = ".github/workflows/other.yml"
+    rerun = e.native if case == "optional_dispatch" else e.old
+    prior = _retry_with_old_failure(e, rerun)
+    e.checks = [e._as_check(run, job) for run in e.runs for job in e.jobs[run["id"]]]
+    e.checks.extend(e._as_check(rerun, job) for job in prior)
+    result = await e.probe(monkeypatch)
+    assert result.outcome is CIProbeOutcome.passed
+    e.checks.append({**e._as_check(rerun, prior[0]), "id": 999})
+    assert (await e.probe(monkeypatch)).outcome is CIProbeOutcome.failed
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"path": ".github/workflows/other.yml"},
+        {"workflow_id": 7, "status": "in_progress", "conclusion": None},
+        {"head_branch": "task-2225/other"},
+    ],
+)
+async def test_unrelated_dispatch_does_not_close_ordinary_pr_ci(monkeypatch, changes):
+    e = Evidence()
+    _prove_hosted(e)
     e.native.update(changes)
     if e.native["status"] == "in_progress":
         e.jobs[NEW][0].update(status="in_progress", conclusion=None)

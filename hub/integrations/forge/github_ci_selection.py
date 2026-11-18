@@ -368,29 +368,48 @@ def _match_action_check(check: Facts, run: Facts, job: Facts) -> None:
         raise Unverified("Actions job does not match its exact check run")
 
 
-def _known_checks(
-    checks: list[Facts],
-    original: Facts,
-    old: dict[str, Facts],
-    selected: Facts,
-    new: dict[str, Facts],
-    previous: list[Facts],
-    *,
-    billing: bool,
-) -> list[Facts]:
-    index([*old.values(), *new.values(), *previous], "id")
-    by_id = index(checks, "id")
-    for run, jobs in ((original, old), (selected, new)):
+class CheckSnapshot:
+    """Commit checks with explicit ownership for any job we can match."""
+
+    def __init__(self, checks: list[Facts]) -> None:
+        self.by_id = index(checks, "id")
+        self.claimed: set[int] = set()
+
+    def match(self, run: Facts, job: Facts, *, required: bool) -> Facts | None:
+        job_id = job["id"]
+        if job_id in self.claimed:
+            raise Unverified("check run maps to multiple Actions jobs")
+        self.claimed.add(job_id)
+        check = self.by_id.get(job_id)
+        if check is not None or required:
+            _match_action_check(check if check is not None else {}, run, job)
+        return check
+
+    def current(
+        self,
+        run: Facts,
+        jobs: dict[str, Facts],
+        *,
+        remove: bool = False,
+    ) -> None:
         for job in jobs.values():
-            _match_action_check(by_id.get(job["id"], {}), run, job)
-            if run is selected or billing:
-                del by_id[job["id"]]
-    for job in previous:
-        check = by_id.get(job["id"])
-        if check is not None:
-            _match_action_check(check, selected, job)
-            del by_id[job["id"]]
-    return list(by_id.values())
+            self.match(run, job, required=True)
+            if remove:
+                del self.by_id[job["id"]]
+
+    def superseded(self, run: Facts, jobs: list[Facts]) -> None:
+        for job in jobs:
+            check = self.match(run, job, required=False)
+            if check is not None and job.get("status") == "completed":
+                del self.by_id[job["id"]]
+
+    def optional(self, run: Facts, jobs: dict[str, Facts]) -> None:
+        for job in jobs.values():
+            result = verdict(job, job["name"])
+            benign = result.outcome in {CIProbeOutcome.passed, CIProbeOutcome.pending}
+            check = self.match(run, job, required=not benign)
+            if check is not None and benign:
+                del self.by_id[job["id"]]
 
 
 def _independent(checks: list[Facts], statuses: list[Facts]) -> CIProbeResult | None:
@@ -424,9 +443,9 @@ async def _commit_ci(get: Get, api: str, sha: str) -> tuple[list[Facts], list[Fa
     return checks, statuses
 
 
-async def _dispatch_check_ids(
-    get: Get, api: str, sha: str, runs: list[Facts], checks: dict[Any, Facts]
-) -> set[int]:
+async def _optional_dispatch_checks(
+    get: Get, api: str, sha: str, runs: list[Facts], checks: CheckSnapshot
+) -> None:
     dispatches = [run for run in runs if run.get("event") == "workflow_dispatch"]
     if not all(
         run.get("head_sha") == sha
@@ -439,19 +458,11 @@ async def _dispatch_check_ids(
         for run in dispatches
     ):
         raise Unverified("unrelated dispatch identity is unreadable")
-    histories = await asyncio.gather(
-        *(attempt_jobs(get, api, run) for run in dispatches)
-    )
-    ids: set[int] = set()
-    for run, jobs in zip(dispatches, histories, strict=True):
-        for job in jobs.values():
-            job_id = job["id"]
-            if job_id in ids:
-                raise Unverified("dispatch check belongs to several attempts")
-            if job_id in checks:
-                _match_action_check(checks[job_id], run, job)
-            ids.add(job_id)
-    return ids
+    for run in dispatches:
+        jobs = await attempt_jobs(get, api, run)
+        checks.optional(run, jobs)
+        if run.get("conclusion") == "success":
+            checks.superseded(run, await previous_attempt_jobs(get, api, run))
 
 
 def _ordinary_profile(jobs: dict[str, Facts], run: Facts, collector: bool) -> str:
@@ -485,23 +496,19 @@ async def _ordinary_proof(
     selected: Facts,
 ) -> CIProbeResult:
     _, sha, base_ref, base = refs
-    jobs, snapshot, policy = await asyncio.gather(
+    jobs, previous, snapshot, policy = await asyncio.gather(
         attempt_jobs(get, api, selected),
+        previous_attempt_jobs(get, api, selected),
         _commit_ci(get, api, sha),
         policy_proof(get, api, sha, base, base_ref),
     )
     checks, statuses = snapshot
-    by_id = index(checks, "id")
+    bound = CheckSnapshot(checks)
     profile = _ordinary_profile(jobs, selected, WORKFLOW_BLOBS[policy[0]])
-    for job in jobs.values():
-        _match_action_check(by_id.get(job["id"], {}), selected, job)
-    optional = await _dispatch_check_ids(get, api, sha, runs, by_id)
-    if optional.intersection(job["id"] for job in jobs.values()):
-        raise Unverified("ordinary PR check overlaps an unrelated dispatch")
-    independent = [
-        check for check_id, check in by_id.items() if check_id not in optional
-    ]
-    return _independent(independent, statuses) or CIProbeResult(
+    bound.current(selected, jobs)
+    bound.superseded(selected, previous)
+    await _optional_dispatch_checks(get, api, sha, runs, bound)
+    return _independent(list(bound.by_id.values()), statuses) or CIProbeResult(
         CIProbeOutcome.passed, "ci_ordinary_pr_proved", f"{label(selected)}: {profile}"
     )
 
@@ -559,21 +566,31 @@ async def _equivalent(
         return snapshot
     old, new = selection
     billing = old.get("conclusion") == "failure"
-    policy, old_jobs, new_jobs, previous, checks, statuses = await asyncio.gather(
+    (
+        policy,
+        old_jobs,
+        new_jobs,
+        old_history,
+        new_history,
+        snapshot,
+    ) = await asyncio.gather(
         policy_proof(get, api, sha, base, base_ref),
         billing_jobs(get, api, old) if billing else attempt_jobs(get, api, old),
         attempt_jobs(get, api, new),
+        previous_attempt_jobs(get, api, old),
         previous_attempt_jobs(get, api, new),
-        pages(get, f"{api}/commits/{sha}/check-runs?filter=all", "check_runs"),
-        pages(get, f"{api}/commits/{sha}/statuses"),
+        _commit_ci(get, api, sha),
     )
+    checks, statuses = snapshot
     profile = native_profile(
         new_jobs, new, collector_required=WORKFLOW_BLOBS[policy[0]]
     )
-    if blocked := _independent(
-        _known_checks(checks, old, old_jobs, new, new_jobs, previous, billing=billing),
-        statuses,
-    ):
+    bound = CheckSnapshot(checks)
+    bound.current(old, old_jobs, remove=billing)
+    bound.current(new, new_jobs, remove=True)
+    bound.superseded(old, old_history)
+    bound.superseded(new, new_history)
+    if blocked := _independent(list(bound.by_id.values()), statuses):
         return blocked
     await _recheck(get, pull_path, run_path, refs, runs)
     fresh_policy, fresh_checks, fresh_statuses = await asyncio.gather(
@@ -610,12 +627,14 @@ def _ordinary_pr(
 ) -> Facts | CIProbeResult | None:
     if not dispatches:
         return _blocking_run(runs)
-    regular = [run for run in runs if run.get("event") != "workflow_dispatch"]
-    if blocked := _blocking_run(regular):
+    relevant = [
+        run for run in runs if run not in dispatches or run.get("status") not in PENDING
+    ]
+    if blocked := _blocking_run(relevant):
         return blocked
     eligible = [
         run
-        for run in regular
+        for run in relevant
         if canonical(run, ref, sha)
         and run.get("event") == "pull_request"
         and run.get("conclusion") == "success"
