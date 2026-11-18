@@ -459,6 +459,12 @@ SWEEP_COVERAGE: dict[str, Coverage] = {
             "tests/test_role_orders.py::test_one_role_order_per_needs_decision_event",
         )
     ),
+    "agent_outbox": Coverage(
+        scenarios=(
+            "tests/test_agent_outbox_delivery.py::test_restart_and_lost_ack_do_not_duplicate",
+            "tests/test_agent_outbox_delivery.py::test_bounded_retry_preserves_status_and_orders",
+        ),
+    ),
     "events_retention": Coverage(removed_by=_NONE_YET),
     "stale_worktrees": Coverage(removed_by=_NONE_YET),
     "sessions_retention": Coverage(removed_by=_NONE_YET),

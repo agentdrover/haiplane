@@ -12,6 +12,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from hub import cli_agent_outbox
 from hub import config
 from hub import cli_outcome_retire as outcome_retire_cli
 from hub import cli_owner_minutes as om_cli
@@ -2586,6 +2587,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_clocks.set_defaults(func=cmd_defect_clocks)
     _add_defect_metric_parsers(sub)
     _add_worktree_parser(sub)
+    cli_agent_outbox.add_parser(sub, _api)
 
     p_answer = sub.add_parser(
         "answer-outcome",
