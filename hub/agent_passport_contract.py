@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 class PassportFact(BaseModel):
     state: Literal["declared", "observed", "verified", "unknown", "stale"] = "unknown"
-    value: str | int | None = None
+    value: str | int | float | None = None
     source: str
     checked_at: str | None = None
 

@@ -267,3 +267,22 @@ async def test_surfaces_share_projection(
         assert bootstrap[key] == payload[key]
     assert 'data-schema-version="1"' in ui.text
     assert html.escape(payload["policy_version"]) in ui.text
+
+
+async def test_fractional_executor_budget_survives_passport_and_bootstrap(
+    client, db, passport_projects
+):
+    await db.execute(
+        "UPDATE projects SET gate_policy=? WHERE slug=?",
+        (json.dumps({"executor_task_cents_ceiling": 10.5}), "home-infra"),
+    )
+    await db.commit()
+    for suffix in ("agent-passport", "agent-bootstrap"):
+        response = await client.get(f"/api/projects/home-infra/{suffix}")
+        assert response.status_code == 200, response.text
+        data = response.json()
+        passport = data if suffix == "agent-passport" else data["agent_passport"]
+        fact = passport["budget"]["executor_task_cents_ceiling"]
+        assert fact["value"] == 10.5
+        assert fact["state"] == "observed"
+        assert "10.5" in passport["text"]
