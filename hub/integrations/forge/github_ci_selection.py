@@ -222,15 +222,19 @@ def _successful_steps(job: Facts, required: set[str]) -> bool:
     )
 
 
-def _native(job: Facts, run: Facts, suffix: str, steps: set[str]) -> bool:
+def _executed(job: Facts, label: str, steps: set[str]) -> bool:
     return (
         _job_completed(job, "success")
-        and job.get("labels")
-        == [f"k8-home-infra-tests-{run['id']}-{run['run_attempt']}-{suffix}"]
+        and job.get("labels") == [label]
         and type(job.get("runner_id")) is int
         and job["runner_id"] > 0
-        and _successful_steps(job, steps | {CHECKOUT, RUNNER_PROOF})
+        and _successful_steps(job, steps | {CHECKOUT})
     )
+
+
+def _native(job: Facts, run: Facts, suffix: str, steps: set[str]) -> bool:
+    label = f"k8-home-infra-tests-{run['id']}-{run['run_attempt']}-{suffix}"
+    return _executed(job, label, steps | {RUNNER_PROOF})
 
 
 def native_profile(
@@ -450,6 +454,29 @@ async def _dispatch_check_ids(
     return ids
 
 
+def _ordinary_profile(jobs: dict[str, Facts], run: Facts, collector: bool) -> str:
+    if (
+        jobs.keys() == CORE_JOBS.keys() | OPTIONAL_JOBS
+        and all(
+            _executed(jobs[name], "ubuntu-24.04", {step})
+            for name, (_, step) in CORE_JOBS.items()
+        )
+        and _executed(
+            jobs[HOSTED_COLLECTOR], "ubuntu-24.04", {"Summarize the whole test suite"}
+        )
+        and all(
+            _job_completed(jobs[name], "skipped") for name in (BALANCED, K8_COLLECTOR)
+        )
+    ):
+        return "six hosted test jobs"
+    try:
+        return native_profile(jobs, run, collector_required=collector)
+    except Unverified as exc:
+        raise Unverified(
+            f"neither hosted nor native PR coverage is proved: {exc}"
+        ) from exc
+
+
 async def _ordinary_proof(
     get: Get,
     api: str,
@@ -458,15 +485,14 @@ async def _ordinary_proof(
     selected: Facts,
 ) -> CIProbeResult:
     _, sha, base_ref, base = refs
-    jobs, snapshot, _ = await asyncio.gather(
+    jobs, snapshot, policy = await asyncio.gather(
         attempt_jobs(get, api, selected),
         _commit_ci(get, api, sha),
-        branch_proof(get, api, base, base_ref),
+        policy_proof(get, api, sha, base, base_ref),
     )
     checks, statuses = snapshot
     by_id = index(checks, "id")
-    if not all(_job_completed(jobs.get(name, {}), "success") for name in CORE_JOBS):
-        raise Unverified("ordinary PR test job coverage is not proved")
+    profile = _ordinary_profile(jobs, selected, WORKFLOW_BLOBS[policy[0]])
     for job in jobs.values():
         _match_action_check(by_id.get(job["id"], {}), selected, job)
     optional = await _dispatch_check_ids(get, api, sha, runs, by_id)
@@ -476,7 +502,7 @@ async def _ordinary_proof(
         check for check_id, check in by_id.items() if check_id not in optional
     ]
     return _independent(independent, statuses) or CIProbeResult(
-        CIProbeOutcome.passed, "ci_ordinary_pr_proved", label(selected)
+        CIProbeOutcome.passed, "ci_ordinary_pr_proved", f"{label(selected)}: {profile}"
     )
 
 

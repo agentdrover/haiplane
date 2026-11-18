@@ -466,8 +466,19 @@ async def test_unrelated_dispatch_does_not_close_ordinary_pr_ci(monkeypatch, cha
     e = Evidence()
     e.old["conclusion"] = "success"
     for job in e.jobs[OLD]:
-        if job["conclusion"] == "failure":
-            job["conclusion"] = "success"
+        if job["conclusion"] != "failure":
+            continue
+        name = job["name"]
+        required = (
+            "Summarize the whole test suite"
+            if name == selection.HOSTED_COLLECTOR
+            else selection.CORE_JOBS[name][1]
+        )
+        job.update(
+            conclusion="success",
+            runner_id=800,
+            steps=[step(selection.CHECKOUT), step(required)],
+        )
     e.native.update(changes)
     if e.native["status"] == "in_progress":
         e.jobs[NEW][0].update(status="in_progress", conclusion=None)
@@ -502,6 +513,21 @@ async def test_unrelated_dispatch_does_not_close_ordinary_pr_ci(monkeypatch, cha
     e.rules = [{"type": "required_status_checks"}]
     protected = await both(CIProbeOutcome.unavailable)
     assert protected.details and "branch requirements" in protected.details
+
+
+async def test_ordinary_workflow_success_without_executed_jobs_is_unavailable(
+    monkeypatch,
+):
+    e = Evidence()
+    e.old["conclusion"] = "success"
+    e.native["path"] = ".github/workflows/other.yml"
+    for job in e.jobs[OLD]:
+        if job["conclusion"] == "failure":
+            job["conclusion"] = "success"
+    e.checks = [e._as_check(run, job) for run in e.runs for job in e.jobs[run["id"]]]
+    result = await e.probe(monkeypatch, primary=(1, "", "HTTP 403"))
+    assert result.outcome is CIProbeOutcome.unavailable
+    assert result.details and "hosted" in result.details
 
 
 async def test_stale_same_run_checks_are_bound_to_exact_attempt_jobs(monkeypatch):
