@@ -491,6 +491,9 @@ SLOT_RUNNER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("GET", "/api/executor-hosts/{name}/role-orders"),
     ("POST", "/api/executor-hosts/{name}/role-orders/{order_id}/started"),
     ("POST", "/api/executor-hosts/{name}/role-orders/{order_id}/report"),
+    ("GET", "/api/executor-hosts/{name}/role-orders/{order_id}/outbox"),
+    ("POST", "/api/executor-hosts/{name}/role-orders/{order_id}/outbox"),
+    ("GET", "/api/executor-hosts/{name}/role-orders/{order_id}/outbox/{delivery_id}"),
     # #1953: заказы критика k8 для облачной сдачи - выдача и отчёт.
     ("GET", "/api/executor-hosts/{name}/critic-orders"),
     ("POST", "/api/executor-hosts/{name}/critic-orders/{order_id}/report"),

@@ -17,8 +17,10 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
+from hub.services.messaging import sweep_retention as _sweep_messages_retention
 from hub.services import ci_head_run, delivery_notes, delivery_writes, watch_notices
 from hub.services import (
+    agent_outbox_delivery,
     critic_orders,
     delivery_wait,
     gate_observations,
@@ -2440,22 +2442,6 @@ async def _sweep_policy_schedule(db) -> None:
         )
 
 
-async def _sweep_messages_retention(db) -> None:
-    # Message retention (#773): the channel is for coordinating work in
-    # flight, and the tasks themselves keep the record of what was done.
-    pruned_messages = await repo.prune_agent_messages(
-        db, keep_days=config.MESSAGE_RETENTION_DAYS
-    )
-    # Коммит безусловный — см. _sweep_events_retention.
-    await db.commit()
-    if pruned_messages:
-        log.info(
-            "Poll: pruned %d messages older than %d days",
-            pruned_messages,
-            config.MESSAGE_RETENTION_DAYS,
-        )
-
-
 async def _sweep_mcp_retention(db) -> None:
     # MCP usage telemetry retention (#780): the records answer "what
     # does the Agent API cost now", and the horizon is deliberately
@@ -2521,6 +2507,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("stale_arbiter", _sweep_stale_arbiter),
     Sweep("owner_minutes", _sweep_owner_minutes),
     Sweep("role_orders", role_orders.run_sweep),  # #1973: перед очисткой events
+    Sweep("agent_outbox", agent_outbox_delivery.sweep),
     Sweep("events_retention", _sweep_events_retention),
     Sweep("stale_worktrees", _sweep_stale_worktrees),
     Sweep("sessions_retention", _sweep_sessions_retention),

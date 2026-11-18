@@ -378,7 +378,7 @@ async def _has_newer_entry(
     return bool(rows)
 
 
-async def _is_fresh(db: aiosqlite.Connection, order: aiosqlite.Row) -> bool:
+async def is_fresh(db: aiosqlite.Connection, order: aiosqlite.Row) -> bool:
     """Задача всё ещё в ТОМ ЖЕ заходе в needs_decision, что породил заказ.
 
     «Новее» ищется среди событий входа, а не «то же самое событие найдено»:
@@ -541,7 +541,7 @@ async def _reap_stale_open(db: aiosqlite.Connection) -> None:
             (last, REAP_BATCH),
         )
         for order in batch:
-            if not await _is_fresh(db, order):
+            if not await is_fresh(db, order):
                 await _expire_stale(db, order)
         if len(batch) < REAP_BATCH:
             return
@@ -608,7 +608,7 @@ async def _claim_first(db: aiosqlite.Connection, host: str) -> dict[str, Any] | 
         (host,),
     )
     for order in candidates:
-        if not await _is_fresh(db, order):
+        if not await is_fresh(db, order):
             await _expire_stale(db, order)
             continue
         cursor = await db.execute(
