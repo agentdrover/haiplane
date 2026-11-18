@@ -1,0 +1,22 @@
+<section class="agent-passport" aria-label="Паспорт агента" data-schema-version="{{ passport.schema_version }}">
+    {% if passport.declaration.state == "unreadable" %}
+        <p class="task-action-note">Источник декларации недоступен. Состояние файла — unknown.</p>
+    {% elif passport.declaration.state == "invalid" %}
+        <p class="task-action-note task-action-note--warning">Ошибка формата декларации.</p>
+    {% elif passport.declaration.state == "stale" %}
+        <p class="task-action-note task-action-note--warning">Срок проверки декларации истёк.</p>
+    {% elif not passport.roles %}
+        <p class="task-action-note">Роли не объявлены. Состояние runtime — unknown.</p>
+    {% endif %}
+    {% if passport.roles %}
+        <ul>
+        {% for role in passport.roles %}
+            <li>{{ role.purpose }}{% if role.status == "planned" %} — планируется{% endif %}</li>
+        {% endfor %}
+        </ul>
+    {% endif %}
+    <details>
+        <summary>Данные и источники</summary>
+        <pre style="white-space: pre-wrap; overflow-wrap: anywhere">{{ passport.text }}</pre>
+    </details>
+</section>

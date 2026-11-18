@@ -79,6 +79,7 @@
       "modules": [
         "hub.models",
         "hub.agent_outbox_models",
+        "hub.agent_passport_contract",
         "hub.behavior_delta",
         "hub.plain_summary",
         "hub.cause_task_view",
