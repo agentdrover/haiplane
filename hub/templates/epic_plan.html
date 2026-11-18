@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Допуск плана #{{ plan.snapshot.epic_id }}{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1>Допуск плана #{{ plan.snapshot.epic_id }}</h1>
+    <a href="/tasks/{{ plan.snapshot.epic_id }}">Карточка эпика</a>
+    <p>{{ plan.snapshot.project }} · {{ plan.state }} · {{ plan.reason }}</p>
+</header>
+<dl>
+    <dt>Версия снимка</dt><dd><code style="overflow-wrap:anywhere">{{ plan.version }}</code></dd>
+    <dt>Действия</dt><dd>{{ plan.snapshot.allowed_actions | join(", ") }}</dd>
+    <dt>Исключения</dt><dd>{{ plan.snapshot.exceptions | join(", ") }}</dd>
+    {% set terms = plan.snapshot.terms %}
+    <dt>Срок и ограничения</dt>
+    <dd>{{ terms.duration_days }} суток. WIP {{ terms.max_in_progress }}.
+        Потолки расходов в центах USD: {{ terms.total_cents }} за пилот, {{ terms.leaf_cents }} за лист.
+        Проектный потолок расходов на лист {{ plan.snapshot.project_leaf_ceiling_cents if plan.snapshot.project_leaf_ceiling_cents is not none else "неизвестен" }}.
+        Действует меньший проверенный лимит пилота, проекта или провайдера.
+        Технических повторов {{ terms.technical_retries }}, исправлений одной причины {{ terms.fixes_same_cause }}.</dd>
+    {% if plan.decision %}
+    <dt>Последнее решение</dt>
+    <dd>Принципал #{{ plan.decision.approved_principal_id }} · {{ plan.decision.approved_at }} · до {{ plan.decision.expires_at }}
+        {% if plan.decision.terminal_at %}· {{ plan.decision.state }} принципалом #{{ plan.decision.terminal_principal_id }}
+        · {{ plan.decision.terminal_at }}{% endif %}</dd>
+    {% endif %}
+</dl>
+<ul>
+    {% for node in plan.snapshot.nodes %}
+    <li><a href="/tasks/{{ node.task_id }}">#{{ node.task_id }} {{ node.title }}</a>
+        · ревизия {{ node.revision }} · {{ "допущен к утверждению" if node.allowed else "исключён" }}
+        {% if node.parent_id %}· родитель #{{ node.parent_id }}{% endif %}
+        {% if node.blocked_by %}· после доставки {{ node.blocked_by | join(", ") }}{% endif %}
+        {% if node.areas %}· {{ node.areas | join(", ") }}{% endif %}
+    </li>
+    {% endfor %}
+</ul>
+{% if plan.can_decide %}
+    {% if not plan.decision or plan.decision.version != plan.version %}
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="version" value="{{ plan.version }}">
+        <button name="action" value="approve" type="submit">Утвердить версию</button>
+    </form>
+    {% endif %}
+    {% if plan.decision and plan.decision.state != "revoked" %}
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="version" value="{{ plan.decision.version }}">
+        <label>Причина <input name="reason" type="text" required maxlength="500"></label>
+        <button name="action" value="stopped" type="submit">Остановить</button>
+        <button name="action" value="revoked" type="submit">Отозвать</button>
+    </form>
+    {% endif %}
+{% endif %}
+{% endblock %}

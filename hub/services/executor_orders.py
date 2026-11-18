@@ -46,7 +46,7 @@ from hub import repository as repo
 from hub.auth import SLOT_RUNNER_USER_PREFIX
 from hub.db import fetchall, write_transaction
 from hub.models import _SLOT_NAME
-from hub.services import admin as admin_svc
+from hub.services import admin as admin_svc, epic_plan
 from hub.services import (
     chat_pair,
     executor_skill_bundle as skills,
@@ -890,6 +890,7 @@ async def _issue_atomically(
     Круг починки running-задачи (#1998): возврат в open — ВНУТРИ этой же точки,
     поэтому сбой выпуска откатывает и его, а не оставляет open без заказа.
     """
+    await epic_plan.refuse_legacy_start(db, int(booked.task["id"]))
     await db.execute("SAVEPOINT executor_slot_issue")
     try:
         if booked.returning:

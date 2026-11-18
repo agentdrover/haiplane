@@ -1249,6 +1249,7 @@ async def _open_draft_under_lock(
     snapshot: DorSnapshot,
     caller_owns_tx: bool = False,
     who: Any = None,
+    approve_plan: dict[str, Any] | None = None,
 ) -> str | None:
     """Допуск заморозки, DoR-override и переход draft -> open одной транзакцией.
 
@@ -1354,12 +1355,12 @@ async def _open_draft_under_lock(
                 db,
                 kind="task_approved",
                 task_id=task_id,
-                actor="human",
+                actor="epic_plan" if approve_plan else "human",
                 payload={
                     "run": bool(body.run),
                     "force": bool(body.force),
                     # #1874: автор для учёта минут владельца; не из actor и не из тела.
-                    **owner_minutes.stamp(who),
+                    **(approve_plan or owner_minutes.stamp(who)),
                 },
             )
         if not transitioned:
@@ -1436,6 +1437,10 @@ async def approve_task(
         )
 
     body = body or TaskApprove()
+    if body.run:
+        from hub.services.epic_plan import refuse_legacy_start
+
+        await refuse_legacy_start(db, task_id)
     if body.run and is_state(task):
         # #1647: запуск headless для state отказывает до одобрения, чтобы
         # отказ не оставил задачу одобренной, но не запущенной.
@@ -1847,6 +1852,9 @@ async def start_task(
     body: TaskStart | None = None,
 ) -> TaskView:
     """Start an open task by dispatching it."""
+    from hub.services.epic_plan import refuse_legacy_start
+
+    await refuse_legacy_start(db, task_id)
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -2132,6 +2140,9 @@ async def _pair_start_core(
     # The status the decision below is made from; the transition must start
     # from exactly this value, not from whatever the row holds later.
     starting_status = task["status"]
+    from hub.services.epic_plan import refuse_legacy_start
+
+    await refuse_legacy_start(db, task_id)
     assigned_agent = (body.assigned_agent or "").strip() if body else ""
     if not assigned_agent:
         assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")

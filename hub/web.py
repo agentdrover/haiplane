@@ -63,6 +63,7 @@ from hub.services import verdict_evidence
 from hub.version import get_app_version
 from hub.services import launch_feedback
 from hub.web_executor_slot import card_capacity, card_hosts
+from hub.web_epic_plan import include_plan_page
 from hub.web_refusals import (
     WebRefusalRoute,
     log_field_refusals,
@@ -185,6 +186,7 @@ def _egress_text(egress: Any) -> str:
 TEMPLATES.env.globals["egress_text"] = _egress_text
 
 router = APIRouter(route_class=WebRefusalRoute)
+include_plan_page(router, TEMPLATES)
 
 log = logging.getLogger("hub.web")
 

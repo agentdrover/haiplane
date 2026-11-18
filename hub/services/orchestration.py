@@ -1922,6 +1922,9 @@ async def dispatch_task(
     task: dict[str, Any],
 ) -> dict[str, Any]:
     """Dispatch a task via oc-dev-dispatch, creating a branch if needed."""
+    from hub.services.epic_plan import refuse_legacy_start
+
+    await refuse_legacy_start(db, task_id)
     if automation_not_applicable(task):
         # #1647: общий затвор headless-запуска (start, approve(run), создание с
         # run_immediately, решение владельца о rework). До git, брони и job.

@@ -4039,6 +4039,16 @@ async def hub_executor_slots() -> CallToolResult:
 
 
 @mcp.tool()
+async def hub_epic_plan(epic_id: int) -> CallToolResult:
+    """Read the pilot plan and the caller's decision eligibility."""
+    try:
+        data = await _api_get(f"/api/tasks/{epic_id}/epic-plan")
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result(data["reason"], **data)
+
+
+@mcp.tool()
 async def hub_effective_policy(project: str) -> CallToolResult:
     """Effective policy of a project: gate keys, values, sources."""
     from hub.services.effective_policy import format_effective_policy

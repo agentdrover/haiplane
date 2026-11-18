@@ -21,6 +21,7 @@
         "hub.cli",
         "hub.cli_manual_recovery",
         "hub.cli_task_fields",
+        "hub.cli_epic_plan",
         "hub.cli_owner_minutes",
         "hub.cli_outcome_retire",
         "hub.cli_delivery_rerun",
@@ -77,6 +78,7 @@
     "models": {
       "modules": [
         "hub.models",
+        "hub.epic_plan_view",
         "hub.behavior_delta",
         "hub.plain_summary",
         "hub.cause_task_view",

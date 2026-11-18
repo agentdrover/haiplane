@@ -408,7 +408,11 @@ async def _skip_reason(
     ``known_blockers`` — недоставленные зависимости, уже посчитанные одним
     проходом по графу (#1527): тот же читатель доставки, без запроса на задачу.
     """
+    from hub.services.epic_plan import start_blocker
+
     task_id = int(candidate["id"])
+    if plan_block := await start_blocker(db, task_id):
+        return {**plan_block, "detail": plan_block["reason"]}
     waiting = current_wait(candidate)
     if waiting:
         return {"task_id": task_id, "reason": SKIP_DEFERRED, "detail": waiting}
