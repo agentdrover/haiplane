@@ -556,6 +556,16 @@
                                 <time>{{ m.created_at }}</time>
                             </div>
                             <div class="task-timeline-content u-pre-wrap">{{ m.body }}</div>
+                            {% if m.id in outbox_questions %}
+                            <form method="post" action="/tasks/{{ task.id }}/web-message">
+                                {{ csrf_field() }}
+                                <input type="hidden" name="outbox_message_id" value="{{ m.id }}">
+                                <label>Ответ роли
+                                    <textarea name="body" required maxlength="4000"></textarea>
+                                </label>
+                                <button type="submit" class="btn btn--small">Ответить</button>
+                            </form>
+                            {% endif %}
                         </div>
                     </article>
                     {% endfor %}
