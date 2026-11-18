@@ -635,7 +635,11 @@ def _ordinary_pr(
     if not dispatches:
         return _blocking_run(runs)
     relevant = [
-        run for run in runs if run not in dispatches or run.get("status") not in PENDING
+        run
+        for run in runs
+        if run not in dispatches
+        or run.get("status") not in PENDING
+        or run.get("conclusion") is not None
     ]
     if blocked := _blocking_run(relevant):
         return blocked

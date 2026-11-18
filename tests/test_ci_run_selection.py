@@ -512,6 +512,18 @@ async def test_completed_optional_dispatch_with_pending_job_is_unavailable(monke
     assert result.details and "pending" in result.details
 
 
+async def test_pending_optional_dispatch_with_terminal_conclusion_blocks(monkeypatch):
+    e = Evidence()
+    _prove_hosted(e)
+    e.native.update(
+        path=".github/workflows/other.yml", status="in_progress", conclusion="success"
+    )
+    e.checks = [e._as_check(run, job) for run in e.runs for job in e.jobs[run["id"]]]
+    result = await e.probe(monkeypatch)
+    assert result.outcome is CIProbeOutcome.pending
+    assert result.details and str(NEW) in result.details
+
+
 async def test_optional_pending_dispatch_does_not_hide_completed_failure(monkeypatch):
     e = Evidence()
     _prove_hosted(e)
