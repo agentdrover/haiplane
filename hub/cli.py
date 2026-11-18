@@ -18,6 +18,7 @@ from hub import cli_outcome_retire as outcome_retire_cli
 from hub import cli_owner_minutes as om_cli
 from hub import cli_review_verdict as rv_cli
 from hub import cli_worktree_prune as wt_prune
+from hub import cli_epic_plan as epic_plan_cli
 from hub import expected_sha as expected_sha_cli
 from hub import cli_delivery_rerun as rerun_cli
 from hub.cli_executor_host import (
@@ -2609,6 +2610,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_answer.add_argument("--note", default="", help="Context or what to do next")
     p_answer.set_defaults(func=cmd_answer_outcome)
 
+    epic_plan_cli.add_parser(sub, _api)
     _add_projects_parser(sub)
 
     p_approve_batch = sub.add_parser(
