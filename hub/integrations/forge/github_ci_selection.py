@@ -11,12 +11,13 @@ from urllib.parse import quote
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 
 PILOT_REPO = "agentdrover/home-infra"
-PILOT_CONTRACT = "0fcb35ba10a1636329938d2d6c626cbd6c33f7190a0ea4c8aa43e8faeeae5970"
+# Public fingerprint of the Hub CI configuration, followed by public Git blob IDs.
+PILOT_CONTRACT = "0fcb35ba10a1636329938d2d6c626cbd6c33f7190a0ea4c8aa43e8faeeae5970"  # pragma: allowlist secret
 WORKFLOW = ".github/workflows/tests.yml"
 # Audited versions of the same job graph. The second adds test_codex_events to unittest.
 WORKFLOW_BLOBS = {
-    "bec1443cb1890775c3e11d1d2858eafe3c5fcb55": False,  # permits the tests-only dispatch
-    "f602fcbfef42ed6b93cd703ca0d48517f0b33a2e": True,  # requires the native collector
+    "bec1443cb1890775c3e11d1d2858eafe3c5fcb55": False,  # pragma: allowlist secret
+    "f602fcbfef42ed6b93cd703ca0d48517f0b33a2e": True,  # pragma: allowlist secret
 }
 WORKFLOW_ID = 397248744
 HOSTED_COLLECTOR = "Collect Hub evidence"

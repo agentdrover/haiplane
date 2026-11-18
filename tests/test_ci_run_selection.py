@@ -10,8 +10,8 @@ from hub.integrations.protocols import CIProbeOutcome
 
 REPO = "agentdrover/home-infra"
 HEAD_REF = "task-2372/olymp-figure-rollout"
-HEAD = "60c77f897b158729668a029f2da3ad3abe7bc558"
-BASE = "4db39d5bfd83c220a15f4723bf43ae85836e56c2"
+HEAD = "60c77f897b158729668a029f2da3ad3abe7bc558"  # pragma: allowlist secret
+BASE = "4db39d5bfd83c220a15f4723bf43ae85836e56c2"  # pragma: allowlist secret
 OLD, NEW = 44332283068, 44333582843
 
 
@@ -58,7 +58,9 @@ class Evidence:
         ]
         self.rules = []
         self.statuses = []
-        self.base_blob = self.head_blob = "bec1443cb1890775c3e11d1d2858eafe3c5fcb55"
+        self.base_blob = self.head_blob = (
+            "bec1443cb1890775c3e11d1d2858eafe3c5fcb55"  # pragma: allowlist secret
+        )
         self.missing = set()
         self.pr_reads = 0
         self.switch_head = False
@@ -309,7 +311,7 @@ async def test_collector_enabled_profile_requires_proof_and_preserves_trust_boun
     monkeypatch,
 ):
     e = Evidence()
-    e.head_blob = "f602fcbfef42ed6b93cd703ca0d48517f0b33a2e"
+    e.head_blob = "f602fcbfef42ed6b93cd703ca0d48517f0b33a2e"  # pragma: allowlist secret
     assert (await e.probe(monkeypatch)).outcome is CIProbeOutcome.unavailable
     collector = e.jobs[NEW][7]
     collector.update(
