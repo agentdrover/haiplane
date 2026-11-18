@@ -170,7 +170,9 @@ async def test_bootstrap_backward_compatibility(client, db, passport_projects):
 
     project_id = await repo.create_project(db, slug="no-passport", name="No passport")
     await repo.update_project(
-        db, project_id, repo="https://bot:PASSPORT-CANARY@forge.example/org/repo"
+        db,
+        project_id,
+        repo="https://bot:PASSPORT-CANARY@forge.example/org/repo",  # pragma: allowlist secret
     )
     await db.commit()
     response = await client.get("/api/projects/no-passport/agent-bootstrap")
