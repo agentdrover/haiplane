@@ -3294,7 +3294,11 @@ async def _policy_and_novelty_allow(
     там, а здесь остаётся прежнее «можно ли заказывать». Вынесена отдельно,
     потому что maybe_dispatch_review стоит на потолке сложности вплотную.
     """
-    return not await dispatch_refusal(db, task, project, force_profile, force_model)
+    from hub.services.epic_plan_gates import can_prepare_review
+
+    return await can_prepare_review(db, task) and not await dispatch_refusal(
+        db, task, project, force_profile, force_model
+    )
 
 
 #: Метка записи об отсутствующем ревьюере, по которой она находится снова.
@@ -4252,6 +4256,7 @@ async def _create_or_adopt(
     reviewer_token: str,
     model_params: list[cursor_cloud.ModelParam] | None = None,
     db: aiosqlite.Connection | None = None,
+    max_attempts: int = _LOST_ANSWER_ATTEMPTS,
 ) -> _Started:
     """Создать ревьюера, а если ответ не дошёл — спросить, не создан ли он.
 
@@ -4331,7 +4336,7 @@ async def _create_or_adopt(
         # Сверка прошла и агента нет — вызов действительно не состоялся,
         # повторить его безопасно. Потолок обязателен: семнадцать минут
         # одной и той же неудачи уже наблюдались на #1175.
-        if attempts >= _LOST_ANSWER_ATTEMPTS:
+        if attempts >= max_attempts:
             break
         attempts += 1
         agent_id, run_id, refusal = await _attempt()
@@ -4513,6 +4518,88 @@ async def _prepare_claimed_order(
     return order
 
 
+async def _start_paid_review(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    order: ReviewOrder,
+    forge: str,
+    gh_repo: str,
+    branch: str,
+    reviewer_token: str,
+    principal_id: int | None,
+) -> tuple[_Started, Any] | None:
+    from hub.services import epic_plan_gates
+
+    task_id = int(task["id"])
+    generation = int(task["submission_generation"] or 0)
+    model_id = order.model
+    ordinal = await _attempt_ordinal(db, task_id, generation)
+    ready, permit = await epic_plan_gates.reserve_review(
+        db,
+        task,
+        channel="cloud",
+        model=model_id,
+        principal_id=principal_id,
+        attempt=ordinal,
+    )
+    if not ready:
+        return None
+    marker = cursor_cloud.agent_marker("review", task_id, generation, ordinal)
+    if permit is not None and permit.reconcile:
+        seen = await cursor_cloud.find_agent_by_name(marker)
+        if not seen.asked:
+            return None
+        if seen.agent_id:
+            return _Started(seen.agent_id, seen.run_id, True, False, 0, None), permit
+    prompt = await epic_plan_gates.with_reservation_prompt(db, permit, order.prompt)
+    params = await cursor_cloud.review_params_for(model_id)
+    if not await epic_plan_gates.ready_to_send(db, permit):
+        return None
+    started = await _create_or_adopt(
+        marker,
+        task_id=task_id,
+        repo_url=forge_urls.repo_url(forge, gh_repo),
+        starting_ref=branch,
+        model_id=model_id,
+        prompt_text=prompt,
+        hub_mcp_url=f"{instance_base_url().rstrip('/')}/mcp",
+        reviewer_token=reviewer_token,
+        model_params=params,
+        db=db,
+        max_attempts=1 if permit is not None else _LOST_ANSWER_ATTEMPTS,
+    )
+    return started, permit
+
+
+async def _release_pilot_review_refusal(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    force_profile: str,
+    replaces_dispatch_id: int | None,
+    force_model: str,
+) -> bool:
+    await _release_the_order(
+        db, task_id, generation, force_profile, replaces_dispatch_id, force_model
+    )
+    await db.commit()
+    return False
+
+
+def _note_unknown_reviewer(task_id: int, expected_principal: int | None) -> None:
+    # #1025: pin whose report this dispatch waits for, resolved from the
+    # reviewer token at dispatch time (above, where the code was minted under
+    # it). An unresolved token is logged and falls back to the old
+    # task+generation match rather than blocking the dispatch — degradation is
+    # this module's contract.
+    if expected_principal is None:
+        log.warning(
+            "reviewer token resolves to no principal — dispatch for task #%s "
+            "matches its report by task+generation only",
+            task_id,
+        )
+
+
 async def maybe_dispatch_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -4615,24 +4702,15 @@ async def maybe_dispatch_review(
     )
     if order is None:
         return False
-    model_id, profile, profile_reasons = order.model, order.profile, order.reasons
-    started = await _create_or_adopt(
-        cursor_cloud.agent_marker(
-            "review",
-            task_id,
-            generation,
-            await _attempt_ordinal(db, task_id, generation),
-        ),
-        task_id=task_id,
-        repo_url=forge_urls.repo_url(forge, gh_repo),
-        starting_ref=branch,
-        model_id=model_id,
-        prompt_text=order.prompt,
-        hub_mcp_url=f"{instance_base_url().rstrip('/')}/mcp",
-        reviewer_token=reviewer_token,
-        model_params=await cursor_cloud.review_params_for(model_id),
-        db=db,
+    purchase = await _start_paid_review(
+        db, task, order, forge, gh_repo, branch, reviewer_token, expected_principal
     )
+    if purchase is None:
+        return await _release_pilot_review_refusal(
+            db, task_id, generation, force_profile, replaces_dispatch_id, force_model
+        )
+    started, permit = purchase
+    model_id, profile, profile_reasons = order.model, order.profile, order.reasons
     agent_id, run_id = started.agent_id, started.run_id
     variant = await _name_the_dropped_params(db, task_id, model_id, started)
     if not agent_id:
@@ -4678,17 +4756,7 @@ async def maybe_dispatch_review(
         await db.commit()
         return owed
 
-    # #1025: pin whose report this dispatch waits for, resolved from the
-    # reviewer token at dispatch time (above, where the code was minted under
-    # it). An unresolved token is logged and falls back to the old
-    # task+generation match rather than blocking the dispatch — degradation is
-    # this module's contract.
-    if expected_principal is None:
-        log.warning(
-            "reviewer token resolves to no principal — dispatch for task #%s "
-            "matches its report by task+generation only",
-            task_id,
-        )
+    _note_unknown_reviewer(task_id, expected_principal)
     placed_id = await repo.create_review_dispatch(
         db,
         task_id=task_id,
@@ -4702,6 +4770,9 @@ async def maybe_dispatch_review(
         replaces_dispatch_id=replaces_dispatch_id,
         only_tests=order.only_tests,
     )
+    from hub.services import epic_plan_gates
+
+    await epic_plan_gates.attach_dispatch(db, permit, placed_id)
     # #1946: код выписан до строки заказа - привязать его к заказу.
     await report_binding.bind_code_to_dispatch(
         db, order.access_code, placed_id, task_id, generation, expected_principal
@@ -5344,17 +5415,34 @@ async def dispatch_local_review(
         await _dispatch_report(db, task_id, generation, late_report_recheck) is not None
     ):
         return False
+    from hub.services import epic_plan_gates
+
+    ready, permit = await epic_plan_gates.reserve_review(
+        db,
+        task,
+        channel="local",
+        model=order.model,
+        principal_id=principal_id,
+        attempt=await _attempt_ordinal(db, task_id, generation),
+    )
+    if not ready or (permit is not None and permit.reconcile):
+        return False
+    if not await epic_plan_gates.ready_to_send(db, permit):
+        return False
     dispatch_id, run_id = await _insert_local_dispatch(
         db, task, order, why, principal_id, generation, late_report_recheck, second_door
     )
     if dispatch_id is None:
         return False
+    await epic_plan_gates.attach_dispatch(db, permit, dispatch_id)
+    if permit is not None:
+        await db.commit()
     await _start_local_run(
         db,
         dispatch_id,
         task_id,
         generation,
-        order.prompt,
+        await epic_plan_gates.with_reservation_prompt(db, permit, order.prompt),
         order.access_code,
         principal_id,
         order.snapshot,

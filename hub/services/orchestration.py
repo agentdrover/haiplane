@@ -4236,10 +4236,18 @@ async def merge_if_approval_stands(
     красный CI, и тогда зелёный CI этого прохода относится не к тому, что ляжет в
     базу. Закрепление сменилось — отказ без вызова форжа (``HEAD_MOVED``).
     """
+    from hub.services.epic_plan_gates import approval_refusal
+
     key = (int(task["id"]), int(task["pr_number"]))
     while True:
         if hold := await delivery_rerun.merge_hold(db, task, ctx):  # #1956, каждый круг
             return MergeStep.RERUN_HOLD, hold
+        row = await repo.get_task(db, key[0])
+        if row is not None and (
+            reason := await approval_refusal(db, row, automatic=False)
+        ):
+            return MergeStep.RERUN_HOLD, reason
+        # Перечитать после проверок пилота: вердикт мог смениться во время чтения.
         row = await repo.get_task(db, key[0])
         # --- ниже до регистрации Future нет ни одного await ---
         if row is None or not _approval_holds(dict(row), task):

@@ -380,6 +380,11 @@ async def _decide_route(
         # автопилота не доходим: она ищет машинный отчёт, которого у такой
         # задачи нет, и отвечала бы «нет отчёта» вместо настоящей причины.
         return _human(AUTOMATION_REFUSAL_CODE, AUTOMATION_REFUSAL)
+    from hub.services.epic_plan_gates import approval_refusal
+
+    blocked = await approval_refusal(db, task, automatic=False)
+    if blocked:
+        return VerdictRoute(DECIDER_NONE, DECIDER_NONE, "", blocked, blocked)
     # #2052: записанный владелец раньше любого прогноза. Актор, сложивший
     # решение, сказал это вслух; стойка автопилота «одобрил бы» не отменяет
     # того, что стюард уже передал сдачу человеку.

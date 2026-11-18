@@ -1737,6 +1737,12 @@ async def _sweep_executor_orders(db) -> None:
         log.exception("executor order sweep failed")
 
 
+async def _sweep_epic_plan(db) -> None:
+    from hub.services.epic_plan_dispatch import sweep
+
+    await sweep(db)
+
+
 async def _sweep_ci_trust(db) -> None:
     # #1687: a CI report is worth what GitHub confirms. Retries the reports
     # GitHub could not be asked about (every 5 minutes, up to 6 hours) and
@@ -2500,6 +2506,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("executor_runs", _sweep_executor_runs),
     Sweep("executor_slots", _sweep_executor_slots),
     Sweep("executor_orders", _sweep_executor_orders),
+    Sweep("epic_plan", _sweep_epic_plan),
     Sweep("rework_launches", rework_launch.sweep),  # #1991: оборванный заказ
     Sweep("critic_orders", critic_orders.expire_due),  # #1953: срок заказа критика
     Sweep("expired_claims", _sweep_expired_claims),

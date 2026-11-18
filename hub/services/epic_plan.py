@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 import aiosqlite
 from fastapi import HTTPException
@@ -13,6 +13,7 @@ from hub import config, repository as repo
 from hub.db import deserialize_str_list, fetchall, write_transaction
 from hub.epic_plan_view import (
     PlanDecision,
+    PlanDispatchAuthority,
     PlanNode,
     PlanSnapshot,
     PlanState,
@@ -27,12 +28,13 @@ from hub.services.refinement import row_to_ac
 from hub.services.statement_generation import statement_fingerprint
 
 EPIC_ID = 2373
-PROJECT = "receipt-split-calculator"
+PROJECT: Literal["receipt-split-calculator"] = "receipt-split-calculator"
 GROUPS = frozenset({2374, 2375, 2376})
 LEAVES = frozenset({2377, 2378, 2379, 2380})
 INCLUDED = GROUPS | LEAVES | {EPIC_ID}
 TERMS = PlanTerms()
 ACTIONS = ["approve_statement", "prepare_leaf_for_dispatch"]
+PAID_ACTIONS = ["launch_bounded_executor", "order_bounded_independent_review"]
 EXCEPTIONS = [
     "live_acceptance_2381",
     "publication",
@@ -102,7 +104,8 @@ def _digest(data: Any) -> str:
 
 
 def _version(snapshot: PlanSnapshot) -> str:
-    return _digest(snapshot.model_dump())
+    excluded = {"dispatch_authority"} if snapshot.dispatch_authority is None else set()
+    return _digest(snapshot.model_dump(exclude=excluded))
 
 
 def _execution_target(project: aiosqlite.Row) -> str:
@@ -165,6 +168,45 @@ def _project_caps(project: aiosqlite.Row) -> tuple[float | None, int | None]:
     ) and cents > 0 else None, project_policy.wip_limit_of(policy)
 
 
+def _dispatch_authority() -> PlanDispatchAuthority | None:
+    from hub.services.epic_plan_authority import configured_source_fingerprint
+
+    source = configured_source_fingerprint()
+    model = (config.env_get("EPIC_PLAN_EXECUTOR_MODEL", "") or "").strip()
+    issuer = config.env_get("EPIC_PLAN_DISPATCH_PRINCIPAL_ID", "") or ""
+    if (
+        not source
+        or not model
+        or not issuer.isascii()
+        or not issuer.isdecimal()
+        or len(issuer) > 18
+    ):
+        return None
+    return PlanDispatchAuthority(
+        host="k8",
+        executor_model=model,
+        issuer_principal_id=int(issuer),
+        budget_source_fingerprint=source,
+        conditions=[
+            "project_executor_and_review_policy",
+            "current_hard_spending_grant_and_verified_checkout",
+            "independent_reviewer_and_exact_trusted_CI_before_verdict",
+            "live_plan_at_every_new_effect",
+        ],
+    )
+
+
+def _allowed_actions(
+    project: aiosqlite.Row, dispatch: PlanDispatchAuthority | None
+) -> list[str]:
+    if dispatch is None:
+        return ACTIONS
+    actions = [*ACTIONS, *PAID_ACTIONS]
+    if project_policy.verdict_is_delegated(project_policy.gate_policy_of(project)):
+        actions.append("delegate_clean_r0_r2_verdict")
+    return actions
+
+
 async def snapshot(db: aiosqlite.Connection, epic_id: int) -> PlanSnapshot:
     if epic_id != EPIC_ID:
         _refuse("pilot_not_found", 404)
@@ -187,7 +229,9 @@ async def snapshot(db: aiosqlite.Connection, epic_id: int) -> PlanSnapshot:
     if not rows:
         _refuse("pilot_not_found", 404)
     leaf_ceiling, wip_limit = _project_caps(project)
+    dispatch = _dispatch_authority()
     return PlanSnapshot(
+        schema_version="2" if dispatch else "1",
         epic_id=epic_id,
         project=PROJECT,
         owner_principal_id=await _owner(db),
@@ -196,7 +240,8 @@ async def snapshot(db: aiosqlite.Connection, epic_id: int) -> PlanSnapshot:
         project_leaf_ceiling_cents=leaf_ceiling,
         project_wip_limit=wip_limit,
         terms=TERMS,
-        allowed_actions=ACTIONS,
+        allowed_actions=_allowed_actions(project, dispatch),
+        dispatch_authority=dispatch,
         exceptions=EXCEPTIONS,
         nodes=[await _node(db, row, int(project["id"])) for row in rows],
     )
@@ -253,6 +298,18 @@ def _decision(row: aiosqlite.Row, current: str) -> PlanDecision:
     )
 
 
+async def _dispatch_blocker(
+    db: aiosqlite.Connection, current: PlanSnapshot, decision: PlanDecision | None
+) -> str:
+    if current.dispatch_authority is None:
+        return "pilot_spending_authority_unavailable"
+    if decision is None or decision.state != "active":
+        return "pilot_dispatch_signature_required"
+    from hub.services.epic_plan_dispatch import preflight
+
+    return await preflight(db)
+
+
 async def read_plan(
     db: aiosqlite.Connection,
     epic_id: int,
@@ -274,6 +331,7 @@ async def read_plan(
             else "plan_not_approved"
         ),
         can_decide=can_decide(identity, current.owner_principal_id),
+        dispatch_blocker=await _dispatch_blocker(db, current, decision),
         decision=decision,
     )
 
@@ -444,13 +502,10 @@ async def _pilot_start_blocker(
     if task_id not in LEAVES:
         return {"reason": "plan_task_excluded", "task_id": task_id}
     try:
-        current = await snapshot(db, EPIC_ID)
+        decision = await active_decision(db)
     except PlanRefusal as exc:
         return {"reason": exc.reason, "task_id": task_id}
-    row = await _decision_row(db, EPIC_ID)
-    reason = _admission_reason(current, row)
-    if reason:
-        return {"reason": reason, "task_id": task_id}
+    current = decision.snapshot
     blockers = await _dependency_blockers(db, task_id)
     if blockers:
         return {
@@ -471,13 +526,19 @@ async def _pilot_start_blocker(
     return None
 
 
-def _admission_reason(current: PlanSnapshot, row: aiosqlite.Row | None) -> str:
+async def active_decision(db: aiosqlite.Connection) -> PlanDecision:
+    """Prove the signed plan is still current independently of queue and WIP."""
+    current = await snapshot(db, EPIC_ID)
     if current.owner_principal_id is None:
-        return "owner_unassigned"
+        _refuse("owner_unassigned")
+    row = await _decision_row(db, EPIC_ID)
     if row is None:
-        return "plan_not_approved"
-    state, reason = _decision_state(row, _version(current), _now())
-    return "" if state == "active" else reason
+        _refuse("plan_not_approved")
+    version = _version(current)
+    state, reason = _decision_state(row, version, _now())
+    if state != "active":
+        _refuse(reason)
+    return _decision(row, version)
 
 
 async def _dependency_blockers(

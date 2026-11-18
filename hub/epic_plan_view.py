@@ -35,8 +35,16 @@ class PlanNode(BaseModel):
     leaf: bool
 
 
+class PlanDispatchAuthority(BaseModel):
+    host: str
+    executor_model: str
+    issuer_principal_id: int
+    budget_source_fingerprint: str
+    conditions: list[str]
+
+
 class PlanSnapshot(BaseModel):
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["1", "2"] = "1"
     epic_id: int
     project: str
     owner_principal_id: int | None
@@ -47,6 +55,7 @@ class PlanSnapshot(BaseModel):
     terms: PlanTerms
     allowed_actions: list[str]
     exceptions: list[str]
+    dispatch_authority: PlanDispatchAuthority | None = None
     nodes: list[PlanNode]
 
 
@@ -68,6 +77,7 @@ class PlanView(BaseModel):
     state: PlanState
     reason: str
     can_decide: bool
+    dispatch_blocker: str = ""
     decision: PlanDecision | None
 
 

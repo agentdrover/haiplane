@@ -222,6 +222,10 @@ async def redeem_for_host(
     order = await orders._own_order(db, host, order_id)
     if order is None or not hmac.compare_digest(str(order["code_hash"]), code_hash):
         raise _refuse(403, REASON_UNAVAILABLE, "заказ недоступен для этого кода")
+    from hub.services.epic_plan_gates import by_order_refusal
+
+    if reason := await by_order_refusal(db, order_id):
+        raise _refuse(409, reason, "допуск пилота больше не действует")
     if not order["first_redeemed_at"]:
         if order["state"] not in orders._UNREDEEMED:
             raise _refuse(409, REASON_EXPIRED, "повтор невозможен: окно не открыто")
