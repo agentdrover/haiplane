@@ -84,9 +84,12 @@ def can_decide(identity: config.TokenIdentity, principal_id: int | None) -> bool
 
 
 class PlanRefusal(HTTPException):
-    def __init__(self, reason: str, status: int = 409, details: dict | None = None):
+    def __init__(
+        self, reason: str, status: int = 409, details: dict[str, Any] | None = None
+    ):
         self.reason = reason
-        super().__init__(status, detail=details or {"reason": reason})
+        self.details = details or {"reason": reason}
+        super().__init__(status, detail=self.details)
 
 
 def _refuse(reason: str, status: int = 409) -> NoReturn:
@@ -451,7 +454,11 @@ async def _pilot_start_blocker(
     blockers = await _dependency_blockers(db, task_id)
     if blockers:
         return {
-            "reason": "dependency_undelivered",
+            "reason": (
+                "dependency_delivery_unknown"
+                if any(blocker["delivered"] is None for blocker in blockers)
+                else "dependency_undelivered"
+            ),
             "task_id": task_id,
             "blockers": blockers,
         }
@@ -473,10 +480,35 @@ def _admission_reason(current: PlanSnapshot, row: aiosqlite.Row | None) -> str:
     return "" if state == "active" else reason
 
 
-async def _dependency_blockers(db: aiosqlite.Connection, task_id: int) -> list[int]:
+async def _dependency_blockers(
+    db: aiosqlite.Connection, task_id: int
+) -> list[dict[str, Any]]:
     dependencies = await repo.list_task_dependencies(db, task_id)
     blockers = await with_cached_delivery(db, dependencies["blocked_by"])
-    return [int(row["task_id"]) for row in blockers if row.get("delivered") is not True]
+    return [
+        {
+            "task_id": int(row["task_id"]),
+            "delivered": row["delivered"],
+            "reason": row.get("reason") or "",
+        }
+        for row in blockers
+        if row["delivered"] is not True
+    ]
+
+
+def format_start_blocker(blocker: dict[str, Any]) -> str:
+    """Keep the reason code and delivery evidence on text-only launch surfaces."""
+    reason = blocker["reason"]
+    dependencies = blocker.get("blockers", [])
+    if not dependencies:
+        return reason
+    details = ", ".join(
+        f"#{dependency['task_id']} ({dependency['reason']})"
+        if dependency["reason"]
+        else f"#{dependency['task_id']}"
+        for dependency in dependencies
+    )
+    return f"{reason}: {details}"
 
 
 async def refuse_legacy_start(db: aiosqlite.Connection, task_id: int) -> None:

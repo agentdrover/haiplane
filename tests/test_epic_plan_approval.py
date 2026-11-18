@@ -8,6 +8,8 @@ import pytest
 from hub import config, repository as repo
 from hub.db import fetchall
 from hub.services import admin, epic_plan, epic_plan_admission, orchestrator_queue
+from tests.executor_slot_support import seed_slot_skills
+from tests.test_executor_orders import keys  # noqa: F401 - slot host key fixture
 
 PLAN = "/api/tasks/2373/epic-plan"
 
@@ -227,15 +229,83 @@ async def test_revised_work_requires_new_decision(
     assert len(await fetchall(db, "SELECT id FROM epic_plan_decisions")) == 1
 
 
+async def test_dependency_delivery_unknown_is_preserved(client, db, pilot):
+    pid, _ = pilot
+    await repo.update_task(db, 2380, dor_passed=True)
+    await db.commit()
+    headers, _ = await _approved(client, pilot)
+    cause = "Реестр недоступен для проверки доставки"
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=2378,
+        state="unknown",
+        reason=cause,
+        pr_number=24,
+        delivery_path="unknown",
+    )
+
+    expected = {
+        "reason": "dependency_delivery_unknown",
+        "task_id": 2380,
+        "blockers": [{"task_id": 2378, "delivered": None, "reason": cause}],
+    }
+    start = await client.post(
+        "/api/tasks/2380/start", headers=headers, json={"plan": "not funded"}
+    )
+    assert start.status_code == 409, start.text
+    assert start.json()["detail"] == expected
+    queue = await orchestrator_queue.next_task(db, await repo.get_project(db, pid))
+    skip = next(row for row in queue["skipped"] if row["task_id"] == 2380)
+    assert {key: skip[key] for key in expected} == expected
+    assert cause in skip["detail"]
+    assert await orchestrator_queue.announce_once(db, queue)
+    assert (await repo.get_task(db, 2380))["status"] == "open"
+
+
+async def test_slot_launch_reports_pilot_gate_for_open_task(
+    client,
+    db,
+    pilot,
+    keys,  # noqa: F811 - imported pytest fixture
+):
+    pid, actors = pilot
+    _, headers = actors["plan-owner"]
+    await seed_slot_skills(db)
+    await repo.update_project(
+        db, pid, gate_policy=json.dumps({"executor_launch": "manual"})
+    )
+    await db.commit()
+    host = await client.post(
+        "/api/admin/executor-hosts",
+        json={"name": "k8", "public_key_pem": keys.k8.public_pem},
+        headers=headers,
+    )
+    assert host.status_code == 200, host.text
+
+    result = await client.post(
+        f"/api/projects/{epic_plan.PROJECT}/executor-launch",
+        headers=headers,
+        json={"target": "slot:k8", "task_id": 2380},
+    )
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"] == {"reason": "plan_not_approved", "task_id": 2380}
+    assert (await repo.get_task(db, 2380))["status"] == "open"
+    assert not await fetchall(db, "SELECT id FROM executor_runs WHERE task_id=2380")
+    assert not await fetchall(db, "SELECT id FROM executor_orders WHERE task_id=2380")
+    assert not await fetchall(
+        db, "SELECT id FROM chat_pair_codes WHERE bound_task_id=2380"
+    )
+
+
 async def test_revoke_or_undelivered_dependency_blocks_start(client, db, pilot):
     pid, _ = pilot
     headers, approved = await _approved(client, pilot)
     reason = await epic_plan.start_blocker(db, 2380)
-    assert reason == {
-        "reason": "dependency_undelivered",
-        "task_id": 2380,
-        "blockers": [2378],
-    }
+    assert reason["reason"] == "dependency_undelivered"
+    assert reason["task_id"] == 2380
+    assert [(row["task_id"], row["delivered"]) for row in reason["blockers"]] == [
+        (2378, False)
+    ]
     skip = await orchestrator_queue._skip_reason(db, {"id": 2380}, [])
     assert skip["reason"] == "dependency_undelivered"
     assert (await epic_plan.start_blocker(db, 2374))["reason"] == "plan_task_excluded"

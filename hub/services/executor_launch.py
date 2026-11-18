@@ -588,12 +588,12 @@ async def _reserve(
         if row is None:
             return _refused(f"{REASON_NO_CANDIDATE}: #{task_id} не найдена", task_id)
         task = dict(row)
-        from hub.services.epic_plan import PlanRefusal, refuse_legacy_start
+        from hub.services import epic_plan
 
         try:
-            await refuse_legacy_start(db, task_id)
-        except PlanRefusal as exc:
-            return _refused(exc.reason, task_id)
+            await epic_plan.refuse_legacy_start(db, task_id)
+        except epic_plan.PlanRefusal as exc:
+            return _refused(epic_plan.format_start_blocker(exc.details), task_id)
         if automation_not_applicable(task):
             return _refused(f"{REASON_STATE_TASK}: #{task_id}", task_id)
         # #1443 (F5.1): суммарный бюджет задачи — под той же транзакцией, что
