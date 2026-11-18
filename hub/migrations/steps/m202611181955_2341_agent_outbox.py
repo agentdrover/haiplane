@@ -120,15 +120,6 @@ MIGRATIONS = [
         END""",
     ),
     (
-        "agent_outbox_invalidate_private_2341",
-        """CREATE TRIGGER IF NOT EXISTS agent_outbox_invalidate_private
-        AFTER INSERT ON private_project_security
-        BEGIN
-            UPDATE agent_outbox SET invalidated_reason='project_unavailable'
-            WHERE project_id=NEW.project_id AND kind='question' AND invalidated_reason='';
-        END""",
-    ),
-    (
         "agent_outbox_invalidate_task_binding_2341",
         """CREATE TRIGGER IF NOT EXISTS agent_outbox_invalidate_task_binding
         AFTER UPDATE OF project_id, parent_id ON tasks
