@@ -1072,11 +1072,11 @@ class GitHubForge:
     ) -> CIProbeResult:
         if (gh_repo or REPO_NAME).lower() == github_ci_selection.PILOT_REPO:
 
-            async def get(endpoint: str) -> tuple[Any, bool]:
+            async def fetch_ci_evidence(endpoint: str) -> tuple[Any, bool]:
                 return await self._api_json(endpoint, repo=repo)
 
             result = await github_ci_selection.equivalent_probe(
-                get, pr_number, contract_fingerprint
+                fetch_ci_evidence, pr_number, contract_fingerprint
             )
             if result is not None:
                 return result

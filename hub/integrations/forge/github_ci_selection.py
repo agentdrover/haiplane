@@ -451,13 +451,21 @@ async def _equivalent(
     )
 
 
+def _blocking_run(runs: list[Facts]) -> CIProbeResult | None:
+    for run in runs:
+        result = verdict(run, label(run))
+        if result.outcome != CIProbeOutcome.passed:
+            return result
+    return None
+
+
 def _select(
     runs: list[Facts], ref: str, sha: str, pr: int
 ) -> tuple[Facts, Facts] | CIProbeResult | None:
     index(runs, "id")
     dispatches = [run for run in runs if run.get("event") == "workflow_dispatch"]
     if not dispatches:
-        return None
+        return _blocking_run(runs)
     manual = [run for run in dispatches if canonical(run, ref, sha)]
     if not manual:
         raise Unverified("no dispatch matches the audited CI workflow and PR identity")
@@ -481,12 +489,9 @@ def _select(
         )
     green = [run for run in prior if run.get("conclusion") == "success"]
     old = billing[0] if billing else max(green, key=lambda run: run["id"], default=None)
-    for run in runs:
-        if run is old or run is new:
-            continue
-        result = verdict(run, label(run))
-        if result.outcome != CIProbeOutcome.passed:
-            return result
+    remainder = [run for run in runs if run is not old and run is not new]
+    if blocked := _blocking_run(remainder):
+        return blocked
     if old is None:
         raise Unverified("no matching older PR suite")
     return old, new

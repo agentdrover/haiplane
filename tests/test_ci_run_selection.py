@@ -360,6 +360,27 @@ async def test_unknown_pilot_contract_cannot_accept_dispatch_from_legacy_checks(
     assert result.details and "contract" in result.details
 
 
+@pytest.mark.parametrize(
+    "status,conclusion,expected",
+    [
+        ("in_progress", None, CIProbeOutcome.pending),
+        ("completed", "failure", CIProbeOutcome.failed),
+        ("completed", "unknown", CIProbeOutcome.unavailable),
+    ],
+)
+async def test_retry_without_dispatch_blocks_stale_green_rollup(
+    monkeypatch, status, conclusion, expected
+):
+    e = Evidence()
+    e.old.update(status=status, conclusion=conclusion, run_attempt=2)
+    e.runs = [e.old]
+    result = await e.probe(
+        monkeypatch, primary=(0, '[{"name":"tests","state":"SUCCESS"}]', "")
+    )
+    assert result.outcome is expected
+    assert result.details and f"{OLD}/2" in result.details
+
+
 async def test_ordinary_green_pr_uses_legacy_checks_and_real_runs_fallback(monkeypatch):
     e = Evidence()
     e.old["conclusion"] = "success"
