@@ -3298,10 +3298,17 @@ class GitOpsIntegration(
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        contract_fingerprint: str = "",
     ) -> CIProbeResult:
-        return await self._forge_for(forge).check_pr_ci(
-            pr_number, repo=repo, gh_repo=gh_repo
-        )
+        adapter = self._forge_for(forge)
+        if contract_fingerprint:
+            return await adapter.check_pr_ci(
+                pr_number,
+                repo=repo,
+                gh_repo=gh_repo,
+                contract_fingerprint=contract_fingerprint,
+            )
+        return await adapter.check_pr_ci(pr_number, repo=repo, gh_repo=gh_repo)
 
     async def request_ci_run(
         self,

@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
+from hub.services import delivery_ci
 from hub.services import ci_head_run, delivery_notes, delivery_writes, watch_notices
 from hub.services import (
     critic_orders,
@@ -645,14 +646,7 @@ async def _deliver_approved_review(db, task: dict) -> None:
     merged = False
     if pr_num:
         mctx = await services.project_git_context(db, task["id"])
-        mworkspace = mctx.get("repo")
-        mgh_repo = mctx.get("gh_repo")
-        ci = await plugins.git_ops.check_pr_ci(
-            pr_num,
-            repo=mworkspace,
-            gh_repo=mgh_repo,
-            forge=mctx.get("forge", ""),
-        )
+        ci = await delivery_ci.check_task(db, task["id"], pr_num, mctx)
         if await services.headless_rerun(db, task, mctx, pr_num):  # #1956
             return  # a rerun booking: any probe outcome (wait / deadline / owner)
         if ci.outcome == CIProbeOutcome.passed:
@@ -958,12 +952,7 @@ async def _sweep_ci_check(db) -> None:
                     int(CI_GRACE_PERIOD - elapsed),
                 )
                 continue
-            ci = await plugins.git_ops.check_pr_ci(
-                task["pr_number"],
-                repo=workspace,
-                gh_repo=ctx.get("gh_repo"),
-                forge=ctx.get("forge", ""),
-            )
+            ci = await delivery_ci.check_task(db, task["id"], task["pr_number"], ctx)
             if ci.outcome == CIProbeOutcome.pending:
                 continue
             if ci.outcome == CIProbeOutcome.unavailable:
