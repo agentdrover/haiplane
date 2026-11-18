@@ -2,7 +2,8 @@
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from hub.auth import current_identity
+from hub.auth import CSRF_HEADER_NAME, current_identity
+from hub.csrf import request_session_token_ok
 from hub.epic_plan_view import PlanConfirm, PlanDecision, PlanTerminate, PlanView
 from hub.services import epic_plan
 
@@ -25,6 +26,16 @@ def check_reader(request: Request, epic_id: int):
     return identity
 
 
+def require_signed_browser_request(
+    request: Request, presented: str | None = None
+) -> None:
+    identity = current_identity(request)
+    if identity.auth_source == "db_session" and not request_session_token_ok(
+        request, presented or request.headers.get(CSRF_HEADER_NAME)
+    ):
+        raise HTTPException(403, detail={"reason": "plan_csrf_required"})
+
+
 @router.get("/api/tasks/{epic_id}/epic-plan")
 async def api_epic_plan(epic_id: int, request: Request, response: Response) -> PlanView:
     response.headers["Cache-Control"] = "no-store"
@@ -37,6 +48,7 @@ async def api_epic_plan(epic_id: int, request: Request, response: Response) -> P
 async def api_approve_plan(
     epic_id: int, request: Request, body: PlanConfirm
 ) -> PlanDecision:
+    require_signed_browser_request(request)
     return await epic_plan.approve(
         _db(request), epic_id, body.version, check_reader(request, epic_id)
     )
@@ -46,6 +58,7 @@ async def api_approve_plan(
 async def api_terminate_plan(
     epic_id: int, request: Request, body: PlanTerminate
 ) -> PlanDecision:
+    require_signed_browser_request(request)
     return await epic_plan.terminate(
         _db(request), epic_id, body, check_reader(request, epic_id)
     )

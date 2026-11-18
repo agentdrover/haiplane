@@ -379,7 +379,7 @@ async def test_owner_browser_form_requires_csrf_and_signs_read_version(
     owner_id, _ = actors["plan-owner"]
     session = await admin.create_browser_session(db, owner_id)
     client.cookies.set(brand.COOKIE_NAME, session)
-    monkeypatch.setattr(config, "CSRF_MODE", "require")
+    monkeypatch.setattr(config, "CSRF_MODE", "warn")
     monkeypatch.setenv("HAIPLANE_HUB_URL", str(client.base_url).rstrip("/"))
     url = "/tasks/2373/epic-plan"
     view = await client.get(url)
@@ -389,6 +389,10 @@ async def test_owner_browser_form_requires_csrf_and_signs_read_version(
     assert version and token
     form = {"action": "approve", "version": version[1]}
     origin = {"Origin": str(client.base_url).rstrip("/")}
+    forged_api = await client.post(
+        PLAN + "/approve", json={"version": version[1]}, headers=origin
+    )
+    assert forged_api.status_code == 403
     forged = await client.post(url, data=form, headers=origin)
     assert forged.status_code == 403
     confirmed = await client.post(

@@ -5,7 +5,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
-from hub.epic_plan_api import check_reader, _db
+from hub.auth import CSRF_FIELD_NAME
+from hub.epic_plan_api import check_reader, require_signed_browser_request, _db
 from hub.epic_plan_view import PlanConfirm, PlanTerminate
 from hub.services import epic_plan
 
@@ -26,6 +27,10 @@ def include_plan_page(router: APIRouter, templates: Jinja2Templates) -> None:
     async def decide_epic_plan(epic_id: int, request: Request):
         identity = check_reader(request, epic_id)
         form = await request.form()
+        token = form.get(CSRF_FIELD_NAME)
+        require_signed_browser_request(
+            request, token if isinstance(token, str) else None
+        )
         try:
             confirm = PlanConfirm.model_validate({"version": form.get("version")})
             action = form.get("action")
