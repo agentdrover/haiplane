@@ -43,6 +43,7 @@ from hub.auth import (
     verify_csrf,
 )
 from hub.csrf import CSRF_FIELD_NAME
+from hub.services import agent_outbox
 from hub.hub_instance import hub_base_url
 from hub.csrf import token_for_request as csrf_token_for_request
 from hub.integrations.registry import plugins
@@ -2952,6 +2953,12 @@ async def _web_task_detail_page(
             db, task_id, exclude_roles=not current_identity(request).is_human
         )
     ]
+    identity = current_identity(request)
+    outbox_questions = (
+        await agent_outbox.answerable_messages(db, task_id, identity.principal_id)
+        if identity.is_human and identity.principal_id is not None
+        else set()
+    )
     pr_repo, delivered_sha, live_checks = await _card_live_checks(db, task_id)
 
     c2_view = await card_c2.card_context(
@@ -2963,6 +2970,7 @@ async def _web_task_detail_page(
             "task": task,
             "pr_repo": pr_repo,
             "task_messages": task_messages,
+            "outbox_questions": outbox_questions,
             "live_checks": live_checks,
             "delivered_sha": delivered_sha,
             "delivery": delivery,
@@ -3351,6 +3359,7 @@ async def web_send_message(
     to_kind: str = Form("task"),
     to_ref: str = Form(""),
     kind: str = Form("note"),
+    outbox_message_id: str = Form(""),
 ):
     """The owner writes into the same channel the agents use (#775).
 
@@ -3360,19 +3369,37 @@ async def web_send_message(
     """
     _require_human_web(request)
     identity = current_identity(request)
-    payload = MessageSend(
-        to_kind=to_kind or "task",
-        to_ref=(to_ref or str(task_id)),
-        body=body,
-        kind=kind or "note",
-        related_task_id=task_id,
-    )
-    await services.send_message(
-        _db(request),
-        payload,
-        agent=identity.username,
-        principal_id=identity.principal_id,
-    )
+    if outbox_message_id:
+        if (
+            not outbox_message_id.isascii()
+            or not outbox_message_id.isdecimal()
+            or len(outbox_message_id) > 18
+        ):
+            agent_outbox.refuse(422, "outbox_invalid_request")
+        if identity.principal_id is None:
+            agent_outbox.refuse(403, "outbox_owner_required")
+        await agent_outbox.answer(
+            _db(request),
+            task_id,
+            int(outbox_message_id),
+            identity.principal_id,
+            identity.username,
+            body,
+        )
+    else:
+        payload = MessageSend(
+            to_kind=to_kind or "task",
+            to_ref=(to_ref or str(task_id)),
+            body=body,
+            kind=kind or "note",
+            related_task_id=task_id,
+        )
+        await services.send_message(
+            _db(request),
+            payload,
+            agent=identity.username,
+            principal_id=identity.principal_id,
+        )
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
