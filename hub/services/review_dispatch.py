@@ -4256,7 +4256,6 @@ async def _create_or_adopt(
     reviewer_token: str,
     model_params: list[cursor_cloud.ModelParam] | None = None,
     db: aiosqlite.Connection | None = None,
-    max_attempts: int = _LOST_ANSWER_ATTEMPTS,
 ) -> _Started:
     """Создать ревьюера, а если ответ не дошёл — спросить, не создан ли он.
 
@@ -4336,7 +4335,7 @@ async def _create_or_adopt(
         # Сверка прошла и агента нет — вызов действительно не состоялся,
         # повторить его безопасно. Потолок обязателен: семнадцать минут
         # одной и той же неудачи уже наблюдались на #1175.
-        if attempts >= max_attempts:
+        if attempts >= _LOST_ANSWER_ATTEMPTS:
             break
         attempts += 1
         agent_id, run_id, refusal = await _attempt()
@@ -4528,47 +4527,71 @@ async def _start_paid_review(
     reviewer_token: str,
     principal_id: int | None,
 ) -> tuple[_Started, Any] | None:
-    from hub.services import epic_plan_gates
+    from hub.services import epic_plan_gates, epic_plan_transport
 
     task_id = int(task["id"])
     generation = int(task["submission_generation"] or 0)
-    model_id = order.model
     ordinal = await _attempt_ordinal(db, task_id, generation)
+    marker = cursor_cloud.agent_marker("review", task_id, generation, ordinal)
+    repo_url = forge_urls.repo_url(forge, gh_repo)
+    hub_url = f"{instance_base_url().rstrip('/')}/mcp"
+    if await epic_plan_gates.managed(db, task_id):
+        request = epic_plan_transport.ReviewRequest(
+            marker,
+            repo_url,
+            branch,
+            task["submission_sha"],
+            order.model,
+            order.prompt,
+            hub_url,
+        )
+        return await _launch_metered_review(db, task, request, principal_id, ordinal)
+    started = await _create_or_adopt(
+        marker,
+        task_id=task_id,
+        repo_url=repo_url,
+        starting_ref=branch,
+        model_id=order.model,
+        prompt_text=order.prompt,
+        hub_mcp_url=hub_url,
+        reviewer_token=reviewer_token,
+        model_params=await cursor_cloud.review_params_for(order.model),
+        db=db,
+    )
+    return started, None
+
+
+async def _launch_metered_review(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    request: Any,
+    principal_id: int | None,
+    ordinal: int,
+) -> tuple[_Started, Any] | None:
+    from hub.services import epic_plan_gates, epic_plan_transport
+
+    backend = epic_plan_transport.review_transport()
+    if backend is None:
+        return None
     ready, permit = await epic_plan_gates.reserve_review(
         db,
         task,
         channel="cloud",
-        model=model_id,
+        model=request.model,
         principal_id=principal_id,
         attempt=ordinal,
     )
-    if not ready:
+    if not ready or permit is None:
         return None
-    marker = cursor_cloud.agent_marker("review", task_id, generation, ordinal)
-    if permit is not None and permit.reconcile:
-        seen = await cursor_cloud.find_agent_by_name(marker)
+    if permit.reconcile:
+        seen = await backend.lookup(request, permit.grant)
         if not seen.asked:
             return None
         if seen.agent_id:
             return _Started(seen.agent_id, seen.run_id, True, False, 0, None), permit
-    prompt = await epic_plan_gates.with_reservation_prompt(db, permit, order.prompt)
-    params = await cursor_cloud.review_params_for(model_id)
     if not await epic_plan_gates.ready_to_send(db, permit):
         return None
-    started = await _create_or_adopt(
-        marker,
-        task_id=task_id,
-        repo_url=forge_urls.repo_url(forge, gh_repo),
-        starting_ref=branch,
-        model_id=model_id,
-        prompt_text=prompt,
-        hub_mcp_url=f"{instance_base_url().rstrip('/')}/mcp",
-        reviewer_token=reviewer_token,
-        model_params=params,
-        db=db,
-        max_attempts=1 if permit is not None else _LOST_ANSWER_ATTEMPTS,
-    )
-    return started, permit
+    return await backend.launch(request, permit.grant), permit
 
 
 async def _release_pilot_review_refusal(
@@ -5357,6 +5380,14 @@ async def dispatch_local_review(
     if automation_not_applicable(task):
         # #1647: свой затвор у второй двери — её зовут и мимо maybe_dispatch_review.
         return False
+    from hub.services.epic_plan_gates import managed
+
+    if await managed(db, task_id):
+        if local_first:
+            raise _LocalFirstDeclined(
+                "Локальный ревьюер не поддерживает ограничение расходов пилота."
+            )
+        return False
     reach = await review_reach(db, forge)
     principal_id = await local_reviewer_principal_id(db)
     if LOCAL_CHANNEL not in reach.ways or principal_id is None:
@@ -5415,34 +5446,17 @@ async def dispatch_local_review(
         await _dispatch_report(db, task_id, generation, late_report_recheck) is not None
     ):
         return False
-    from hub.services import epic_plan_gates
-
-    ready, permit = await epic_plan_gates.reserve_review(
-        db,
-        task,
-        channel="local",
-        model=order.model,
-        principal_id=principal_id,
-        attempt=await _attempt_ordinal(db, task_id, generation),
-    )
-    if not ready or (permit is not None and permit.reconcile):
-        return False
-    if not await epic_plan_gates.ready_to_send(db, permit):
-        return False
     dispatch_id, run_id = await _insert_local_dispatch(
         db, task, order, why, principal_id, generation, late_report_recheck, second_door
     )
     if dispatch_id is None:
         return False
-    await epic_plan_gates.attach_dispatch(db, permit, dispatch_id)
-    if permit is not None:
-        await db.commit()
     await _start_local_run(
         db,
         dispatch_id,
         task_id,
         generation,
-        await epic_plan_gates.with_reservation_prompt(db, permit, order.prompt),
+        order.prompt,
         order.access_code,
         principal_id,
         order.snapshot,

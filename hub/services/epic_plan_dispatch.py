@@ -17,6 +17,7 @@ from hub.services import (
     chat_pair,
     epic_plan,
     epic_plan_spend as spend,
+    epic_plan_transport as transport,
     executor_orders as orders,
     executor_skill_bundle as skills,
     orchestrator_queue,
@@ -74,6 +75,11 @@ async def preflight(db: aiosqlite.Connection) -> str:
         return "pilot_issuer_unavailable"
     if HOST not in await orders.enabled_host_names(db):
         return "pilot_host_unavailable"
+    if (
+        transport.executor_transport(HOST) is None
+        or transport.review_transport() is None
+    ):
+        return "pilot_metered_transport_unavailable"
     if not await checkpoint_available(db, int(project["id"])):
         return "pilot_checkpoint_unavailable"
     return ""
@@ -85,11 +91,9 @@ async def review_route_ready(
     from hub.integrations import cursor_cloud
     from hub.services import epic_plan_gates, review_dispatch
 
+    if transport.review_transport() is None:
+        return False
     routes = await review_dispatch.review_reach(db, project_policy.forge_of(project))
-    if "local" in routes.ways and await epic_plan_gates.independent_reviewer(
-        db, await review_dispatch.local_reviewer_principal_id(db), excluded
-    ):
-        return True
     return (
         "cloud" in routes.ways
         and cursor_cloud.is_configured()
@@ -249,6 +253,9 @@ async def _write_order(
     db: aiosqlite.Connection, grant: SpendingGrant
 ) -> tuple[int | None, str]:
     binding = grant.binding
+    backend = transport.executor_transport(binding.host)
+    if backend is None or transport.review_transport() is None:
+        return None, "pilot_metered_transport_unavailable"
     try:
         async with write_transaction(db):
             decision = await epic_plan.active_decision(db)
@@ -285,13 +292,7 @@ async def _write_order(
                 db, binding, causes, decision.snapshot.terms.fixes_same_cause
             ):
                 return None, "pilot_fixes_exhausted"
-            order_id, _ = await orders._issue_atomically(
-                db,
-                project,
-                booked,
-                issuer_principal_id=binding.principal_id,
-                pilot_reference=grant.reference,
-            )
+            order_id, _ = await backend.issue(db, project, booked, grant)
             await spend.record(
                 db,
                 grant,
@@ -322,6 +323,11 @@ async def start_next(db: aiosqlite.Connection) -> tuple[int | None, str]:
         return None, exc.reason
     if "launch_bounded_executor" not in decision.snapshot.allowed_actions:
         return None, "pilot_execution_not_authorized"
+    if (
+        transport.executor_transport(HOST) is None
+        or transport.review_transport() is None
+    ):
+        return None, "pilot_metered_transport_unavailable"
     project = await repo.get_project_by_slug(db, epic_plan.PROJECT)
     if project is None:
         return None, "pilot_project_moved"

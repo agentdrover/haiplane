@@ -427,6 +427,12 @@ async def close_order(
     кода ``redeemed_at`` уже стоит и строку DELETE не трогает, а у непотраченного
     после сдачи другим путём применения не остаётся.
     """
+    from hub.services.epic_plan_gates import by_order_refusal
+
+    if return_task and await by_order_refusal(
+        db, int(order["id"]), enforce_grant=False
+    ):
+        return_task = False
     # #1817: фактический исход на момент закрытия — до снятия захвата, который
     # уберёт держателя задачи: сдала ли задачу прогон ЭТОГО заказа. Сдача сильнее
     # любой иной причины (в том числе слова хоста failed до закрытия): причина
@@ -822,7 +828,7 @@ async def _issue_atomically(
     *,
     issuer_principal_id: int,
     issuer_human: bool = False,
-    pilot_reference: str = "",
+    pilot_start: tuple[str, str] | None = None,
 ) -> tuple[int, int]:
     """``_issue`` под SAVEPOINT: сбой откатывает ЕГО записи, а не только свои.
 
@@ -844,7 +850,7 @@ async def _issue_atomically(
             booked,
             issuer_principal_id=issuer_principal_id,
             issuer_human=issuer_human,
-            pilot_reference=pilot_reference,
+            pilot_start=pilot_start,
         )
     except BaseException:
         await db.execute("ROLLBACK TO executor_slot_issue")
@@ -882,22 +888,24 @@ async def _issue(
     *,
     issuer_principal_id: int,
     issuer_human: bool = False,
-    pilot_reference: str = "",
+    pilot_start: tuple[str, str] | None = None,
 ) -> tuple[int, int]:
     """Прогон, код, шифротекст и заказ — без commit; (id заказа, id прогона)."""
     task, host = booked.task, booked.host
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0) + 1
     text, starting_ref = await _order_text(db, project, task, booked.bundle)
-    if pilot_reference:
-        text = f"Разрешение контроллера расходов пилота: {pilot_reference}.\n\n{text}"
+    if pilot_start is not None:
+        starting_ref, model = pilot_start
+    else:
+        model = ""
     row_id = await repo.create_executor_run(
         db,
         task_id=task_id,
         submission_generation=generation,
         agent_id="",
         run_id="",
-        model="",
+        model=model,
         channel="slot",
         slot=host["name"],
         launched_by=issuer_principal_id,
@@ -956,7 +964,9 @@ async def _issue(
         host=host["name"],
     )
     source = (
-        "по действующему плану пилота" if pilot_reference else "по нажатию человека"
+        "по действующему плану пилота"
+        if pilot_start is not None
+        else "по нажатию человека"
     )
     await repo.add_task_update(
         db,
@@ -1406,7 +1416,10 @@ async def report_outcome(
                     f"итог по заказу уже записан: {order['report_outcome']}",
                 )
             return {"id": order["id"], "outcome": outcome, "duplicate": True}
-        if outcome in ("failed", "rescued"):
+        from hub.services.epic_plan_gates import by_order_refusal
+
+        plan_stopped = await by_order_refusal(db, order_id, enforce_grant=False)
+        if not plan_stopped and outcome in ("failed", "rescued"):
             # #1942: граница включения разбора закрепляется ДО закрытия заказа и вне
             # SAVEPOINT рекомендации: откат разбора её не уносит, а закрытие этого
             # заказа не может оказаться «историей» из-за ленивого создания.
@@ -1423,6 +1436,8 @@ async def report_outcome(
             "WHERE id = ? AND report_outcome = ''",
             (outcome, sha, branch, note, reason_code, reason, order["id"]),
         )
+        if plan_stopped:
+            return {"id": order["id"], "outcome": outcome, "duplicate": False}
         text = _report_text(
             order, host, outcome, sha, branch, note, reason_code, reason
         )

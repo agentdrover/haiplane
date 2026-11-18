@@ -20,6 +20,7 @@ from hub.services import (
     epic_plan,
     epic_plan_authority as authority,
     epic_plan_spend as spend,
+    epic_plan_transport as transport,
     project_policy,
     verdict_owner,
 )
@@ -43,7 +44,9 @@ async def managed(db: aiosqlite.Connection, task_id: int) -> bool:
     return task_id in epic_plan.LEAVES and await epic_plan._under_pilot(db, task_id)
 
 
-async def by_order_refusal(db: aiosqlite.Connection, order_id: int) -> str:
+async def by_order_refusal(
+    db: aiosqlite.Connection, order_id: int, *, enforce_grant: bool = True
+) -> str:
     work = await _one(
         db,
         "SELECT plan_version,grant_expires_at,charged_cents FROM epic_plan_work WHERE executor_order_id=?",
@@ -57,6 +60,8 @@ async def by_order_refusal(db: aiosqlite.Connection, order_id: int) -> str:
         return exc.reason
     if current.version != work["plan_version"]:
         return "plan_version_moved"
+    if not enforce_grant:
+        return ""
     if datetime.fromisoformat(work["grant_expires_at"]) <= datetime.now(UTC):
         return "spending_grant_expired"
     if work["charged_cents"] is not None:
@@ -92,6 +97,8 @@ async def _trusted_ci(db: aiosqlite.Connection, task: Any) -> bool:
 async def can_prepare_review(db: aiosqlite.Connection, task: Any) -> bool:
     if not await managed(db, int(task["id"])):
         return True
+    if transport.review_transport() is None:
+        return False
     _, _, reason = await _scope(db, task)
     return (
         not reason
@@ -115,7 +122,22 @@ async def independent_reviewer(
 @dataclass(frozen=True)
 class ReviewPermit:
     id: int
+    grant: authority.SpendingGrant
     reconcile: bool = False
+
+
+async def _reviewer_still_independent(
+    db: aiosqlite.Connection, decision: PlanDecision, work: Any, reviewer: int
+) -> bool:
+    acting = await chat_pair.get_acting_agent(db)
+    excluded = {
+        work["principal_id"],
+        work["actor_principal_id"],
+        decision.approved_principal_id,
+    }
+    if acting is not None:
+        excluded.add(int(acting["id"]))
+    return await independent_reviewer(db, reviewer, excluded)
 
 
 async def reserve_review(
@@ -130,19 +152,13 @@ async def reserve_review(
     """Reserve cap for one identifiable provider attempt, even across restart."""
     if not await managed(db, int(task["id"])):
         return True, None
+    if channel != "cloud" or transport.review_transport() is None:
+        return False, None
     decision, work, reason = await _scope(db, task)
     if decision is None or reason or not await can_prepare_review(db, task):
         return False, None
-    acting = await chat_pair.get_acting_agent(db)
-    excluded = {
-        work["principal_id"],
-        work["actor_principal_id"],
-        decision.approved_principal_id,
-    }
-    if acting is not None:
-        excluded.add(int(acting["id"]))
-    if principal_id is None or not await independent_reviewer(
-        db, principal_id, excluded
+    if principal_id is None or not await _reviewer_still_independent(
+        db, decision, work, principal_id
     ):
         return False, None
     if not 1 <= attempt <= decision.snapshot.terms.technical_retries + 1:
@@ -184,8 +200,17 @@ async def _write_review_reservation(
             or task["submission_generation"] != binding.generation
         ):
             return False, None
-        decision, _, reason = await _scope(db, task)
-        if decision is None or reason or not await _trusted_ci(db, task):
+        decision, work, reason = await _scope(db, task)
+        if (
+            decision is None
+            or reason
+            or task["risk_class"] not in {"R0", "R1", "R2"}
+            or not await _trusted_ci(db, task)
+            or await _steward_stop(db, task)
+            or not await _reviewer_still_independent(
+                db, decision, work, binding.principal_id
+            )
+        ):
             return False, None
         previous = await _one(
             db,
@@ -198,10 +223,11 @@ async def _write_review_reservation(
                 same = (
                     previous["review_dispatch_id"] is None
                     and previous["authority_ref"] == grant.reference
+                    and previous["ceiling_cents"] == grant.ceiling_cents
                     and spend.binding_of(previous) == binding
                 )
                 return (
-                    (True, ReviewPermit(previous["id"], reconcile=True))
+                    (True, ReviewPermit(previous["id"], grant, reconcile=True))
                     if same
                     else (False, None)
                 )
@@ -215,7 +241,7 @@ async def _write_review_reservation(
 
             await epic_plan_escalation.maybe_notify(db, decision, task, refusal)
             return False, None
-        return True, ReviewPermit(await spend.record(db, grant))
+        return True, ReviewPermit(await spend.record(db, grant), grant)
 
 
 async def attach_dispatch(
@@ -290,21 +316,6 @@ async def approval_refusal(
     return ""
 
 
-async def with_reservation_prompt(
-    db: aiosqlite.Connection, reservation: ReviewPermit | None, prompt: str
-) -> str:
-    if reservation is None:
-        return prompt
-    row = await _one(
-        db, "SELECT authority_ref FROM epic_plan_work WHERE id=?", (reservation.id,)
-    )
-    if row is None:
-        raise RuntimeError("missing review budget reservation")
-    return (
-        f"Разрешение контроллера расходов пилота: {row['authority_ref']}.\n\n{prompt}"
-    )
-
-
 async def ready_to_send(
     db: aiosqlite.Connection, reservation: ReviewPermit | None
 ) -> bool:
@@ -328,10 +339,18 @@ async def ready_to_send(
             or task["submission_sha"] != row["sha"]
         ):
             return False
-        decision, _, reason = await _scope(db, task)
-        if decision is None or reason or decision.version != row["plan_version"]:
-            return False
-        if not await _trusted_ci(db, task):
+        decision, work, reason = await _scope(db, task)
+        if (
+            decision is None
+            or reason
+            or decision.version != row["plan_version"]
+            or task["risk_class"] not in {"R0", "R1", "R2"}
+            or not await _trusted_ci(db, task)
+            or await _steward_stop(db, task)
+            or not await _reviewer_still_independent(
+                db, decision, work, row["principal_id"]
+            )
+        ):
             return False
         if reservation.reconcile:
             attempt = await db.execute(

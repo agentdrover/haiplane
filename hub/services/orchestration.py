@@ -4211,6 +4211,23 @@ async def approval_stands(db: aiosqlite.Connection, task: dict[str, Any]) -> boo
     return row is not None and _approval_holds(dict(row), task)
 
 
+async def _merge_approval_row(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[Any, str]:
+    from hub.services import epic_plan, epic_plan_gates
+
+    if task_id not in epic_plan.LEAVES:
+        return await repo.get_task(db, task_id), ""
+    # Serialize the last plan authorization with the owner's revoke/stop write.
+    # The caller uses this same task row to claim the merge, without rereading
+    # it across a separate await that would lose the plan authorization.
+    async with write_transaction(db):
+        row = await repo.get_task(db, task_id)
+        if row is None:
+            return None, ""
+        return row, await epic_plan_gates.approval_refusal(db, row, automatic=False)
+
+
 async def merge_if_approval_stands(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -4236,19 +4253,13 @@ async def merge_if_approval_stands(
     красный CI, и тогда зелёный CI этого прохода относится не к тому, что ляжет в
     базу. Закрепление сменилось — отказ без вызова форжа (``HEAD_MOVED``).
     """
-    from hub.services.epic_plan_gates import approval_refusal
-
     key = (int(task["id"]), int(task["pr_number"]))
     while True:
         if hold := await delivery_rerun.merge_hold(db, task, ctx):  # #1956, каждый круг
             return MergeStep.RERUN_HOLD, hold
-        row = await repo.get_task(db, key[0])
-        if row is not None and (
-            reason := await approval_refusal(db, row, automatic=False)
-        ):
-            return MergeStep.RERUN_HOLD, reason
-        # Перечитать после проверок пилота: вердикт мог смениться во время чтения.
-        row = await repo.get_task(db, key[0])
+        row, pilot_refusal = await _merge_approval_row(db, key[0])
+        if pilot_refusal:
+            return MergeStep.RERUN_HOLD, pilot_refusal
         # --- ниже до регистрации Future нет ни одного await ---
         if row is None or not _approval_holds(dict(row), task):
             return MergeStep.APPROVAL_GONE, ""

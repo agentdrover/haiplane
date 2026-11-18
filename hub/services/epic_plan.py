@@ -169,8 +169,14 @@ def _project_caps(project: aiosqlite.Row) -> tuple[float | None, int | None]:
 
 
 def _dispatch_authority() -> PlanDispatchAuthority | None:
+    from hub.services import epic_plan_transport
     from hub.services.epic_plan_authority import configured_source_fingerprint
 
+    if (
+        epic_plan_transport.executor_transport("k8") is None
+        or epic_plan_transport.review_transport() is None
+    ):
+        return None
     source = configured_source_fingerprint()
     model = (config.env_get("EPIC_PLAN_EXECUTOR_MODEL", "") or "").strip()
     issuer = config.env_get("EPIC_PLAN_DISPATCH_PRINCIPAL_ID", "") or ""
@@ -303,7 +309,13 @@ async def _dispatch_blocker(
     db: aiosqlite.Connection, current: PlanSnapshot, decision: PlanDecision | None
 ) -> str:
     if current.dispatch_authority is None:
-        return "pilot_spending_authority_unavailable"
+        from hub.services.epic_plan_authority import configured_source_fingerprint
+
+        return (
+            "pilot_metered_transport_unavailable"
+            if configured_source_fingerprint()
+            else "pilot_spending_authority_unavailable"
+        )
     if decision is None or decision.state != "active":
         return "pilot_dispatch_signature_required"
     from hub.services.epic_plan_dispatch import preflight

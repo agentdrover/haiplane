@@ -14,6 +14,7 @@ from fastapi import HTTPException
 
 from hub import db as hub_db, repository as repo
 from hub.agent_outbox_models import OutboxPublish
+from hub.integrations.cursor_cloud import Reconciliation
 from hub.services import (
     admin,
     agent_outbox,
@@ -24,9 +25,11 @@ from hub.services import (
     epic_plan_escalation as escalation,
     epic_plan_gates as gates,
     epic_plan_spend as spend,
+    epic_plan_transport as transport,
     executor_orders,
     orchestration,
     role_orders,
+    review_dispatch,
 )
 from tests.executor_slot_support import seed_slot_skills
 from tests.test_epic_plan_approval import PLAN, _approved, pilot  # noqa: F401
@@ -36,6 +39,37 @@ BASE = "a" * 40
 HEAD = "b" * 40
 AUTHORITY_URL = "https://budget.example.test/pilot"
 AUTHORITY_TOKEN = "fixture-synthetic-auth"  # pragma: allowlist secret
+
+
+class SyntheticExecutor:
+    async def issue(self, db, project, booking, grant):
+        binding = grant.binding
+        assert binding.phase == "executor"
+        assert booking.host["name"] == binding.host
+        assert booking.task["id"] == binding.task_id
+        return await executor_orders._issue_atomically(
+            db,
+            project,
+            booking,
+            issuer_principal_id=binding.principal_id,
+            pilot_start=(binding.sha, binding.model),
+        )
+
+
+class SyntheticReview:
+    def __init__(self):
+        self.sent = {}
+
+    async def lookup(self, request, grant):
+        return Reconciliation(self.sent.get(grant.reference, ""), "fixture", True)
+
+    async def launch(self, request, grant):
+        assert request.head_sha == grant.binding.sha
+        assert request.model == grant.binding.model
+        assert grant.reference not in self.sent
+        agent = "synthetic-review"
+        self.sent[grant.reference] = agent
+        return review_dispatch._Started(agent, "fixture", False, False, 1, None)
 
 
 @pytest.fixture
@@ -75,6 +109,11 @@ async def prepared(
     monkeypatch.setenv("HAIPLANE_EPIC_PLAN_COST_AUTHORITY_TOKEN", AUTHORITY_TOKEN)
     monkeypatch.setenv("HAIPLANE_EPIC_PLAN_DISPATCH_PRINCIPAL_ID", str(agent))
     monkeypatch.setenv("HAIPLANE_EPIC_PLAN_EXECUTOR_MODEL", "codex-fixture")
+    synthetic_review = SyntheticReview()
+    monkeypatch.setattr(
+        transport, "executor_transport", lambda host: SyntheticExecutor()
+    )
+    monkeypatch.setattr(transport, "review_transport", lambda: synthetic_review)
 
     async def origin(db, task):
         return task["submission_sha"] or BASE
@@ -144,6 +183,8 @@ async def test_concurrent_wakeup_reserves_one_order(db, db_dsn, prepared):
         1,
     )
     assert len(await _rows(db, "executor_orders")) == 1
+    [run] = await _rows(db, "executor_runs")
+    assert run["starting_ref"] == BASE and run["model"] == "codex-fixture"
     async with _new_connection(db_dsn) as restarted:
         assert await dispatch.start_next(restarted) == (None, "pilot_order_in_flight")
         delivered = await executor_orders.deliver_orders(restarted, "k8")
@@ -250,6 +291,35 @@ async def test_rework_round_is_bound_to_new_sha(db, prepared, monkeypatch):
         await gates.approval_refusal(db, task, automatic=True)
         == "pilot_review_unavailable"
     )
+    await repo.update_task(db, 2377, risk_class="R3")
+    await db.commit()
+    assert not await gates.ready_to_send(db, reservation)
+    await repo.update_task(db, 2377, risk_class="R2")
+    await db.execute(
+        "UPDATE principals SET status='disabled' WHERE id=?", (reviewer_id,)
+    )
+    await db.commit()
+    assert not await gates.ready_to_send(db, reservation)
+    await db.execute("UPDATE principals SET status='active' WHERE id=?", (reviewer_id,))
+    await db.commit()
+
+    request = transport.ReviewRequest(
+        "review-fixture-generation-2",
+        "https://example.test/repo.git",
+        "task-2377/pilot",
+        repaired_sha,
+        "independent",
+        "review the pin",
+        "https://hub.example.test/mcp",
+    )
+    started, sent_permit = await review_dispatch._launch_metered_review(
+        db, dict(task), request, reviewer_id, 1
+    )
+    adopted, adopted_permit = await review_dispatch._launch_metered_review(
+        db, dict(task), request, reviewer_id, 1
+    )
+    assert started.agent_id == adopted.agent_id == "synthetic-review"
+    assert adopted.adopted and sent_permit.id == adopted_permit.id == reservation.id
     dispatch_id = await repo.create_review_dispatch(
         db,
         task_id=2377,
@@ -302,7 +372,8 @@ async def test_exception_escalates_once(db, prepared, monkeypatch):
     assert await spend.usage(db, 2377) == (0, 0, False)
 
 
-async def test_late_result_cannot_spend_or_deliver(client, db, prepared):
+@pytest.mark.parametrize("outcome", ["submitted", "failed", "rescued"])
+async def test_late_result_cannot_spend_or_deliver(client, db, prepared, outcome):
     _, headers, _, _ = prepared
     await repo.update_task(db, 2377, branch="task-2377/pilot")
     await db.commit()
@@ -317,9 +388,12 @@ async def test_late_result_cannot_spend_or_deliver(client, db, prepared):
     )
     assert ended.status_code == 200, ended.text
     feedback = await executor_orders.report_outcome(
-        db, "k8", order, outcome="submitted", sha=HEAD, branch="task-2377/pilot"
+        db, "k8", order, outcome=outcome, sha=HEAD, branch="task-2377/pilot"
     )
-    assert feedback["outcome"] == "submitted"
+    assert feedback["outcome"] == outcome
+    [saved] = await _rows(db, "executor_orders")
+    assert saved["report_outcome"] == outcome and saved["state"] == "delivered"
+    assert (await repo.get_task(db, 2377))["status"] == "open"
     assert await dispatch.start_next(db) == (None, "plan_revoked")
     task = await _put_submission(db, 2377, 1, HEAD)
     await repo.update_task(db, 2377, pr_number=22)
@@ -477,3 +551,72 @@ async def test_agent_cannot_impersonate_pilot_policy(db, prepared):
         await lifecycle._vstep_pilot_approval(state)
     assert rejected.value.status_code == 403
     assert rejected.value.detail["reason"] == "pilot_verdict_actor_not_authorized"
+
+
+async def test_unmetered_transports_cannot_buy_from_favorable_quote(
+    client, db, prepared, monkeypatch
+):
+    _, owner, reviewer_id, _ = prepared
+    monkeypatch.setattr(transport, "executor_transport", lambda host: None)
+    monkeypatch.setattr(transport, "review_transport", lambda: None)
+
+    async def unexpected_quote(*args, **kwargs):
+        raise AssertionError("an ordinary transport cannot ask for a paid grant")
+
+    monkeypatch.setattr(dispatch, "get_grant", unexpected_quote)
+    monkeypatch.setattr(authority, "get_grant", unexpected_quote)
+    plan = (await client.get(PLAN, headers=owner)).json()
+    assert plan["snapshot"]["schema_version"] == "1"
+    assert plan["dispatch_blocker"] == "pilot_metered_transport_unavailable"
+    assert await dispatch.start_next(db) == (None, "plan_changed")
+    task = await _put_submission(db, 2377, 1, HEAD)
+    assert await gates.reserve_review(
+        db,
+        task,
+        channel="cloud",
+        model="independent",
+        principal_id=reviewer_id,
+        attempt=1,
+    ) == (False, None)
+    assert not await _rows(db, "epic_plan_work")
+
+
+async def test_merge_plan_gate_uses_locked_last_task_read(db, prepared, monkeypatch):
+    head = await _put_submission(db, 2377, 1, HEAD)
+    await repo.update_task(
+        db, 2377, pr_number=22, review_verdict="approved", review_verdict_generation=1
+    )
+    await db.commit()
+    head = dict(await repo.get_task(db, 2377))
+    get_task = repo.get_task
+    authorization_seen = False
+
+    async def no_second_read(connection, task_id):
+        assert not authorization_seen, (
+            "merge may not reread task after final plan authorization"
+        )
+        return await get_task(connection, task_id)
+
+    async def refuse(connection, task, *, automatic):
+        nonlocal authorization_seen
+        assert (
+            connection.in_transaction
+            and task["submission_sha"] == HEAD
+            and not automatic
+        )
+        authorization_seen = True
+        return "plan_revoked"
+
+    async def refuse_external_call(*args, **kwargs):
+        raise AssertionError("revoked plan must not call the forge")
+
+    monkeypatch.setattr(repo, "get_task", no_second_read)
+    monkeypatch.setattr(gates, "approval_refusal", refuse)
+    monkeypatch.setattr(
+        orchestration.plugins.git_ops, "merge_pr_with_detail", refuse_external_call
+    )
+    assert await orchestration.merge_if_approval_stands(db, head, {}) == (
+        orchestration.MergeStep.RERUN_HOLD,
+        "plan_revoked",
+    )
+    assert authorization_seen
