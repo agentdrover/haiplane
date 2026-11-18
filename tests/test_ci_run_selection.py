@@ -1,3 +1,4 @@
+import asyncio
 import json
 from copy import deepcopy
 from unittest.mock import AsyncMock
@@ -53,6 +54,7 @@ class Evidence:
             "head": {"ref": HEAD_REF, "sha": HEAD, "repo": {"full_name": REPO}},
             "base": {"ref": "main", "sha": BASE, "repo": {"full_name": REPO}},
         }
+        self.previous_jobs = {}
         self.jobs = {OLD: self._make_jobs(self.old), NEW: self._make_jobs(self.native)}
         self.checks = [
             self._as_check(r, job) for r in self.runs for job in self.jobs[r["id"]]
@@ -175,7 +177,12 @@ class Evidence:
         if path.endswith("/statuses"):
             return self.statuses, False
         if path.endswith("/jobs"):
-            rows, key = self.jobs[int(path.split("/")[2])], "jobs"
+            parts = path.split("/")
+            run_id, attempt = int(parts[2]), int(parts[4])
+            rows, key = (
+                self.previous_jobs.get((run_id, attempt), self.jobs[run_id]),
+                "jobs",
+            )
         elif path.endswith("/check-runs"):
             rows, key = self.checks, "check_runs"
         elif path == "actions/runs":
@@ -445,3 +452,76 @@ async def test_collector_enabled_profile_requires_proof_and_preserves_trust_boun
     assert result.outcome is CIProbeOutcome.passed
     assert "native collector" in (result.details or "")
     assert not any("/artifacts" in evidence for evidence in e.requests)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"path": ".github/workflows/other.yml"},
+        {"workflow_id": 7, "status": "in_progress", "conclusion": None},
+        {"head_branch": "task-2225/other"},
+    ],
+)
+async def test_unrelated_dispatch_does_not_close_ordinary_pr_ci(monkeypatch, changes):
+    e = Evidence()
+    e.old["conclusion"] = "success"
+    e.native.update(changes)
+    result = await e.probe(
+        monkeypatch, primary=(0, '[{"name":"tests","state":"SUCCESS"}]', "")
+    )
+    assert result.outcome is CIProbeOutcome.passed
+    assert result.reason == "checks_passed"
+    blocked = await e.probe(
+        monkeypatch, primary=(0, '[{"name":"independent","state":"FAILURE"}]', "")
+    )
+    assert blocked.outcome is CIProbeOutcome.failed
+    pending = await e.probe(
+        monkeypatch, primary=(0, '[{"name":"independent","state":"PENDING"}]', "")
+    )
+    assert pending.outcome is CIProbeOutcome.pending
+    e.rules = [{"type": "required_status_checks"}]
+    protected = await e.probe(
+        monkeypatch, primary=(0, '[{"name":"tests","state":"SUCCESS"}]', "")
+    )
+    assert protected.outcome is CIProbeOutcome.unavailable
+    assert protected.details and "branch requirements" in protected.details
+
+
+async def test_stale_same_run_checks_are_bound_to_exact_attempt_jobs(monkeypatch):
+    e = Evidence()
+    previous = deepcopy(e.jobs[NEW])
+    previous[0]["conclusion"] = "failure"
+    e.previous_jobs[(NEW, 1)] = previous
+    e.native["run_attempt"] = 2
+    for job in e.jobs[NEW]:
+        job["id"] += 50
+        job["run_attempt"] = 2
+        job["labels"] = [
+            label.replace(f"{NEW}-1-", f"{NEW}-2-") for label in job["labels"]
+        ]
+    e.checks = [e._as_check(e.old, job) for job in e.jobs[OLD]] + [
+        e._as_check(e.native, job) for job in previous + e.jobs[NEW]
+    ]
+    result = await e.probe(monkeypatch)
+    assert result.outcome is CIProbeOutcome.passed
+    assert result.details and f"{NEW}/2" in result.details
+    # Same suite and same job name are insufficient to discard a check.
+    e.checks.append({**e.checks[len(e.jobs[OLD])], "id": 777, "status": "in_progress"})
+    assert (await e.probe(monkeypatch)).outcome is CIProbeOutcome.pending
+
+
+async def test_probe_timeout_names_the_interrupted_read(monkeypatch):
+    e = Evidence()
+    api = e.api
+
+    async def slow_api(endpoint, **kwargs):
+        if "/statuses?" in endpoint:
+            await asyncio.Event().wait()
+        return await api(endpoint, **kwargs)
+
+    monkeypatch.setattr(e, "api", slow_api)
+    monkeypatch.setattr(selection, "PROBE_TIMEOUT", 0.01)
+    result = await e.probe(monkeypatch)
+    assert result.outcome is CIProbeOutcome.unavailable
+    assert result.reason == "ci_equivalence_timeout"
+    assert result.details and "/statuses?" in result.details
