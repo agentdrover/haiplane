@@ -6382,6 +6382,7 @@ async def hub_whoami() -> str:
     return _format_whoami(data)
 
 
+# Project release history has its own REST/CLI view at GET /api/deploys (#1928).
 @mcp.tool()
 async def hub_prod_state(limit: int = 50) -> str:
     """What production runs, and which completed tasks did not get there (#499).
