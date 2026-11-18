@@ -501,6 +501,17 @@ async def test_unsuccessful_unrelated_dispatch_blocks_ordinary_pr(
     assert result.details and str(NEW) in result.details
 
 
+async def test_completed_optional_dispatch_with_pending_job_is_unavailable(monkeypatch):
+    e = Evidence()
+    _prove_hosted(e)
+    e.native["path"] = ".github/workflows/other.yml"
+    e.jobs[NEW][0].update(status="in_progress", conclusion=None)
+    e.checks = [e._as_check(run, job) for run in e.runs for job in e.jobs[run["id"]]]
+    result = await e.probe(monkeypatch)
+    assert result.outcome is CIProbeOutcome.unavailable
+    assert result.details and "pending" in result.details
+
+
 async def test_optional_pending_dispatch_does_not_hide_completed_failure(monkeypatch):
     e = Evidence()
     _prove_hosted(e)

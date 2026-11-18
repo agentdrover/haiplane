@@ -406,7 +406,14 @@ class CheckSnapshot:
     def optional(self, run: Facts, jobs: dict[str, Facts]) -> None:
         for job in jobs.values():
             result = verdict(job, job["name"])
-            benign = result.outcome in {CIProbeOutcome.passed, CIProbeOutcome.pending}
+            pending = result.outcome == CIProbeOutcome.pending
+            if pending and (
+                run.get("status") not in PENDING or job.get("conclusion") is not None
+            ):
+                raise Unverified(
+                    f"pending job conflicts with dispatch state: {label(run)}"
+                )
+            benign = pending or result.outcome == CIProbeOutcome.passed
             check = self.match(run, job, required=not benign)
             if check is not None and benign:
                 del self.by_id[job["id"]]
@@ -461,7 +468,7 @@ async def _optional_dispatch_checks(
     for run in dispatches:
         jobs = await attempt_jobs(get, api, run)
         checks.optional(run, jobs)
-        if run.get("conclusion") == "success":
+        if _job_completed(run, "success"):
             checks.superseded(run, await previous_attempt_jobs(get, api, run))
 
 
