@@ -1,8 +1,9 @@
 from hub import config, mcp_server
+from hub.csrf import token_for_session_cookie
 from hub.services import admin as admin_service
 from hub.services import agent_outbox_delivery as worker
 from tests import outbox_support as fixtures
-from tests.outbox_support import messages, payload, publish
+from tests.outbox_support import messages, payload, publish, status
 from tests.role_orders_support import rows
 
 world = fixtures.world
@@ -83,6 +84,21 @@ async def test_role_question_form_uses_existing_task_messaging(outbox_world):
     assert page.status_code == 200
     assert "outbox_message_id" in page.text
     assert "<script>confirm(123)</script>" not in page.text
+    delivery_id = response.json()["id"]
+    sent = await status(world, delivery_id)
+    reply = await world.client.post(
+        f"/tasks/{world.task}/web-message",
+        data={
+            "body": "Approved wording, no gate",
+            "outbox_message_id": str(sent["message_id"]),
+            "csrf_token": token_for_session_cookie(session),
+        },
+        headers=cookie | {"Origin": "https://hub.example.test"},
+    )
+    assert reply.status_code == 303, reply.text
+    current = await status(world, delivery_id)
+    assert current["continuation_state"] == "answered"
+    assert current["answer"] == "Approved wording, no gate"
 
 
 async def test_cli_and_mcp_project_the_same_routes(monkeypatch):

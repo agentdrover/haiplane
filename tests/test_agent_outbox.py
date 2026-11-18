@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from hub import repository as repo
+from hub.services import agent_outbox
 from hub.services import agent_outbox_delivery as worker
 from hub.services import role_orders
 from tests import outbox_support as fixtures
@@ -56,16 +57,43 @@ async def _sent_question(world):
     return await status(world, response.json()["id"])
 
 
-async def test_delivery_and_replay_survive_closed_role_order(outbox_world):
+@pytest.mark.parametrize("kind", ["result", "question"])
+async def test_delivery_and_replay_survive_closed_role_order(outbox_world, kind):
     world = outbox_world
-    first = await publish(world)
+    data = {"kind": kind}
+    if kind == "question":
+        data["continuation"] = "resume-after-close"
+    first = await publish(world, **data)
+    assert first.status_code == 200, first.text
     assert first.json()["accepted_state"] == "pending"
     order = world.order
     closed = await report(world, "k8", order["id"], order["lease_id"])
     assert closed.status_code == 200, closed.text
+    denial = await publish(world, delivery_key="new-after-close")
+    assert denial.status_code == 409
+    assert denial.json()["detail"]["reason"] == "outbox_run_inactive"
     await worker.sweep(world.db)
-    assert (await status(world, first.json()["id"]))["state"] == "sent"
-    assert (await publish(world)).json() == first.json()
+    sent = await status(world, first.json()["id"])
+    assert sent["state"] == "sent"
+    assert (await publish(world, **data)).json() == first.json()
+    if kind == "question":
+        answered = await answer(world, sent["message_id"])
+        assert answered.status_code == 200, answered.text
+        current = await status(world, first.json()["id"])
+        assert current["continuation_state"] == "answered"
+
+
+async def test_disappeared_order_cannot_offer_answer(outbox_world):
+    world = outbox_world
+    sent = await _sent_question(world)
+    await world.db.execute("DELETE FROM role_orders WHERE id=?", (world.order["id"],))
+    await world.db.commit()
+    assert not await agent_outbox.answerable_messages(
+        world.db, world.task, world.human_id
+    )
+    denial = await answer(world, sent["message_id"])
+    assert denial.status_code == 409
+    assert denial.json()["detail"]["reason"] == "order_unavailable"
 
 
 @pytest.mark.parametrize(
