@@ -56,6 +56,13 @@
         {% elif ci_block and ci_block.state == 'no_reports' %}
         <p class="task-action-note">{{ ci_block.message }}</p>
         {% endif %}
+        <details class="project-agent-passport">
+            <summary>Паспорт агента</summary>
+            <a href="{{ url_for('web_agent_passport', slug=c.project.slug) }}"
+               hx-get="{{ url_for('web_agent_passport', slug=c.project.slug) }}"
+               hx-target="next .agent-passport-content">Читать паспорт</a>
+            <div class="agent-passport-content"></div>
+        </details>
         <div class="topbar-stats project-card-numbers">
             {# The dashboard's own chip pattern, not a new one for the same
                meaning: outline pill, caps label, bold value, .is-zero dims a

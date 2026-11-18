@@ -1862,10 +1862,10 @@ def cmd_effective_policy(args: argparse.Namespace) -> int:
 
 
 def cmd_projects_bootstrap(args: argparse.Namespace) -> int:
-    """Стартовый пакет проекта: печатает серверный text, не пересобирает (#1631)."""
+    """Печатает текст проектного документа, сформированный сервером."""
     result = _api(
         "GET",
-        f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/agent-bootstrap",
+        f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/{args.document}",
     )
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -2292,12 +2292,14 @@ def _add_projects_parser(sub: Any) -> None:
         "--include-archived", dest="include_archived", action="store_true"
     )
     pp_list.set_defaults(func=cmd_projects_list)
-    pp_bootstrap = projects_sub.add_parser(
-        "bootstrap", help="First message for an agent of a new project (#1631)"
-    )
-    pp_bootstrap.add_argument("slug")
-    pp_bootstrap.add_argument("--json", action="store_true")
-    pp_bootstrap.set_defaults(func=cmd_projects_bootstrap)
+    for name, help_text in (
+        ("bootstrap", "First message for a project agent"),
+        ("passport", "Read a project's agent passport"),
+    ):
+        document = projects_sub.add_parser(name, help=help_text)
+        document.add_argument("slug")
+        document.add_argument("--json", action="store_true")
+        document.set_defaults(func=cmd_projects_bootstrap, document=f"agent-{name}")
     pp_create = projects_sub.add_parser("create", help="Create a project (human token)")
     pp_create.add_argument("slug")
     pp_create.add_argument("--name", required=True)

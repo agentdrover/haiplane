@@ -25,6 +25,7 @@ from hub.models import (
     BootstrapRulesFile,
     BootstrapSkill,
 )
+from hub.services.agent_passport import build_agent_passport
 from hub.services import project_policy, working_rules
 from hub.services.effective_policy import effective_policy
 from hub.workflow_reference import HUMAN_ONLY_TOOLS, HUMAN_ROUTES
@@ -80,6 +81,19 @@ def _safe_hub_url(raw: str) -> str:
     if bad:
         return ""
     return raw.rstrip("/")
+
+
+def _public_repo(raw: str) -> str:
+    """Permit public forge references; withhold local paths and URL credentials."""
+    value = raw.strip()
+    segment = r"[A-Za-z0-9_][A-Za-z0-9_.-]*"
+    slug = rf"{segment}(?:/{segment})+"
+    if re.fullmatch(slug, value) or re.fullmatch(
+        rf"(?:git@[A-Za-z0-9.-]+:|ssh://git@[A-Za-z0-9.-]+(?::[0-9]+)?/){slug}",
+        value,
+    ):
+        return value
+    return _safe_hub_url(value)
 
 
 def _safe_value(row: dict[str, Any]) -> str:
@@ -205,6 +219,8 @@ def render_agent_bootstrap(b: AgentBootstrap) -> str:
         "Ошибка транспорта MCP не значит, что запись не прошла: сначала "
         "hub_task_status, потом повтор.",
     ]
+    if b.agent_passport is not None:
+        lines.extend(["", "## 7. Паспорт агента", b.agent_passport.text])
     return "\n".join(lines)
 
 
@@ -218,7 +234,7 @@ async def build_agent_bootstrap(
     bootstrap = AgentBootstrap(
         project_slug=slug,
         project_name=str(project["name"] or slug),
-        repo=str(project["repo"] or "").strip(),
+        repo=_public_repo(str(project["repo"] or "")),
         base_branch=(
             str(project["default_branch"] or "").strip() or config.PAIR_BASE_BRANCH
         ),
@@ -239,6 +255,7 @@ async def build_agent_bootstrap(
         ci_before_submit=ci_mode,
         submit_order=_submit_order(ci_mode),
         human_only=_human_only(),
+        agent_passport=await build_agent_passport(db, project),
         text="",
     )
     bootstrap.text = render_agent_bootstrap(bootstrap)
