@@ -253,6 +253,19 @@ put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
 - Weeks are ISO (Monday), UTC; the key carries the ISO year (`2026-W53`, `2027-W01`). Every week of the window is present, zero weeks with `orders_closed=0` and `rate=null`; the edge weeks cut by the window are `partial=true`. A window longer than 104 weeks starts at the first closed order. `rate` is rounded to 3 digits.
 - `by_outcome` covers all orders (empty `report_outcome` = `none`); `by_reason_code` only the non-autonomous ones (empty = `unknown`), no truncation, order: count descending, then code.
 
+### Deployment view (#1928)
+
+`GET /api/deploys?project=<slug>&limit=20` returns one authorized project's
+`pipeline`, recent `releases` and the applied `limit`. The default project is
+`default`. The feed accepts 1–100 rows. `hp-hub deploys` uses the same model and
+formatter. The pipeline reports recorded deployment, branch heads and causes
+of delay. A missing counter is `null`; the pipeline gives its reason or a
+project-level note such as `мерж = выкат`. Branch heads name their source.
+
+`POST /api/deploys` records deploy callbacks with `deploys.record`. A scoped CI
+key can still post for its own project. The feed requires `tasks.read` and
+enforces project membership for private projects.
+
 ## Contract-Smell Checklist
 
 - Does the same concept have different names across API, CLI, MCP, and DB?
