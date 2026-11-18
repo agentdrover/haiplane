@@ -1,3 +1,4 @@
+import json
 from copy import deepcopy
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
@@ -57,7 +58,11 @@ class Evidence:
             self._as_check(r, job) for r in self.runs for job in self.jobs[r["id"]]
         ]
         self.rules = []
+        self.policy_change = None
         self.statuses = []
+        self.annotations = [
+            {"annotation_level": "failure", "message": selection.BILLING_MESSAGE}
+        ]
         self.base_blob = self.head_blob = (
             "bec1443cb1890775c3e11d1d2858eafe3c5fcb55"  # pragma: allowlist secret
         )
@@ -157,13 +162,16 @@ class Evidence:
                 "sha": self.head_blob if query["ref"] == [HEAD] else self.base_blob
             }, False
         if path == "rules/branches/main":
+            if self.policy_change == "rules" and self.pr_reads > 1:
+                return [{"type": "required_status_checks"}], False
             return self.rules, False
         if path == "branches/main":
-            return {"protected": False, "commit": {"sha": BASE}}, False
+            return {
+                "protected": self.policy_change == "protection" and self.pr_reads > 1,
+                "commit": {"sha": BASE},
+            }, False
         if path.endswith("/annotations"):
-            return [
-                {"annotation_level": "failure", "message": selection.BILLING_MESSAGE}
-            ], False
+            return self.annotations, False
         if path.endswith("/statuses"):
             return self.statuses, False
         if path.endswith("/jobs"):
@@ -182,7 +190,10 @@ class Evidence:
         }, False
 
     async def probe(
-        self, monkeypatch, primary=(0, '[{"name":"hosted","state":"FAILURE"}]', "")
+        self,
+        monkeypatch,
+        primary=(0, '[{"name":"hosted","state":"FAILURE"}]', ""),
+        fingerprint=selection.PILOT_CONTRACT,
     ):
         forge = GitHubForge()
         monkeypatch.setattr(forge, "_api_json", self.api)
@@ -192,7 +203,7 @@ class Evidence:
         return await forge.check_pr_ci(
             229,
             gh_repo=REPO,
-            contract_fingerprint=selection.PILOT_CONTRACT,
+            contract_fingerprint=fingerprint,
         )
 
 
@@ -293,6 +304,88 @@ async def test_pagination_read_failures_and_head_races_fail_closed(monkeypatch):
     result = await e.probe(monkeypatch)
     assert result.outcome is CIProbeOutcome.unavailable
     assert result.details and "changed" in result.details
+
+
+@pytest.mark.parametrize("omit_job", [True, False])
+async def test_newer_dispatch_coverage_also_gates_green_pr(monkeypatch, omit_job):
+    e = Evidence()
+    e.old["conclusion"] = "success"
+    for job in e.jobs[OLD]:
+        if job["conclusion"] == "failure":
+            job["conclusion"] = "success"
+    e.checks = [e._as_check(run, job) for run in e.runs for job in e.jobs[run["id"]]]
+    if omit_job:
+        e.jobs[NEW].pop(0)
+    result = await e.probe(
+        monkeypatch, primary=(0, '[{"name":"tests","state":"SUCCESS"}]', "")
+    )
+    if omit_job:
+        assert result.outcome is CIProbeOutcome.unavailable
+    else:
+        assert result.outcome is CIProbeOutcome.passed
+        assert result.details and str(NEW) in result.details
+
+
+@pytest.mark.parametrize("policy_change", ["rules", "protection"])
+async def test_same_sha_branch_policy_change_during_probe_fails_closed(
+    monkeypatch, policy_change
+):
+    e = Evidence()
+    e.policy_change = policy_change
+    result = await e.probe(monkeypatch)
+    assert result.outcome is CIProbeOutcome.unavailable
+    assert result.details and "branch requirements" in result.details
+
+
+async def test_billing_does_not_supersede_another_failure_annotation(monkeypatch):
+    e = Evidence()
+    e.annotations.append(
+        {"annotation_level": "failure", "message": "A different startup error"}
+    )
+    result = await e.probe(monkeypatch)
+    assert result.outcome is CIProbeOutcome.unavailable
+    assert result.details and "billing" in result.details
+
+
+async def test_unknown_pilot_contract_cannot_accept_dispatch_from_legacy_checks(
+    monkeypatch,
+):
+    e = Evidence()
+    result = await e.probe(
+        monkeypatch,
+        primary=(0, '[{"name":"tests","state":"SUCCESS"}]', ""),
+        fingerprint="unknown",
+    )
+    assert result.outcome is CIProbeOutcome.unavailable
+    assert result.details and "contract" in result.details
+
+
+async def test_ordinary_green_pr_uses_legacy_checks_and_real_runs_fallback(monkeypatch):
+    e = Evidence()
+    e.old["conclusion"] = "success"
+    e.runs = [e.old]
+    primary = await e.probe(
+        monkeypatch, primary=(0, '[{"name":"tests","state":"SUCCESS"}]', "")
+    )
+    forge = GitHubForge()
+    monkeypatch.setattr(forge, "_api_json", e.api)
+    gh = AsyncMock(
+        side_effect=[
+            (1, "", "HTTP 403"),
+            (0, json.dumps({"headRefOid": HEAD}), ""),
+            (0, json.dumps({"workflow_runs": e.runs}), ""),
+        ]
+    )
+    monkeypatch.setattr("hub.integrations.forge.github._gh", gh)
+    fallback = await forge.check_pr_ci(
+        229, gh_repo=REPO, contract_fingerprint="unknown"
+    )
+    assert primary.outcome is fallback.outcome is CIProbeOutcome.passed
+    assert [call.args[:2] for call in gh.await_args_list[:2]] == [
+        ("pr", "checks"),
+        ("pr", "view"),
+    ]
+    assert gh.await_args_list[2].args[0] == "api"
 
 
 async def test_primary_and_fallback_share_selection_rules(monkeypatch):

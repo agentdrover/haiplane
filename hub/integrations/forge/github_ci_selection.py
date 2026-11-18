@@ -177,8 +177,6 @@ def canonical(run: Facts, ref: str, sha: str) -> bool:
 def _older_pr(run: Facts, selected: Facts, number: int) -> bool:
     return (
         run.get("event") == "pull_request"
-        and run.get("run_attempt") == 1
-        and run.get("conclusion") == "failure"
         and run.get("status") == "completed"
         and run["id"] < selected["id"]
         and isinstance(run.get("created_at"), str)
@@ -271,9 +269,13 @@ def native_profile(
 
 async def _billing_annotation(get: Get, api: str, job: Facts) -> bool:
     annotations = await pages(get, f"{api}/check-runs/{job['id']}/annotations")
-    return any(
-        item.get("annotation_level") == "failure"
-        and item.get("message") == BILLING_MESSAGE
+    failures = {
+        item.get("message")
+        for item in annotations
+        if item.get("annotation_level") not in {"notice", "warning"}
+    }
+    return failures == {BILLING_MESSAGE} and all(
+        item.get("annotation_level") in {"notice", "warning", "failure"}
         for item in annotations
     )
 
@@ -302,7 +304,9 @@ async def billing_jobs(get: Get, api: str, run: Facts) -> dict[str, Facts]:
     return jobs
 
 
-async def policy_proof(get: Get, api: str, head: str, base: str, base_ref: str) -> bool:
+async def policy_proof(
+    get: Get, api: str, head: str, base: str, base_ref: str
+) -> tuple[str, str]:
     workflow = f"{api}/contents/{WORKFLOW}"
     branch = quote(base_ref, safe="")
     head_blob, base_blob, rules, metadata = await asyncio.gather(
@@ -325,7 +329,7 @@ async def policy_proof(get: Get, api: str, head: str, base: str, base_ref: str) 
         raise Unverified("independent branch requirements cannot be proved")
     if (metadata.get("commit") or {}).get("sha") != base:
         raise Unverified("base branch changed or is unreadable")
-    return bool(WORKFLOW_BLOBS[head_blob["sha"]])
+    return head_blob["sha"], base_blob["sha"]
 
 
 def _known_checks(
@@ -334,6 +338,8 @@ def _known_checks(
     old: dict[str, Facts],
     selected: Facts,
     new: dict[str, Facts],
+    *,
+    billing: bool,
 ) -> list[Facts]:
     by_id = index(checks, "id")
     for run, jobs in ((original, old), (selected, new)):
@@ -341,7 +347,7 @@ def _known_checks(
         if type(suite) is not int or suite <= 0:
             raise Unverified("check-suite identity missing")
         for job in jobs.values():
-            check = by_id.pop(job["id"], {})
+            check = by_id.get(job["id"], {})
             if (
                 check.get("name") != job["name"]
                 or check.get("head_sha") != run["head_sha"]
@@ -351,6 +357,8 @@ def _known_checks(
                 or check.get("conclusion") != job.get("conclusion")
             ):
                 raise Unverified("Actions job does not match its exact check run")
+            if run is selected or billing:
+                del by_id[job["id"]]
     return list(by_id.values())
 
 
@@ -377,12 +385,14 @@ def _independent(checks: list[Facts], statuses: list[Facts]) -> CIProbeResult | 
     return None
 
 
-async def equivalent_probe(get: Get, pr: int) -> CIProbeResult | None:
+async def equivalent_probe(
+    get: Get, pr: int, contract_fingerprint: str
+) -> CIProbeResult | None:
     """Return None only when no alternative dispatch is present."""
     api = f"repos/{PILOT_REPO}"
     try:
         async with asyncio.timeout(PROBE_TIMEOUT):
-            return await _equivalent(get, api, pr)
+            return await _equivalent(get, api, pr, contract_fingerprint)
     except TimeoutError:
         return CIProbeResult(CIProbeOutcome.unavailable, "ci_equivalence_timeout")
     except (Unverified, TypeError, AttributeError) as exc:
@@ -391,7 +401,9 @@ async def equivalent_probe(get: Get, pr: int) -> CIProbeResult | None:
         )
 
 
-async def _equivalent(get: Get, api: str, pr: int) -> CIProbeResult | None:
+async def _equivalent(
+    get: Get, api: str, pr: int, contract_fingerprint: str
+) -> CIProbeResult | None:
     pull_path = f"{api}/pulls/{pr}"
     ref, sha, base_ref, base = refs = pr_refs(await read(get, pull_path))
     run_path = f"{api}/actions/runs?head_sha={sha}"
@@ -399,30 +411,43 @@ async def _equivalent(get: Get, api: str, pr: int) -> CIProbeResult | None:
     selection = _select(runs, ref, sha, pr)
     if selection is None or isinstance(selection, CIProbeResult):
         return selection
+    if contract_fingerprint != PILOT_CONTRACT:
+        raise Unverified("project CI contract is outside the audited dispatch profile")
     old, new = selection
-    collector_required, old_jobs, new_jobs, checks, statuses = await asyncio.gather(
+    billing = old.get("conclusion") == "failure"
+    policy, old_jobs, new_jobs, checks, statuses = await asyncio.gather(
         policy_proof(get, api, sha, base, base_ref),
-        billing_jobs(get, api, old),
+        billing_jobs(get, api, old) if billing else attempt_jobs(get, api, old),
         attempt_jobs(get, api, new),
         pages(get, f"{api}/commits/{sha}/check-runs?filter=all", "check_runs"),
         pages(get, f"{api}/commits/{sha}/statuses"),
     )
-    profile = native_profile(new_jobs, new, collector_required=collector_required)
+    profile = native_profile(
+        new_jobs, new, collector_required=WORKFLOW_BLOBS[policy[0]]
+    )
     if blocked := _independent(
-        _known_checks(checks, old, old_jobs, new, new_jobs), statuses
+        _known_checks(checks, old, old_jobs, new, new_jobs, billing=billing), statuses
     ):
         return blocked
     await _recheck(get, pull_path, run_path, refs, runs)
-    fresh_checks, fresh_statuses = await asyncio.gather(
+    fresh_policy, fresh_checks, fresh_statuses = await asyncio.gather(
+        policy_proof(get, api, sha, base, base_ref),
         pages(get, f"{api}/commits/{sha}/check-runs?filter=all", "check_runs"),
         pages(get, f"{api}/commits/{sha}/statuses"),
     )
+    if policy != fresh_policy:
+        raise Unverified("workflow version changed during the probe")
     if checks != fresh_checks or statuses != fresh_statuses:
         raise Unverified("independent checks or statuses changed during the probe")
     return CIProbeResult(
         CIProbeOutcome.passed,
-        "ci_equivalent_native_run",
-        f"{label(new)}: {profile}; supersedes billing-only {label(old)}",
+        "ci_equivalent_native_run" if billing else "ci_native_run_proved",
+        f"{label(new)}: {profile}; "
+        + (
+            f"supersedes billing-only {label(old)}"
+            if billing
+            else f"with successful {label(old)}"
+        ),
     )
 
 
@@ -430,13 +455,12 @@ def _select(
     runs: list[Facts], ref: str, sha: str, pr: int
 ) -> tuple[Facts, Facts] | CIProbeResult | None:
     index(runs, "id")
-    manual = [
-        run
-        for run in runs
-        if run.get("event") == "workflow_dispatch" and canonical(run, ref, sha)
-    ]
-    if not manual:
+    dispatches = [run for run in runs if run.get("event") == "workflow_dispatch"]
+    if not dispatches:
         return None
+    manual = [run for run in dispatches if canonical(run, ref, sha)]
+    if not manual:
+        raise Unverified("no dispatch matches the audited CI workflow and PR identity")
     new = max(manual, key=lambda run: run["id"])
     result = verdict(new, label(new))
     if result.outcome != CIProbeOutcome.passed:
@@ -446,11 +470,17 @@ def _select(
     prior = [
         run for run in runs if canonical(run, ref, sha) and _older_pr(run, new, pr)
     ]
-    if len(prior) > 1:
+    billing = [
+        run
+        for run in prior
+        if run.get("conclusion") == "failure" and run.get("run_attempt") == 1
+    ]
+    if len(billing) > 1:
         raise Unverified(
             "multiple older PR failures cannot be matched to one replacement"
         )
-    old = prior[0] if prior else None
+    green = [run for run in prior if run.get("conclusion") == "success"]
+    old = billing[0] if billing else max(green, key=lambda run: run["id"], default=None)
     for run in runs:
         if run is old or run is new:
             continue
@@ -458,17 +488,6 @@ def _select(
         if result.outcome != CIProbeOutcome.passed:
             return result
     if old is None:
-        if any(
-            canonical(run, ref, sha)
-            and run.get("event") == "pull_request"
-            and run.get("conclusion") == "success"
-            and any(
-                pr_ref.get("number") == pr
-                for pr_ref in (run.get("pull_requests") or [])
-            )
-            for run in runs
-        ):
-            return None  # no replacement needed: ordinary PR checks still decide
         raise Unverified("no matching older PR suite")
     return old, new
 

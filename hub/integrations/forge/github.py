@@ -1070,15 +1070,14 @@ class GitHubForge:
         gh_repo: str | None = None,
         contract_fingerprint: str = "",
     ) -> CIProbeResult:
-        if (
-            (gh_repo or REPO_NAME).lower() == github_ci_selection.PILOT_REPO
-            and contract_fingerprint == github_ci_selection.PILOT_CONTRACT
-        ):
+        if (gh_repo or REPO_NAME).lower() == github_ci_selection.PILOT_REPO:
 
             async def get(endpoint: str) -> tuple[Any, bool]:
                 return await self._api_json(endpoint, repo=repo)
 
-            result = await github_ci_selection.equivalent_probe(get, pr_number)
+            result = await github_ci_selection.equivalent_probe(
+                get, pr_number, contract_fingerprint
+            )
             if result is not None:
                 return result
         return await self._legacy_pr_ci(pr_number, repo=repo, gh_repo=gh_repo)
