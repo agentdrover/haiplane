@@ -1,13 +1,14 @@
 """Narrow HTTP doors for role outbox acknowledgements and human replies."""
 
 from collections.abc import Callable, Coroutine
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Path, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 
 from hub.agent_outbox_models import (
+    MAX_SQL_INT,
     OutboxAck,
     OutboxAnswer,
     OutboxPublish,
@@ -34,12 +35,13 @@ class _SafeRoute(APIRoute):
         return handle
 
 
+ResourceID = Annotated[int, Path(gt=0, le=MAX_SQL_INT)]
 router = APIRouter(route_class=_SafeRoute)
 HOST_OUTBOX = "/api/executor-hosts/{name}/role-orders/{order_id}/outbox"
 
 
 @router.get(HOST_OUTBOX)
-async def scope(name: str, order_id: int, request: Request) -> OutboxScope:
+async def scope(name: str, order_id: ResourceID, request: Request) -> OutboxScope:
     principal = await _principal(request, name)
     db = _db(request)
     await agent_outbox.check_host(db, name, principal)
@@ -58,7 +60,7 @@ async def scope(name: str, order_id: int, request: Request) -> OutboxScope:
 @router.post(HOST_OUTBOX)
 async def publish(
     name: str,
-    order_id: int,
+    order_id: ResourceID,
     body: OutboxPublish,
     request: Request,
 ) -> OutboxAck:
@@ -68,22 +70,25 @@ async def publish(
 
 @router.get(HOST_OUTBOX + "/{delivery_id}")
 async def status(
-    name: str, order_id: int, delivery_id: int, request: Request
+    name: str, order_id: ResourceID, delivery_id: ResourceID, request: Request
 ) -> OutboxStatus:
     principal = await _principal(request, name)
-    return await agent_outbox.get_status(
-        _db(request), name, principal, order_id, delivery_id
-    )
+    db = getattr(request.state, "db", None)
+    if db is None:
+        agent_outbox.refuse(503, "outbox_connection_unavailable")
+    return await agent_outbox.get_status(db, name, principal, order_id, delivery_id)
 
 
 @router.post("/api/tasks/{task_id}/outbox-questions/{message_id}/answer")
 async def answer(
-    task_id: int, message_id: int, body: OutboxAnswer, request: Request
+    task_id: ResourceID, message_id: ResourceID, body: OutboxAnswer, request: Request
 ) -> dict:
     return await _answer(request, task_id, message_id, body.body)
 
 
-async def _answer(request: Request, task_id: int, message_id: int, body: str) -> dict:
+async def _answer(
+    request: Request, task_id: ResourceID, message_id: ResourceID, body: str
+) -> dict:
     identity = await _human(request, "role question answer")
     if identity.principal_id is None:
         agent_outbox.refuse(403, "outbox_owner_required")

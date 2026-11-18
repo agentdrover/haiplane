@@ -19,14 +19,24 @@ MAX_ATTEMPTS = 8
 
 async def _lease(db: aiosqlite.Connection, token: str) -> aiosqlite.Row | None:
     async with write_transaction(db):
-        return await outbox.one(
+        selected = await outbox.one(
             db,
-            """UPDATE agent_outbox SET lease=?, lease_until=unixepoch()+?, attempts=attempts+1
-               WHERE id=(SELECT id FROM agent_outbox WHERE state='pending'
-                   AND lease_until<=unixepoch() AND next_attempt<=unixepoch()
-                   ORDER BY next_attempt,id LIMIT 1)
-               RETURNING *""",
-            (token, LEASE_SECONDS),
+            """SELECT id FROM agent_outbox WHERE state='pending'
+               AND lease_until<=CAST(strftime('%s','now') AS INTEGER)
+               AND next_attempt<=CAST(strftime('%s','now') AS INTEGER)
+               ORDER BY next_attempt,id LIMIT 1""",
+            (),
+        )
+        if selected is None:
+            return None
+        delivery_id = selected["id"]
+        await db.execute(
+            """UPDATE agent_outbox SET lease=?, attempts=attempts+1,
+                   lease_until=CAST(strftime('%s','now') AS INTEGER)+? WHERE id=?""",
+            (token, LEASE_SECONDS, delivery_id),
+        )
+        return await outbox.one(
+            db, "SELECT * FROM agent_outbox WHERE id=?", (delivery_id,)
         )
 
 
@@ -42,7 +52,7 @@ async def _retry(db: aiosqlite.Connection, row: aiosqlite.Row, reason: str) -> N
     async with write_transaction(db):
         await db.execute(
             """UPDATE agent_outbox SET state=?, reason=?, lease=NULL, lease_until=0,
-                   next_attempt=unixepoch()+? WHERE id=? AND lease=? AND state='pending'""",
+                   next_attempt=CAST(strftime('%s','now') AS INTEGER)+? WHERE id=? AND lease=? AND state='pending'""",
             (
                 state,
                 reason,
@@ -65,8 +75,8 @@ async def _deliver(db: aiosqlite.Connection, row: aiosqlite.Row) -> None:
     async with write_transaction(db):
         standing = await outbox.one(
             db,
-            """SELECT created_at+?<=unixepoch() AS expired FROM agent_outbox
-               WHERE id=? AND lease=? AND lease_until>unixepoch() AND state='pending'""",
+            """SELECT created_at+?<=CAST(strftime('%s','now') AS INTEGER) AS expired FROM agent_outbox
+               WHERE id=? AND lease=? AND lease_until>CAST(strftime('%s','now') AS INTEGER) AND state='pending'""",
             (outbox.TTL_SECONDS, row["id"], row["lease"]),
         )
         if standing is None:
@@ -124,7 +134,7 @@ async def sweep(db: aiosqlite.Connection) -> None:
         await db.execute(
             """DELETE FROM agent_outbox WHERE id IN (
                    SELECT id FROM agent_outbox WHERE state<>'pending'
-                     AND created_at+?<=unixepoch() ORDER BY id LIMIT ?
+                     AND created_at+?<=CAST(strftime('%s','now') AS INTEGER) ORDER BY id LIMIT ?
                )""",
             (outbox.RETENTION_SECONDS, BATCH),
         )

@@ -27,6 +27,28 @@ async def test_key_conflict_and_principal_project_isolation(outbox_world):
     assert len(await rows(world.db, "SELECT * FROM agent_outbox")) == 1
 
 
+async def test_private_project_hides_previously_accepted_delivery(outbox_world):
+    world = outbox_world
+    first = await publish(world)
+    assert first.status_code == 200
+    await world.db.execute(
+        "INSERT INTO private_project_security(project_id,owner_id) VALUES (?,?)",
+        (world.pid, world.human_id),
+    )
+    await world.db.execute(
+        "INSERT INTO project_memberships(project_id,principal_id,role) VALUES (?,?,'owner')",
+        (world.pid, world.human_id),
+    )
+    await world.db.commit()
+    assert (await publish(world)).status_code == 404
+    response = await world.client.get(
+        f"{world.path}/{first.json()['id']}", headers=world.k8_auth
+    )
+    assert response.status_code == 404
+    await worker.sweep(world.db)
+    assert not await messages(world)
+
+
 async def test_secret_canaries_and_safe_errors(outbox_world, caplog):
     world = outbox_world
     canary = "Bearer " + "t" * 24

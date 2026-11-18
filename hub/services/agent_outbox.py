@@ -6,7 +6,7 @@ import re
 import unicodedata
 from contextlib import asynccontextmanager
 from hmac import compare_digest
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 import aiosqlite
 from fastapi import HTTPException
@@ -133,14 +133,14 @@ async def _persist(
         owner_id = await _owner(db, order["human_owner"])
         if owner_id is None:
             refuse(409, "outbox_owner_unavailable")
-    state = "sent" if data.kind == "silent" else "pending"
+    state: Literal["pending", "sent"] = "sent" if data.kind == "silent" else "pending"
     cursor = await db.execute(
         """INSERT INTO agent_outbox (
                principal_id, host, project_id, project_slug, role, task_id, order_id,
                generation, run, continuation, delivery_key, digest, kind, body, state,
                owner_id, reason
            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(order_id,run,continuation) DO NOTHING RETURNING id""",
+           ON CONFLICT(order_id,run,continuation) DO NOTHING""",
         (
             principal,
             order["host"],
@@ -161,11 +161,12 @@ async def _persist(
             "silent" if data.kind == "silent" else "",
         ),
     )
-    row = await cursor.fetchone()
-    await cursor.close()
-    if row is None:
+    if cursor.rowcount != 1 or cursor.lastrowid is None:
+        await cursor.close()
         refuse(409, "outbox_continuation_conflict")
-    return OutboxAck(id=row["id"], state=state)
+    delivery_id = cursor.lastrowid
+    await cursor.close()
+    return OutboxAck(id=delivery_id, accepted_state=state)
 
 
 async def _check_new(
@@ -187,7 +188,7 @@ async def _check_new(
         refuse(429, "outbox_queue_full")
     recent = await one(
         db,
-        "SELECT COUNT(*) AS n FROM agent_outbox WHERE principal_id=? AND created_at>=unixepoch()-3600",
+        "SELECT COUNT(*) AS n FROM agent_outbox WHERE principal_id=? AND created_at>=CAST(strftime('%s','now') AS INTEGER)-3600",
         (principal,),
     )
     if recent and recent["n"] >= HOURLY_LIMIT:
@@ -237,7 +238,8 @@ async def publish(
             if not order["admitted"]:
                 refuse(409, "admission_revoked")
             return OutboxAck(
-                id=previous["id"], state="sent" if data.kind == "silent" else "pending"
+                id=previous["id"],
+                accepted_state="sent" if data.kind == "silent" else "pending",
             )
         await _check_new(db, order, data, principal)
         return await _persist(db, order, principal, data, text, fingerprint)
@@ -276,6 +278,7 @@ async def get_status(
     order_id: int,
     delivery_id: int,
 ) -> OutboxStatus:
+    # The HTTP door requires its own request connection.
     async with _read_snapshot(db):
         return await _status(db, host, principal, order_id, delivery_id)
 
@@ -312,16 +315,16 @@ async def _status(
     if row is None or order is None:
         refuse(404, "outbox_not_found")
     reason = await continuation_refusal(db, row, order) if row["continuation"] else ""
-    state = "none"
-    if row["continuation"]:
-        state = "stale" if reason else "answered" if row["answered_at"] else "waiting"
+    state = _continuation_state(row, reason)
     return OutboxStatus.model_validate(
         {
             "id": row["id"],
             "state": row["state"],
             "reason": row["reason"],
             "message_id": row["message_id"],
-            "answer_message_id": row["answer_message_id"],
+            "answer_message_id": row["answer_message_id"]
+            if state == "answered"
+            else None,
             "answer_event_id": row["answer_event_id"] if state == "answered" else None,
             "continuation": row["continuation"],
             "continuation_state": state,
@@ -329,6 +332,20 @@ async def _status(
             "continuation_reason": reason,
         }
     )
+
+
+def _continuation_state(row: aiosqlite.Row, reason: str) -> str:
+    if not row["continuation"]:
+        return "none"
+    if reason:
+        return "stale"
+    if row["answered_at"]:
+        return "answered"
+    if row["state"] == "pending":
+        return "queued"
+    if row["state"] in ("failed", "unknown"):
+        return "undeliverable"
+    return "waiting"
 
 
 async def append_message(
@@ -424,7 +441,7 @@ async def answer(
         )
         await db.execute(
             """UPDATE agent_outbox SET answer=?, answer_digest=?, answer_message_id=?, answer_event_id=?,
-                   answered_at=unixepoch() WHERE id=?""",
+                   answered_at=CAST(strftime('%s','now') AS INTEGER) WHERE id=?""",
             (text, fingerprint, answer_id, event_id, row["id"]),
         )
         return {"id": row["id"], "answer_message_id": answer_id}
@@ -435,13 +452,19 @@ async def answerable_messages(
 ) -> set[int]:
     rows = await fetchall(
         db,
-        """SELECT o.message_id FROM agent_outbox o JOIN tasks t ON t.id=o.task_id
+        """SELECT o.* FROM agent_outbox o JOIN tasks t ON t.id=o.task_id
            JOIN principals owner ON owner.id=o.owner_id AND owner.username=t.human_owner
            WHERE o.task_id=? AND owner.id=? AND owner.kind='human' AND owner.status='active'
              AND o.kind='question' AND o.message_id IS NOT NULL AND o.answered_at IS NULL
              AND o.invalidated_reason=''
              AND o.generation=t.submission_generation AND NOT t.archived
-             AND NOT EXISTS (SELECT 1 FROM private_project_security p WHERE p.project_id=o.project_id)""",
+             AND NOT EXISTS (SELECT 1 FROM private_project_security p WHERE p.project_id=o.project_id)
+           ORDER BY o.message_id DESC LIMIT 200""",
         (task_id, owner_id),
     )
-    return {int(row["message_id"]) for row in rows}
+    answerable = set()
+    for row in rows:
+        order = await live_order(db, row["order_id"], row["host"])
+        if not await continuation_refusal(db, row, order):
+            answerable.add(int(row["message_id"]))
+    return answerable

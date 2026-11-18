@@ -7,7 +7,7 @@ from hub.services import agent_outbox_delivery as worker
 from hub.services import role_orders
 from tests import outbox_support as fixtures
 from tests.outbox_support import messages, answer, publish, status
-from tests.role_orders_support import rows
+from tests.role_orders_support import report, rows
 
 world = fixtures.world
 keys = fixtures.keys
@@ -54,6 +54,43 @@ async def _sent_question(world):
     assert response.status_code == 200, response.text
     await worker.sweep(world.db)
     return await status(world, response.json()["id"])
+
+
+async def test_delivery_and_replay_survive_closed_role_order(outbox_world):
+    world = outbox_world
+    first = await publish(world)
+    assert first.json()["accepted_state"] == "pending"
+    order = world.order
+    closed = await report(world, "k8", order["id"], order["lease_id"])
+    assert closed.status_code == 200, closed.text
+    await worker.sweep(world.db)
+    assert (await status(world, first.json()["id"]))["state"] == "sent"
+    assert (await publish(world)).json() == first.json()
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("human_owner", "", "owner_changed"),
+        ("archived", 1, "task_unavailable"),
+        ("project_id", None, "task_project_changed"),
+    ],
+)
+async def test_reinstating_task_does_not_revive_answer(
+    outbox_world, field, value, reason
+):
+    world = outbox_world
+    delivery = await _sent_question(world)
+    assert (await answer(world, delivery["message_id"])).status_code == 200
+    task = await repo.get_task(world.db, world.task)
+    await repo.update_task(world.db, world.task, **{field: value})
+    await repo.update_task(world.db, world.task, **{field: task[field]})
+    await world.db.commit()
+    got = await status(world, delivery["id"])
+    assert got["continuation_state"] == "stale"
+    assert got["continuation_reason"] == reason
+    assert got["answer_message_id"] is None
+    assert got["answer"] is None
 
 
 async def test_answer_correlates_once_without_granting_gate(outbox_world):

@@ -33,7 +33,7 @@ MIGRATIONS = [
             lease TEXT,
             lease_until INTEGER NOT NULL DEFAULT 0,
             next_attempt INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
             UNIQUE (principal_id, project_id, delivery_key),
             UNIQUE (order_id, run, continuation)
         )""",
@@ -74,6 +74,75 @@ MIGRATIONS = [
         BEGIN
             UPDATE agent_outbox SET invalidated_reason='owner_changed'
             WHERE task_id=NEW.id AND kind='question' AND invalidated_reason='';
+        END""",
+    ),
+    (
+        "agent_outbox_wait_principal_2341",
+        """CREATE INDEX IF NOT EXISTS agent_outbox_wait_principal
+        ON agent_outbox(principal_id) WHERE kind='question' AND invalidated_reason=''""",
+    ),
+    (
+        "agent_outbox_invalidate_principal_2341",
+        """CREATE TRIGGER IF NOT EXISTS agent_outbox_invalidate_principal
+        AFTER UPDATE OF status ON principals WHEN OLD.status='active' AND NEW.status<>'active'
+        BEGIN
+            UPDATE agent_outbox SET invalidated_reason='principal_inactive'
+            WHERE (principal_id=NEW.id OR owner_id=NEW.id)
+              AND kind='question' AND invalidated_reason='';
+        END""",
+    ),
+    (
+        "agent_outbox_invalidate_host_2341",
+        """CREATE TRIGGER IF NOT EXISTS agent_outbox_invalidate_host
+        AFTER UPDATE OF enabled ON executor_hosts WHEN OLD.enabled AND NOT NEW.enabled
+        BEGIN
+            UPDATE agent_outbox SET invalidated_reason='host_disabled'
+            WHERE principal_id=NEW.principal_id AND host=NEW.name
+              AND kind='question' AND invalidated_reason='';
+        END""",
+    ),
+    (
+        "agent_outbox_invalidate_archive_2341",
+        """CREATE TRIGGER IF NOT EXISTS agent_outbox_invalidate_archive
+        AFTER UPDATE OF archived ON tasks WHEN NOT OLD.archived AND NEW.archived
+        BEGIN
+            UPDATE agent_outbox SET invalidated_reason='task_unavailable'
+            WHERE task_id=NEW.id AND kind='question' AND invalidated_reason='';
+        END""",
+    ),
+    (
+        "agent_outbox_invalidate_project_2341",
+        """CREATE TRIGGER IF NOT EXISTS agent_outbox_invalidate_project
+        AFTER UPDATE OF status ON projects WHEN OLD.status='active' AND NEW.status<>'active'
+        BEGIN
+            UPDATE agent_outbox SET invalidated_reason='project_unavailable'
+            WHERE project_id=NEW.id AND kind='question' AND invalidated_reason='';
+        END""",
+    ),
+    (
+        "agent_outbox_invalidate_private_2341",
+        """CREATE TRIGGER IF NOT EXISTS agent_outbox_invalidate_private
+        AFTER INSERT ON private_project_security
+        BEGIN
+            UPDATE agent_outbox SET invalidated_reason='project_unavailable'
+            WHERE project_id=NEW.project_id AND kind='question' AND invalidated_reason='';
+        END""",
+    ),
+    (
+        "agent_outbox_invalidate_task_binding_2341",
+        """CREATE TRIGGER IF NOT EXISTS agent_outbox_invalidate_task_binding
+        AFTER UPDATE OF project_id, parent_id ON tasks
+        WHEN OLD.project_id IS NOT NEW.project_id OR OLD.parent_id IS NOT NEW.parent_id
+        BEGIN
+            UPDATE agent_outbox SET invalidated_reason='task_project_changed'
+            WHERE kind='question' AND invalidated_reason='' AND task_id IN (
+                WITH RECURSIVE affected_task(id) AS (
+                    SELECT NEW.id
+                    UNION
+                    SELECT tasks.id FROM tasks JOIN affected_task ON tasks.parent_id=affected_task.id
+                )
+                SELECT id FROM affected_task
+            );
         END""",
     ),
 ]

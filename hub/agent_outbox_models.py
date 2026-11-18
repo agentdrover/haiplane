@@ -12,8 +12,8 @@ DeliveryState = Literal["pending", "sent", "unknown", "failed"]
 
 
 class OutboxScope(BaseModel):
-    project: Identifier
-    role: Identifier
+    project: str
+    role: str
     task_id: int = Field(gt=0, le=MAX_SQL_INT)
     generation: int = Field(ge=0, le=MAX_SQL_INT)
     run: int = Field(gt=0, le=MAX_SQL_INT)
@@ -22,6 +22,8 @@ class OutboxScope(BaseModel):
 class OutboxPublish(OutboxScope):
     model_config = ConfigDict(extra="forbid")
 
+    project: str = Field(min_length=1, max_length=512)
+    role: str = Field(min_length=1, max_length=32)
     lease_id: SecretStr
     delivery_key: Identifier
     continuation: Identifier | None = None
@@ -37,15 +39,19 @@ class OutboxAnswer(BaseModel):
 
 class OutboxAck(BaseModel):
     id: int
+    accepted_state: Literal["pending", "sent"]
+
+
+class OutboxStatus(BaseModel):
+    id: int
     state: DeliveryState
-
-
-class OutboxStatus(OutboxAck):
     reason: str
     message_id: int | None
     answer_message_id: int | None
     answer_event_id: int | None
     continuation: str | None
     answer: str | None
-    continuation_state: Literal["none", "waiting", "answered", "stale"]
+    continuation_state: Literal[
+        "none", "queued", "waiting", "answered", "stale", "undeliverable"
+    ]
     continuation_reason: str = ""

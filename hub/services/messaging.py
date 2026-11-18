@@ -29,7 +29,6 @@ addressing in SQL, so no filter can widen it into someone else's mail.
 from __future__ import annotations
 
 import logging
-
 from typing import Any
 
 import aiosqlite
