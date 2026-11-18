@@ -9,6 +9,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from hub.agent_passport_contract import AgentPassport
+
 from hub import config
 from hub.behavior_delta import (
     BehaviorDeltaRecord,
@@ -3202,6 +3204,7 @@ class AgentBootstrap(BaseModel):
     submit_order: list[str]
     human_only: list[str]
     text: str
+    agent_passport: AgentPassport | None = None
 
 
 class TaskEvidenceView(BaseModel):
