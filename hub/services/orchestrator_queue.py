@@ -461,6 +461,7 @@ async def next_task(
     *,
     known_blockers: dict[int, list[dict[str, Any]]] | None = None,
     exclude_state: bool = False,
+    candidate_ids: frozenset[int] | None = None,
 ) -> dict[str, Any]:
     """Ответ очереди для одного проекта. Ничего не пишет.
 
@@ -481,6 +482,7 @@ async def next_task(
             # #1455: эпик и фича здесь есть — их пропуск назван (_skip_reason).
             if t["status"] == "open"
             and t["dor_passed"]
+            and (candidate_ids is None or int(t["id"]) in candidate_ids)
             and not (exclude_state and t["state"])
         ),
         key=_sort_key,
