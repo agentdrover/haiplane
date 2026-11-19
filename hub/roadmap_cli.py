@@ -26,7 +26,9 @@ def add_parser(
     api: Callable[..., Any],
     print_json: Callable[[Any], None],
 ) -> None:
-    roadmap = sub.add_parser("roadmap", help="Manage task-scoped roadmap requests")
+    roadmap = sub.add_parser(
+        "roadmap", help="Manage task-scoped roadmap requests and decisions"
+    )
     operations = roadmap.add_subparsers(dest="roadmap_command", required=True)
 
     def call(args: argparse.Namespace) -> int:
@@ -40,8 +42,8 @@ def add_parser(
         if args.roadmap_command == "request":
             path = f"/api/tasks/{args.task_id}/roadmap-requests"
             body["question"] = _read_question(args.question_file)
-        elif args.roadmap_command == "recover":
-            path = f"/api/tasks/{args.task_id}/roadmap-orders/{args.order_id}/recover"
+        elif args.roadmap_command in ("recover", "decision"):
+            path = f"/api/tasks/{args.task_id}/roadmap-orders/{args.order_id}/{args.roadmap_command}"
         print_json(api(method, path, body) if body else api(method, path))
         return 0
 
@@ -96,3 +98,11 @@ def add_parser(
             "runtime_smoke_passed",
         ),
     )
+
+    decision = operations.add_parser(
+        "decision", help="Evaluate a reported recommendation with its bound steward key"
+    )
+    decision.add_argument("task_id", type=int)
+    decision.add_argument("order_id", type=int)
+    decision.add_argument("--grant-id", required=True, type=int)
+    decision.set_defaults(func=call, method="POST", fields=("grant_id",))

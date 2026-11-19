@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from secrets import compare_digest, token_hex
@@ -13,7 +14,7 @@ from fastapi import HTTPException
 from hub import repository as repo
 from hub.config import TokenIdentity
 from hub.db import fetchall, write_transaction
-from hub.services import admin
+from hub.services import admin, roadmap_decisions
 
 SOURCE = "steward_request"
 _ACTIVE_PLAN_STATES = ("open", "claimed", "running", "needs_info", "needs_decision")
@@ -266,10 +267,13 @@ async def grant(
         active = await _active_grant(db, task_id)
         if active is not None:
             raise HTTPException(409, "revoke the active grant before granting again")
+        checks = await roadmap_decisions.approved_checks(
+            db, plan_id, approval_id, generation
+        )
         cursor = await db.execute(
             "INSERT INTO roadmap_grants "
-            "(project_id, plan_id, task_id, approval_id, plan_generation, task_generation, steward_id, roadmap_id, signal_task_id, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', ?))",
+            "(project_id, plan_id, task_id, approval_id, plan_generation, task_generation, steward_id, roadmap_id, signal_task_id, expires_at, decision_checks_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', ?), ?)",
             (
                 project_id,
                 plan_id,
@@ -281,6 +285,7 @@ async def grant(
                 roadmap_id,
                 signal_task_id,
                 f"+{ttl_days} days",
+                json.dumps(checks, sort_keys=True),
             ),
         )
         grant_id = int(cursor.lastrowid or 0)
@@ -433,6 +438,9 @@ async def grant_signal(
             "approval_id": row["approval_id"],
             "task_id": task_id,
             "signals": await _signals(db, row, after_order_id),
+            "pending_decision_order_id": await roadmap_decisions.pending_order_id(
+                db, row["id"]
+            ),
         }
 
 
@@ -568,4 +576,5 @@ async def started_question(
             "project": project["slug"],
             "source_kind": SOURCE,
             "question": row["question"],
+            "decision_context": roadmap_decisions.decision_context(row),
         }
