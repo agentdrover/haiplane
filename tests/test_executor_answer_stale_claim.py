@@ -1,10 +1,13 @@
 """Answer without resume releases only the finished executor's claim (#2395)."""
 
+import asyncio
+
 import pytest
 
 from hub import repository as repo
 from hub.config import CHAT_PAIR_AGENT
-from hub.services import executor_dispatch
+from hub.poller import SWEEPS
+from hub.services import executor_dispatch, run_claim
 from tests.test_executor_orders import (  # noqa: F401
     _claim_and_start,
     _clean_limiter,
@@ -33,7 +36,7 @@ async def _answered(world, task_id):
     return result.json()
 
 
-async def _question_with_stale_claim(world):
+async def _question_with_stale_claim(world, *, outcome="aborted", live_session=False):
     task_id = await _task(world)
     previous = await _launch_redeem(world, task_id)
     await _claim_and_start(world, task_id, previous["session"])
@@ -44,12 +47,14 @@ async def _question_with_stale_claim(world):
     await repo.add_task_update(
         world.db, task_id, CHAT_PAIR_AGENT, "question", "Продолжать?"
     )
+    if not live_session:
+        await world.db.execute(
+            "UPDATE chat_pair_sessions SET revoked_at = datetime('now') "
+            "WHERE executor_run_id=?",
+            (run_id,),
+        )
     await world.db.execute(
-        "UPDATE chat_pair_sessions SET revoked_at = datetime('now') WHERE executor_run_id=?",
-        (run_id,),
-    )
-    await world.db.execute(
-        "UPDATE executor_runs SET outcome='aborted' WHERE id=?", (run_id,)
+        "UPDATE executor_runs SET outcome=? WHERE id=?", (outcome, run_id)
     )
     await world.db.execute(
         "UPDATE executor_orders SET state='closed', close_reason='aborted' WHERE id=?",
@@ -184,3 +189,123 @@ async def test_delayed_answer_does_not_reopen_a_new_question(slot_world):  # noq
 
     assert (await repo.get_task(world.db, task_id))["status"] == "needs_info"
     assert (await _answered(world, task_id))["status"] == "open"
+
+
+async def _expire_session(db, run_id):
+    await db.execute(
+        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 second') "
+        "WHERE executor_run_id=?",
+        (run_id,),
+    )
+
+
+async def _poll_orders(db):
+    sweep = next(sweep for sweep in SWEEPS if sweep.name == "executor_orders")
+    await sweep.run(db)
+
+
+@pytest.mark.parametrize("blocker", ["running", "live_session"])
+async def test_recorded_answer_reopens_after_live_blocker_ends(
+    slot_world,  # noqa: F811
+    blocker,
+):
+    world = slot_world
+    task_id, run_id = await _question_with_stale_claim(
+        world,
+        outcome="running" if blocker == "running" else "aborted",
+        live_session=blocker == "live_session",
+    )
+    assert (await _answered(world, task_id))["status"] == "needs_info"
+    await _poll_orders(world.db)
+    waiting = dict(await repo.get_task(world.db, task_id))
+    assert waiting["status"] == "needs_info"
+    assert waiting["executor_run_id"] == run_id
+    assert waiting["claim_session_id"] == f"slot-{task_id}"
+
+    worker = await _other_connection(world)
+    try:
+        await worker.execute(
+            "UPDATE executor_runs SET outcome='aborted' WHERE id=?", (run_id,)
+        )
+        await _expire_session(worker, run_id)
+        await worker.commit()
+        await asyncio.gather(_poll_orders(world.db), _poll_orders(worker))
+    finally:
+        await worker.close()
+
+    assert (await repo.get_task(world.db, task_id))["status"] == "open"
+    assert (
+        len(
+            [
+                u
+                for u in await repo.get_task_updates(world.db, task_id)
+                if u["kind"] == "answer"
+            ]
+        )
+        == 1
+    )
+    released = await _rows(
+        world.db,
+        "SELECT id FROM events WHERE kind=? AND task_id=?",
+        (run_claim.EVENT_CLAIM_RELEASED, task_id),
+    )
+    assert len(released) == 1
+    next_run = await _launch_redeem(world, task_id)
+    await _claim_and_start(world, task_id, next_run["session"])
+    await _poll_orders(world.db)
+    assert (await repo.get_task(world.db, task_id))["status"] == "running"
+
+
+async def test_new_question_supersedes_deferred_answer(slot_world):  # noqa: F811
+    world = slot_world
+    task_id, run_id = await _question_with_stale_claim(world, live_session=True)
+    assert (await _answered(world, task_id))["status"] == "needs_info"
+
+    # A later authorized transition opens the task. A new question returns it
+    # to needs_info with the same claim while the old intent is still pending.
+    await repo.update_task(world.db, task_id, status="open")
+    await world.db.commit()
+    asked = await world.client.post(
+        f"/api/tasks/{task_id}/question",
+        json={"question": "Новый вопрос", "agent": "bot"},
+        headers=world.agent_auth,
+    )
+    assert asked.status_code == 200, asked.text
+    await _expire_session(world.db, run_id)
+    await world.db.commit()
+
+    await _poll_orders(world.db)
+    current = dict(await repo.get_task(world.db, task_id))
+    assert current["status"] == "needs_info"
+    assert current["executor_run_id"] == run_id
+    assert (await _answered(world, task_id))["status"] == "open"
+
+
+async def test_new_holder_supersedes_deferred_answer(slot_world):  # noqa: F811
+    world = slot_world
+    task_id, run_id = await _question_with_stale_claim(world, live_session=True)
+    assert (await _answered(world, task_id))["status"] == "needs_info"
+
+    newer = await _other_connection(world)
+    try:
+        await _expire_session(newer, run_id)
+        await repo.update_task(
+            newer,
+            task_id,
+            status="open",
+            claim_session_id=None,
+            claimed_at=None,
+            executor_run_id=None,
+        )
+        await newer.commit()
+        next_run = await _launch_redeem(world, task_id)
+        await _claim_and_start(world, task_id, next_run["session"])
+    finally:
+        await newer.close()
+    await _poll_orders(world.db)
+
+    order = await _order_row(world, next_run["order"]["id"])
+    current = dict(await repo.get_task(world.db, task_id))
+    assert current["status"] == "running"
+    assert current["executor_run_id"] == order["executor_run_id"] != run_id
+    assert current["claimed_by"]
