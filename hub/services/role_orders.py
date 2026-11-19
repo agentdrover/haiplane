@@ -438,7 +438,9 @@ async def _message_steward(
             "role": order["role"],
             "order_id": int(order["id"]),
             "task_id": int(order["task_id"]),
-            "source_key": order["source_key"],
+            "source_key": roadmap_requests.SOURCE
+            if _is_explicit(order)
+            else order["source_key"],
             "outcome": outcome,
         },
         ensure_ascii=False,
@@ -820,6 +822,18 @@ async def _close_by_report(
     return True
 
 
+async def _check_explicit_success(
+    db: aiosqlite.Connection, host: str, order: aiosqlite.Row, lease_id: str
+) -> None:
+    await _check_explicit_freshness(db, order, lease_id)
+    if (
+        _is_explicit(order)
+        and order["lease_id"] == lease_id
+        and not await _is_admitted(db, host, order)
+    ):
+        _refuse(409, "admission_revoked", "допуск хоста к роли отозван")
+
+
 async def report(
     db: aiosqlite.Connection,
     host: str,
@@ -850,7 +864,7 @@ async def report(
         if order["state"] in ("done", "failed") and order["report_digest"] == digest:
             return {"id": int(order_id), "outcome": outcome, "repeat": True}
         if outcome == "done":
-            await _check_explicit_freshness(db, order, lease_id)
+            await _check_explicit_success(db, host, order, lease_id)
         if await _close_by_report(
             db, order, host, lease_id, outcome, sanitize_note(note), digest
         ):

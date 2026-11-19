@@ -83,9 +83,10 @@ async def _request(s, *, auth=None, task_id=None, **overrides):
     )
 
 
-async def _question(s, order_id, auth=None):
+async def _question(s, order_id, auth=None, source_key=""):
     return await s.world.client.get(
-        f"/api/roadmap/orders/{order_id}", headers=auth or s.guest
+        f"/api/roadmap/orders/{order_id}",
+        headers={**(auth or s.guest), "X-Hub-Roadmap-Source": source_key},
     )
 
 
@@ -136,7 +137,11 @@ async def test_roadmap_read_is_bound_to_started_order(scenario):
     assert (
         await support.started(s.world, "k8", order_id, order["lease_id"])
     ).status_code == 200
-    read = await _question(s, order_id)
+    assert (await _question(s, order_id)).status_code == 404
+    assert (
+        await _question(s, order_id, source_key="steward_request:" + "0" * 32)
+    ).status_code == 404
+    read = await _question(s, order_id, source_key=order["source_key"])
     assert read.status_code == 200, read.text
     assert read.json() == {
         "order_id": order_id,
@@ -145,8 +150,12 @@ async def test_roadmap_read_is_bound_to_started_order(scenario):
         "source_kind": "steward_request",
         "question": QUESTION,
     }
-    assert (await _question(s, order_id, s.other_guest)).status_code == 404
-    assert (await _question(s, order_id, s.owner)).status_code == 404
+    assert (
+        await _question(s, order_id, s.other_guest, order["source_key"])
+    ).status_code == 404
+    assert (
+        await _question(s, order_id, s.owner, order["source_key"])
+    ).status_code == 404
     assert (await _question(s, order_id + 1)).status_code == 404
     assert (
         await support.report(s.world, "k8", order_id, order["lease_id"])
@@ -196,7 +205,9 @@ async def test_revocation_and_project_boundary(scenario):
     ).status_code == 200
     revoked = await s.world.client.delete(_grant_path(child), headers=s.owner)
     assert revoked.json() == {"revoked": True}
-    assert (await _question(s, order["id"])).status_code == 404
+    assert (
+        await _question(s, order["id"], source_key=order["source_key"])
+    ).status_code == 404
     assert (
         await support.report(s.world, "k8", order["id"], order["lease_id"])
     ).status_code == 409
@@ -305,3 +316,36 @@ async def test_signal_grant_rejects_other_project_and_survives_event_retention(
     )
     await s.world.db.commit()
     assert (await _request(s)).status_code == 409
+
+
+async def test_scoped_admin_cannot_grant_or_revoke_outside_scope(scenario):
+    s = scenario
+    other = await repo.create_project(
+        s.world.db, slug="outside-admin", name="outside-admin"
+    )
+    assert other != s.world.pid
+    principal = await admin.create_principal(
+        s.world.db, kind="human", username="scoped-admin", role_slug="admin"
+    )
+    key = await admin.create_api_key(
+        s.world.db, principal["id"], name="other-project", projects=["outside-admin"]
+    )
+    scoped = {"Authorization": f"Bearer {key['plaintext_key']}"}
+    path = _grant_path(s.task_id)
+    denied = await s.world.client.put(path, headers=scoped, json=s.grant_body)
+    assert denied.status_code == 403
+    assert (await _grant(s)).status_code == 200
+    assert (await s.world.client.delete(path, headers=scoped)).status_code == 403
+    assert (await _request(s)).status_code == 200
+
+
+async def test_deleted_signal_task_cannot_expand_grant(scenario):
+    s = scenario
+    source = await support.task_in_project(s.world, "source")
+    assert (await _grant(s, signal_task_id=source)).status_code == 200
+    await s.world.db.execute("DELETE FROM tasks WHERE id = ?", (source,))
+    await s.world.db.commit()
+    refused = await _request(s)
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["reason"] == "roadmap_source_invalid"
+    assert await support.order_rows(s.world) == []

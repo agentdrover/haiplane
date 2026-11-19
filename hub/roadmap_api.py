@@ -1,6 +1,6 @@
 """REST operations for the explicit roadmap source."""
 
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from typing import Annotated
 
@@ -66,9 +66,11 @@ async def api_revoke(
 async def api_signal(
     task_id: ResourceId,
     request: Request,
+    response: Response,
     who: TokenIdentity = Depends(current_identity),
     after_order_id: int = Query(default=0, ge=0, le=_MAX_ID),
 ):
+    response.headers["Cache-Control"] = "no-store"
     return await roadmap_requests.grant_signal(
         _db(request), who, task_id, after_order_id
     )
@@ -96,8 +98,11 @@ async def api_issue(
 async def api_started_question(
     order_id: ResourceId,
     request: Request,
+    response: Response,
     who: TokenIdentity = Depends(current_identity),
+    source_key: str = Header(default="", alias="X-Hub-Roadmap-Source"),
 ):
+    response.headers["Cache-Control"] = "no-store"
     return await roadmap_requests.started_question(
-        _db(request), who, order_id, role_orders.RUN_MAX_MINUTES
+        _db(request), who, order_id, source_key, role_orders.RUN_MAX_MINUTES
     )

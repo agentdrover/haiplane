@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
-from typing import Any
+from secrets import compare_digest, token_hex
+from typing import Any, NoReturn
 
 import aiosqlite
 from fastapi import HTTPException
@@ -16,6 +17,10 @@ from hub.services import admin
 
 SOURCE = "steward_request"
 _ACTIVE_PLAN_STATES = ("open", "claimed", "running", "needs_info", "needs_decision")
+
+
+def _conflict(reason: str, message: str) -> NoReturn:
+    raise HTTPException(409, {"reason": reason, "message": message})
 
 
 async def _one(
@@ -186,6 +191,30 @@ async def _signals(
     return [dict(row) for row in rows]
 
 
+async def _require_grantor(
+    db: aiosqlite.Connection,
+    who: TokenIdentity,
+    project_id: int,
+) -> None:
+    if (
+        who.role not in ("admin", "super_admin")
+        or who.auth_source not in ("db_api_key", "db_session", "env")
+        or not await _key_in_project(db, who, project_id)
+    ):
+        raise HTTPException(
+            403, "roadmap grant requires an authenticated administrator for the project"
+        )
+
+
+async def _require_task_grantor(
+    db: aiosqlite.Connection, who: TokenIdentity, task_id: int
+) -> None:
+    project = await repo.resolve_bound_project(db, task_id)
+    if project is None:
+        raise HTTPException(404, "roadmap project not found")
+    await _require_grantor(db, who, project["id"])
+
+
 async def grant(
     db: aiosqlite.Connection,
     who: TokenIdentity,
@@ -197,6 +226,7 @@ async def grant(
     ttl_days: int,
 ) -> dict[str, int]:
     async with write_transaction(db):
+        await _require_task_grantor(db, who, task_id)
         snapshot = await _plan_snapshot(db, task_id, plan_id)
         if snapshot is None:
             raise HTTPException(
@@ -251,9 +281,11 @@ async def revoke(
     db: aiosqlite.Connection, who: TokenIdentity, task_id: int
 ) -> dict[str, bool]:
     async with write_transaction(db):
+        await _require_task_grantor(db, who, task_id)
         active = await _active_grant(db, task_id)
         if active is None:
             return {"revoked": False}
+        await _require_grantor(db, who, active["project_id"])
         await db.execute(
             "UPDATE roadmap_grants SET revoked_at = datetime('now') WHERE id = ?",
             (active["id"],),
@@ -294,16 +326,11 @@ async def _make_order(
         "AND state IN ('open', 'leased', 'started')",
         (row["task_id"],),
     ):
-        raise HTTPException(409, "task already has an active roadmap request")
-    cursor = await db.execute(
-        "INSERT INTO roadmap_requests (grant_id, request_id, question, source_order_id) VALUES (?, ?, ?, ?)",
-        (row["id"], request_id, question, source_order_id),
-    )
-    source_id = int(cursor.lastrowid or 0)
+        _conflict("roadmap_target_busy", "task already has an active roadmap request")
     result = await role_orders.order_role(
         db,
         role=role_orders.ROLE_ROADMAP,
-        source_key=f"{SOURCE}:{source_id}",
+        source_key=f"{SOURCE}:{token_hex(16)}",
         task_id=row["task_id"],
         project_id=row["project_id"],
     )
@@ -311,7 +338,9 @@ async def _make_order(
         raise HTTPException(429, "roadmap order quota exhausted")
     order_id = int(result["id"])
     await db.execute(
-        "UPDATE roadmap_requests SET order_id = ? WHERE id = ?", (order_id, source_id)
+        "INSERT INTO roadmap_requests (grant_id, request_id, question, source_order_id, order_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (row["id"], request_id, question, source_order_id, order_id),
     )
     return order_id
 
@@ -342,7 +371,7 @@ async def _steward_grant(
     if row is None or row["steward_id"] != who.principal_id:
         raise HTTPException(404, "roadmap grant not found")
     if not await _current(db, row):
-        raise HTTPException(409, "roadmap grant is stale")
+        _conflict("roadmap_grant_stale", "roadmap grant is stale")
     if not await _key_in_project(db, who, row["project_id"]):
         raise HTTPException(404, "roadmap grant not found")
     return row
@@ -395,8 +424,8 @@ async def issue(
         if row["plan_id"] != plan_id:
             raise HTTPException(404, "roadmap grant not found")
         if not await _signal_is_current(db, row, source_order_id):
-            raise HTTPException(
-                409,
+            _conflict(
+                "roadmap_source_invalid",
                 "source order is outside the grant or not an eligible technical signal",
             )
         previous = await _one(
@@ -410,8 +439,9 @@ async def issue(
                 previous["question"] != question
                 or previous["source_order_id"] != source_order_id
             ):
-                raise HTTPException(
-                    409, "request identifier already used for another question"
+                _conflict(
+                    "roadmap_request_conflict",
+                    "request identifier already used for another request",
                 )
             return {"order_id": previous["order_id"], "repeat": True}
         if source_order_id is not None and await _one(
@@ -419,7 +449,10 @@ async def issue(
             "SELECT 1 FROM roadmap_requests WHERE grant_id = ? AND source_order_id = ?",
             (row["id"], source_order_id),
         ):
-            raise HTTPException(409, "source order already has a roadmap request")
+            _conflict(
+                "roadmap_source_already_requested",
+                "source order already has a roadmap request",
+            )
         order_id = await _make_order(db, row, request_id, question, source_order_id)
         await _audit(
             db,
@@ -434,10 +467,10 @@ async def issue(
 async def _request(db: aiosqlite.Connection, order_id: int) -> aiosqlite.Row | None:
     return await _one(
         db,
-        "SELECT g.*, r.question, r.source_order_id, o.state, o.host, o.started_at, o.role "
+        "SELECT g.*, r.question, r.source_order_id, o.state, o.host, o.started_at, o.role, o.source_key "
         "FROM roadmap_requests r JOIN roadmap_grants g ON g.id = r.grant_id "
         "JOIN role_orders o ON o.id = r.order_id "
-        "WHERE o.id = ? AND o.role = 'roadmap' AND o.source_key = 'steward_request:' || r.id "
+        "WHERE o.id = ? AND o.role = 'roadmap' "
         "AND o.task_id = g.task_id AND o.project_id = g.project_id",
         (order_id,),
     )
@@ -458,8 +491,11 @@ async def started_question(
     db: aiosqlite.Connection,
     who: TokenIdentity,
     order_id: int,
+    source_key: str,
     max_minutes: int,
 ) -> dict[str, Any]:
+    if not source_key.isascii() or len(source_key) != len(SOURCE) + 33:
+        raise HTTPException(404, "roadmap order not found")
     async with _read_snapshot(db):
         row = await _request(db, order_id)
         if (
@@ -468,6 +504,7 @@ async def started_question(
             or who.auth_source != "db_api_key"
             or who.role != "agent"
             or row["roadmap_id"] != who.principal_id
+            or not compare_digest(row["source_key"], source_key)
             or not await _key_in_project(db, who, row["project_id"])
             or not await _request_is_current(db, row)
         ):
