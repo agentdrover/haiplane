@@ -168,6 +168,27 @@ async def _signal_is_current(
     )
 
 
+_SOURCE_ALREADY_CONSULTED = (
+    "SELECT 1 FROM roadmap_requests r "
+    "JOIN roadmap_grants previous ON previous.id = r.grant_id "
+    "JOIN roadmap_grants existing ON existing.id = ? "
+    "WHERE previous.project_id = existing.project_id AND previous.plan_id = existing.plan_id "
+    "AND previous.task_id = existing.task_id AND previous.approval_id = existing.approval_id "
+    "AND r.source_order_id = "
+)
+
+
+async def _source_already_consulted(
+    db: aiosqlite.Connection,
+    grant_id: int,
+    source_order_id: int,
+) -> bool:
+    return (
+        await _one(db, _SOURCE_ALREADY_CONSULTED + "?", (grant_id, source_order_id))
+        is not None
+    )
+
+
 async def _signals(
     db: aiosqlite.Connection,
     grant: aiosqlite.Row,
@@ -184,8 +205,9 @@ async def _signals(
         "o.report_outcome AS outcome, o.report_reason_code AS reason_code "
         "FROM executor_orders o WHERE "
         + _SIGNAL_FILTER
-        + " AND o.id > ? AND NOT EXISTS (SELECT 1 FROM roadmap_requests r "  # nosec B608
-        "WHERE r.grant_id = ? AND r.source_order_id = o.id) ORDER BY o.id LIMIT 20",
+        + " AND o.id > ? AND NOT EXISTS ("
+        + _SOURCE_ALREADY_CONSULTED
+        + "o.id) ORDER BY o.id LIMIT 20",
         (task_id, after_order_id, grant["id"]),
     )
     return [dict(row) for row in rows]
@@ -370,10 +392,10 @@ async def _steward_grant(
     row = await _active_grant(db, task_id)
     if row is None or row["steward_id"] != who.principal_id:
         raise HTTPException(404, "roadmap grant not found")
-    if not await _current(db, row):
-        _conflict("roadmap_grant_stale", "roadmap grant is stale")
     if not await _key_in_project(db, who, row["project_id"]):
         raise HTTPException(404, "roadmap grant not found")
+    if not await _current(db, row):
+        _conflict("roadmap_grant_stale", "roadmap grant is stale")
     return row
 
 
@@ -415,6 +437,7 @@ async def issue(
     who: TokenIdentity,
     task_id: int,
     plan_id: int,
+    grant_id: int,
     request_id: str,
     question: str,
     source_order_id: int | None,
@@ -423,6 +446,8 @@ async def issue(
         row = await _steward_grant(db, who, task_id)
         if row["plan_id"] != plan_id:
             raise HTTPException(404, "roadmap grant not found")
+        if row["id"] != grant_id:
+            _conflict("roadmap_grant_stale", "roadmap grant was replaced")
         if not await _signal_is_current(db, row, source_order_id):
             _conflict(
                 "roadmap_source_invalid",
@@ -444,10 +469,10 @@ async def issue(
                     "request identifier already used for another request",
                 )
             return {"order_id": previous["order_id"], "repeat": True}
-        if source_order_id is not None and await _one(
+        if source_order_id is not None and await _source_already_consulted(
             db,
-            "SELECT 1 FROM roadmap_requests WHERE grant_id = ? AND source_order_id = ?",
-            (row["id"], source_order_id),
+            grant_id,
+            source_order_id,
         ):
             _conflict(
                 "roadmap_source_already_requested",

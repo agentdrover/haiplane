@@ -29,6 +29,7 @@ class RoadmapRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     plan_id: int = Field(gt=0, le=_MAX_ID)
+    grant_id: int = Field(gt=0, le=_MAX_ID)
     source_order_id: int | None = Field(default=None, gt=0, le=_MAX_ID)
     request_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,80}$")
     question: Annotated[
@@ -88,6 +89,7 @@ async def api_issue(
         who,
         task_id,
         body.plan_id,
+        body.grant_id,
         body.request_id,
         body.question,
         body.source_order_id,

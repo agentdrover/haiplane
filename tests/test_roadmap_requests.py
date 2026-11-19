@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+from io import StringIO
 from types import SimpleNamespace
 
 import pytest
 
 from hub import repository as repo
+from hub import roadmap_cli
 from hub.services import admin
 from tests import role_orders_support as support
 from tests import test_executor_orders as executor_tests
@@ -50,6 +53,7 @@ async def scenario(world):
         other_steward=other_steward,
         guest=roadmap_auth,
         other_guest=other_guest,
+        grants={},
         grant_body={
             "plan_id": task_id,
             "steward_principal_id": steward_id,
@@ -63,11 +67,15 @@ def _grant_path(task_id):
 
 
 async def _grant(s, task_id=None, **overrides):
-    return await s.world.client.put(
-        _grant_path(task_id or s.task_id),
+    target = task_id or s.task_id
+    response = await s.world.client.put(
+        _grant_path(target),
         headers=s.owner,
         json={**s.grant_body, **overrides},
     )
+    if response.status_code == 200:
+        s.grants[target] = response.json()["grant_id"]
+    return response
 
 
 async def _request(s, *, auth=None, task_id=None, **overrides):
@@ -76,6 +84,7 @@ async def _request(s, *, auth=None, task_id=None, **overrides):
         headers=auth or s.steward,
         json={
             "plan_id": s.task_id,
+            "grant_id": s.grants.get(task_id or s.task_id, 1),
             "request_id": "one",
             "question": QUESTION,
             **overrides,
@@ -143,6 +152,10 @@ async def test_roadmap_read_is_bound_to_started_order(scenario):
     ).status_code == 404
     read = await _question(s, order_id, source_key=order["source_key"])
     assert read.status_code == 200, read.text
+    assert read.headers["cache-control"] == "no-store"
+    card = await s.world.client.get(f"/api/tasks/{s.task_id}", headers=s.guest)
+    assert order["source_key"] not in card.text
+    assert QUESTION not in card.text
     assert read.json() == {
         "order_id": order_id,
         "task_id": s.task_id,
@@ -349,3 +362,71 @@ async def test_deleted_signal_task_cannot_expand_grant(scenario):
     assert refused.status_code == 409
     assert refused.json()["detail"]["reason"] == "roadmap_source_invalid"
     assert await support.order_rows(s.world) == []
+
+
+async def test_replacement_grant_rejects_old_intent_and_does_not_relist_source(
+    scenario,
+):
+    s = scenario
+    source = await support.task_in_project(s.world, "source")
+    first_grant = (await _grant(s, signal_task_id=source)).json()["grant_id"]
+    order_a = await _record_redeem_failure(s.world, source)
+    order_b = await _record_redeem_failure(s.world, source)
+    first = await _request(s, source_order_id=order_a)
+    assert first.status_code == 200, first.text
+    revoked = await s.world.client.delete(_grant_path(s.task_id), headers=s.owner)
+    assert revoked.json() == {"revoked": True}
+    assert (await _grant(s, signal_task_id=source)).status_code == 200
+    outdated = await _request(s, grant_id=first_grant, source_order_id=order_b)
+    assert outdated.status_code == 409
+    assert outdated.json()["detail"]["reason"] == "roadmap_grant_stale"
+    replay = await _request(s, source_order_id=order_a)
+    assert replay.status_code == 409
+    assert replay.json()["detail"]["reason"] == "roadmap_source_already_requested"
+    current = await s.world.client.get(_grant_path(s.task_id), headers=s.steward)
+    assert current.status_code == 200, current.text
+    assert [item["executor_order_id"] for item in current.json()["signals"]] == [
+        order_b
+    ]
+    assert len(await support.order_rows(s.world)) == 1
+
+
+def test_cli_reads_question_from_stdin(monkeypatch):
+    parser = argparse.ArgumentParser()
+    operations = parser.add_subparsers(required=True)
+    calls = []
+    roadmap_cli.add_parser(
+        operations, lambda *args: calls.append(args), lambda result: None
+    )
+    monkeypatch.setattr("sys.stdin", StringIO(QUESTION))
+    args = parser.parse_args(
+        [
+            "roadmap",
+            "request",
+            "2386",
+            "--plan-id",
+            "2386",
+            "--grant-id",
+            "4",
+            "--source-order-id",
+            "37",
+            "--request-id",
+            "one",
+            "--question-file",
+            "-",
+        ]
+    )
+    assert args.func(args) == 0
+    assert calls == [
+        (
+            "POST",
+            "/api/tasks/2386/roadmap-requests",
+            {
+                "plan_id": 2386,
+                "grant_id": 4,
+                "request_id": "one",
+                "source_order_id": 37,
+                "question": QUESTION,
+            },
+        )
+    ]

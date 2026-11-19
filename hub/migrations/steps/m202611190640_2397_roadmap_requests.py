@@ -47,6 +47,11 @@ MIGRATIONS = [
         )""",
     ),
     (
+        "index_roadmap_signal_source_order",
+        "CREATE INDEX IF NOT EXISTS idx_roadmap_signal_source_order "
+        "ON roadmap_requests(source_order_id)",
+    ),
+    (
         "index_roadmap_order_request",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_roadmap_order_request ON roadmap_requests(order_id)",
     ),

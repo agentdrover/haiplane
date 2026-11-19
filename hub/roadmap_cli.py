@@ -1,8 +1,24 @@
 """CLI entry points for roadmap grants and requests."""
 
 import argparse
+import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
+
+
+def _read_question(filename: str) -> str:
+    try:
+        if filename == "-":
+            question = sys.stdin.read(2001)
+        else:
+            with Path(filename).open(encoding="utf-8") as stream:
+                question = stream.read(2001)
+    except (OSError, UnicodeError):
+        raise SystemExit("Could not read the roadmap question as UTF-8") from None
+    if len(question) > 2000 or not question.strip():
+        raise SystemExit("Roadmap questions must contain 1–2000 characters")
+    return question
 
 
 def add_parser(
@@ -23,6 +39,7 @@ def add_parser(
         }
         if args.roadmap_command == "request":
             path = f"/api/tasks/{args.task_id}/roadmap-requests"
+            body["question"] = _read_question(args.question_file)
         print_json(api(method, path, body) if body else api(method, path))
         return 0
 
@@ -40,14 +57,20 @@ def add_parser(
         ),
         ("revoke", "DELETE", ()),
         ("signal", "GET", ()),
-        ("request", "POST", ("plan_id", "request_id", "question", "source_order_id")),
+        ("request", "POST", ("plan_id", "grant_id", "request_id", "source_order_id")),
     ):
         parser = operations.add_parser(name)
         parser.add_argument("task_id", type=int)
+        if name == "request":
+            parser.add_argument(
+                "--question-file",
+                required=True,
+                help="UTF-8 question file or - for stdin",
+            )
         for field in fields:
             parser.add_argument(
                 "--" + field.replace("_", "-"),
                 required=field not in ("signal_task_id", "source_order_id", "ttl_days"),
-                type=int if field != "request_id" and field != "question" else str,
+                type=str if field == "request_id" else int,
             )
         parser.set_defaults(func=call, method=method, fields=fields)
