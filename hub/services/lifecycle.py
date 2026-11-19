@@ -5551,25 +5551,25 @@ async def answer_question(
     who: Any = None,
 ) -> TaskView:
     """Answer a question and optionally resume the task."""
-    row = await repo.get_task(db, task_id)
-    if not row:
-        raise HTTPException(404, "task not found")
-    task = dict(row)
-    if task["status"] != "needs_info":
-        raise HTTPException(
-            400,
-            f"can only answer needs_info tasks, current status: {task['status']}",
-        )
+    async with write_transaction(db):
+        row = await repo.get_task(db, task_id)
+        if not row:
+            raise HTTPException(404, "task not found")
+        task = dict(row)
+        if task["status"] != "needs_info":
+            raise HTTPException(
+                400,
+                f"can only answer needs_info tasks, current status: {task['status']}",
+            )
 
-    await repo.add_task_update(db, task_id, "", "answer", body.answer)
-    await repo.insert_event(
-        db,
-        kind="question_answered",
-        task_id=task_id,
-        actor="human",
-        payload={"resume": bool(body.resume), **owner_minutes.stamp(who)},
-    )
-    await db.commit()
+        answer_id = await repo.add_task_update(db, task_id, "", "answer", body.answer)
+        await repo.insert_event(
+            db,
+            kind="question_answered",
+            task_id=task_id,
+            actor="human",
+            payload={"resume": bool(body.resume), **owner_minutes.stamp(who)},
+        )
 
     from hub.services.executor_dispatch import answer_for_executor
     from hub.services.run_claim import reopen_after_answer
@@ -5607,7 +5607,7 @@ async def answer_question(
                 f"Task #{task_id}: answered and re-dispatched",
                 detail=mutation_activity_detail(),
             )
-    elif await reopen_after_answer(db, task):
+    elif await reopen_after_answer(db, task, answer_id=answer_id):
         await log_activity(
             db,
             "task_answered",

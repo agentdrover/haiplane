@@ -152,3 +152,35 @@ async def test_answer_does_not_clear_live_competing_claim(
         "AND kind='implementer' AND revoked_at IS NULL",
         (task_id,),
     ) == [{"executor_run_id": live["executor_run_id"]}]
+
+
+async def test_delayed_answer_does_not_reopen_a_new_question(slot_world):  # noqa: F811
+    world = slot_world
+    task_id = await _task(world)
+    original = executor_dispatch.answer_for_executor
+
+    async def ask(question):
+        response = await world.client.post(
+            f"/api/tasks/{task_id}/question",
+            json={"question": question, "agent": "bot"},
+            headers=world.agent_auth,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "needs_info"
+
+    await ask("Первый вопрос")
+
+    async def answer_first_then_ask_again(db, seen, *, resume):
+        monkeypatch.undo()
+        assert (await _answered(world, task_id))["status"] == "open"
+        await ask("Второй вопрос")
+        return await original(db, seen, resume=resume)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            executor_dispatch, "answer_for_executor", answer_first_then_ask_again
+        )
+        assert (await _answered(world, task_id))["status"] == "needs_info"
+
+    assert (await repo.get_task(world.db, task_id))["status"] == "needs_info"
+    assert (await _answered(world, task_id))["status"] == "open"

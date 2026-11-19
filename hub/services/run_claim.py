@@ -333,9 +333,9 @@ async def release_run_claim(
 
 
 async def reopen_after_answer(
-    db: aiosqlite.Connection, answered: dict[str, Any]
+    db: aiosqlite.Connection, answered: dict[str, Any], *, answer_id: int
 ) -> bool:
-    """Return the answered task to the queue without touching a newer claim."""
+    """Return the answered task to the queue while its question and claim are current."""
     task_id = int(answered["id"])
     async with write_transaction(db):
         current = await repo.get_task(db, task_id)
@@ -349,6 +349,15 @@ async def reopen_after_answer(
             "executor_run_id",
         )
         if any(current[field] != answered[field] for field in claim_fields):
+            return False
+
+        # needs_info can recur with exactly the same claim after another answer.
+        if await fetchall(
+            db,
+            "SELECT 1 FROM task_updates WHERE task_id = ? AND id > ? "
+            "AND kind IN ('question', 'answer') LIMIT 1",
+            (task_id, answer_id),
+        ):
             return False
         if (run_id := current["executor_run_id"]) is not None:
             await release_run_claim(
