@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import quote
@@ -57,6 +58,8 @@ SHA = re.compile(r"[0-9a-f]{40}")
 PAGE_SIZE = 100
 MAX_PAGES = 10
 MAX_ATTEMPTS = 10
+MAX_JOB_ATTEMPTS = 40
+MAX_CONCURRENT_READS = 8
 PROBE_TIMEOUT = 45
 Get = Callable[[str], Awaitable[tuple[Any, bool]]]
 Facts = dict[str, Any]
@@ -198,8 +201,10 @@ async def attempt_jobs(get: Get, api: str, run: Facts) -> dict[str, Facts]:
     )
     for job in rows:
         if (
-            job.get("run_id") != run["id"]
-            or job.get("run_attempt") != run["run_attempt"]
+            type(job.get("run_id")) is not int
+            or job["run_id"] != run["id"]
+            or type(job.get("run_attempt")) is not int
+            or job["run_attempt"] != run["run_attempt"]
             or job.get("head_sha") != run["head_sha"]
             or type(job.get("id")) is not int
             or job["id"] <= 0
@@ -285,8 +290,7 @@ async def _billing_annotation(get: Get, api: str, job: Facts) -> bool:
     )
 
 
-async def billing_jobs(get: Get, api: str, run: Facts) -> dict[str, Facts]:
-    jobs = await attempt_jobs(get, api, run)
+async def prove_billing(get: Get, api: str, jobs: dict[str, Facts]) -> None:
     if jobs.keys() != CORE_JOBS.keys() | OPTIONAL_JOBS:
         raise Unverified("hosted job coverage not established")
     hosted = [jobs[name] for name in (*CORE_JOBS, HOSTED_COLLECTOR)]
@@ -306,7 +310,6 @@ async def billing_jobs(get: Get, api: str, run: Facts) -> dict[str, Facts]:
         await asyncio.gather(*(_billing_annotation(get, api, job) for job in hosted))
     ):
         raise Unverified("older failure has no authoritative billing annotation")
-    return jobs
 
 
 async def branch_proof(get: Get, api: str, base: str, base_ref: str) -> None:
@@ -343,14 +346,70 @@ async def policy_proof(
     return head_blob["sha"], base_blob["sha"]
 
 
-async def previous_attempt_jobs(get: Get, api: str, run: Facts) -> list[Facts]:
-    attempt = run["run_attempt"]
-    if attempt > MAX_ATTEMPTS:
+def _validate_history_run(run: Facts, sha: str) -> None:
+    if (
+        run.get("head_sha") != sha
+        or _repo_name(run.get("repository")) != PILOT_REPO
+        or _repo_name(run.get("head_repository")) != PILOT_REPO
+        or any(
+            type(run.get(field)) is not int or run[field] <= 0
+            for field in ("id", "run_attempt", "check_suite_id", "workflow_id")
+        )
+        or any(
+            not isinstance(run.get(field), str) or not run[field]
+            for field in ("event", "head_branch", "path")
+        )
+    ):
+        raise Unverified(f"attempt history identity is unreadable: {label(run)}")
+    if run["run_attempt"] > MAX_ATTEMPTS:
         raise Unverified("workflow attempt history exceeds proof limit")
-    history = await asyncio.gather(
-        *(attempt_jobs(get, api, {**run, "run_attempt": n}) for n in range(1, attempt))
-    )
-    return [job for jobs in history for job in jobs.values()]
+
+
+def _history_runs(
+    runs: list[Facts], profile_runs: tuple[Facts, ...], sha: str, *, ordinary: bool
+) -> list[Facts]:
+    required = {run["id"] for run in profile_runs}
+    suite_counts = Counter(run.get("check_suite_id") for run in runs)
+    selected = [
+        run
+        for run in runs
+        if run["id"] in required
+        or run.get("run_attempt") != 1
+        or (ordinary and run.get("event") == "workflow_dispatch")
+    ]
+    for run in selected:
+        _validate_history_run(run, sha)
+        if suite_counts[run["check_suite_id"]] != 1:
+            raise Unverified("check suite maps to multiple workflow runs")
+    if sum(run["run_attempt"] for run in selected) > MAX_JOB_ATTEMPTS:
+        raise Unverified("workflow evidence exceeds attempt read budget")
+    return selected
+
+
+async def _read_histories(
+    get: Get, api: str, runs: list[Facts]
+) -> dict[int, list[dict[str, Facts]]]:
+    histories: dict[int, list[dict[str, Facts]]] = {}
+    tasks = []
+    for run in runs:
+        for number in range(1, run["run_attempt"] + 1):
+            tasks.append(
+                (
+                    run["id"],
+                    asyncio.create_task(
+                        attempt_jobs(get, api, {**run, "run_attempt": number})
+                    ),
+                )
+            )
+    try:
+        for run_id, task in tasks:
+            histories.setdefault(run_id, []).append(await task)
+    finally:
+        for _, task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
+    return histories
 
 
 def _match_action_check(check: Facts, run: Facts, job: Facts) -> None:
@@ -385,44 +444,66 @@ class CheckSnapshot:
             raise Unverified("check run maps to multiple Actions jobs")
         self.claimed.add(job_id)
         check = self.by_id.get(job_id)
-        if check is not None or required:
-            _match_action_check(check if check is not None else {}, run, job)
+        if check is None:
+            if required:
+                raise Unverified(
+                    f"official check missing for job {job_id}: {label(run)}"
+                )
+            return None
+        _match_action_check(check, run, job)
         return check
 
-    def current(
-        self,
-        run: Facts,
-        jobs: dict[str, Facts],
-        *,
-        remove: bool = False,
-    ) -> None:
-        for job in jobs.values():
-            self.match(run, job, required=True)
-            if remove:
-                del self.by_id[job["id"]]
-
-    def superseded(self, run: Facts, jobs: list[Facts]) -> None:
-        for job in jobs:
-            check = self.match(run, job, required=False)
-            if check is not None and job.get("status") == "completed":
-                del self.by_id[job["id"]]
-
-    def optional(self, run: Facts, jobs: dict[str, Facts]) -> CIProbeResult | None:
-        for job in jobs.values():
-            result = verdict(job, job["name"])
-            if result.outcome == CIProbeOutcome.pending and not (
-                _genuinely_pending(run) and _genuinely_pending(job)
-            ):
-                raise Unverified(
-                    f"pending job conflicts with dispatch state: {label(run)}"
-                )
-            benign = result.outcome in {CIProbeOutcome.passed, CIProbeOutcome.pending}
-            check = self.match(run, job, required=not benign)
-            if not benign:
-                return result
+    def normalize(
+        self, run: Facts, attempts: list[dict[str, Facts]], *, optional: bool
+    ) -> CIProbeResult | None:
+        # IDs bind check ownership; the name identifies the job slot across
+        # attempts of this run. A partial rerun may leave earlier jobs current.
+        verified = set()
+        for job in attempts[-1].values():
+            check, blocked = self._current_check(run, job, optional=optional)
+            if blocked:
+                return blocked
             if check is not None:
-                del self.by_id[job["id"]]
+                verified.add(job["name"])
+        for attempt in reversed(attempts[:-1]):
+            self._apply_older_attempt(run, attempt, verified)
         return None
+
+    def _current_check(
+        self, run: Facts, job: Facts, *, optional: bool
+    ) -> tuple[Facts | None, CIProbeResult | None]:
+        if not optional:
+            return self.match(run, job, required=True), None
+        result = verdict(job, job["name"])
+        pending = result.outcome == CIProbeOutcome.pending
+        if pending and not (_genuinely_pending(run) and _genuinely_pending(job)):
+            raise Unverified(f"pending job conflicts with dispatch state: {label(run)}")
+        benign = pending or result.outcome == CIProbeOutcome.passed
+        check = self.match(run, job, required=not benign or run["run_attempt"] > 1)
+        if pending and check is not None:
+            del self.by_id[job["id"]]
+        return check, None if benign else result
+
+    def _apply_older_attempt(
+        self, run: Facts, jobs: dict[str, Facts], verified: set[str]
+    ) -> None:
+        for name, job in jobs.items():
+            result = verdict(job, name)
+            obsolete = (
+                name in verified
+                and job.get("status") == "completed"
+                and result.outcome != CIProbeOutcome.unavailable
+            )
+            check = self.match(
+                run,
+                job,
+                required=not obsolete and result.outcome != CIProbeOutcome.passed,
+            )
+            if check is None:
+                continue
+            if obsolete:
+                del self.by_id[job["id"]]
+            verified.add(name)
 
 
 def _independent(checks: list[Facts], statuses: list[Facts]) -> CIProbeResult | None:
@@ -456,31 +537,6 @@ async def _commit_ci(get: Get, api: str, sha: str) -> tuple[list[Facts], list[Fa
     return checks, statuses
 
 
-async def _optional_dispatch_checks(
-    get: Get, api: str, sha: str, runs: list[Facts], checks: CheckSnapshot
-) -> CIProbeResult | None:
-    dispatches = [run for run in runs if run.get("event") == "workflow_dispatch"]
-    if not all(
-        run.get("head_sha") == sha
-        and _repo_name(run.get("repository")) == PILOT_REPO
-        and _repo_name(run.get("head_repository")) == PILOT_REPO
-        and type(run.get("id")) is int
-        and run["id"] > 0
-        and type(run.get("run_attempt")) is int
-        and run["run_attempt"] > 0
-        for run in dispatches
-    ):
-        raise Unverified("unrelated dispatch identity is unreadable")
-    for run in dispatches:
-        jobs = await attempt_jobs(get, api, run)
-        if blocked := checks.optional(run, jobs):
-            return blocked
-        # The ordinary route permits a pending, successful, skipped or neutral
-        # dispatch. Its historical check IDs are stale in all four states.
-        checks.superseded(run, await previous_attempt_jobs(get, api, run))
-    return None
-
-
 def _ordinary_profile(jobs: dict[str, Facts], run: Facts, collector: bool) -> str:
     if (
         jobs.keys() == CORE_JOBS.keys() | OPTIONAL_JOBS
@@ -504,29 +560,41 @@ def _ordinary_profile(jobs: dict[str, Facts], run: Facts, collector: bool) -> st
         ) from exc
 
 
-async def _ordinary_proof(
+async def _profile_result(
     get: Get,
     api: str,
-    refs: tuple[str, str, str, str],
-    runs: list[Facts],
-    selected: Facts,
+    selection: tuple[Facts, Facts] | Facts,
+    histories: dict[int, list[dict[str, Facts]]],
+    checks: CheckSnapshot,
+    *,
+    collector: bool,
 ) -> CIProbeResult:
-    _, sha, base_ref, base = refs
-    jobs, previous, snapshot, policy = await asyncio.gather(
-        attempt_jobs(get, api, selected),
-        previous_attempt_jobs(get, api, selected),
-        _commit_ci(get, api, sha),
-        policy_proof(get, api, sha, base, base_ref),
+    if isinstance(selection, dict):
+        jobs = histories[selection["id"]][-1]
+        profile = _ordinary_profile(jobs, selection, collector)
+        return CIProbeResult(
+            CIProbeOutcome.passed,
+            "ci_ordinary_pr_proved",
+            f"{label(selection)}: {profile}",
+        )
+    old, new = selection
+    profile = native_profile(
+        histories[new["id"]][-1], new, collector_required=collector
     )
-    checks, statuses = snapshot
-    bound = CheckSnapshot(checks)
-    profile = _ordinary_profile(jobs, selected, WORKFLOW_BLOBS[policy[0]])
-    bound.current(selected, jobs)
-    bound.superseded(selected, previous)
-    if blocked := await _optional_dispatch_checks(get, api, sha, runs, bound):
-        return blocked
-    return _independent(list(bound.by_id.values()), statuses) or CIProbeResult(
-        CIProbeOutcome.passed, "ci_ordinary_pr_proved", f"{label(selected)}: {profile}"
+    if old.get("conclusion") != "failure":
+        return CIProbeResult(
+            CIProbeOutcome.passed,
+            "ci_native_run_proved",
+            f"{label(new)}: {profile}; with successful {label(old)}",
+        )
+    old_jobs = histories[old["id"]][-1]
+    await prove_billing(get, api, old_jobs)
+    for job in old_jobs.values():
+        del checks.by_id[job["id"]]
+    return CIProbeResult(
+        CIProbeOutcome.passed,
+        "ci_equivalent_native_run",
+        f"{label(new)}: {profile}; supersedes billing-only {label(old)}",
     )
 
 
@@ -536,13 +604,23 @@ async def equivalent_probe(
     """Return None when ordinary PR checks should decide."""
     api = f"repos/{PILOT_REPO}"
     interrupted: set[str] = set()
+    capacity = asyncio.Semaphore(MAX_CONCURRENT_READS)
+    active: set[asyncio.Future[tuple[Any, bool]]] = set()
+    finished = False
 
     async def track_evidence_read(endpoint: str) -> tuple[Any, bool]:
-        try:
-            return await get(endpoint)
-        except asyncio.CancelledError:
-            interrupted.add(endpoint)
-            raise
+        async with capacity:
+            if finished:
+                raise asyncio.CancelledError
+            request = asyncio.ensure_future(get(endpoint))
+            active.add(request)
+            try:
+                return await request
+            except asyncio.CancelledError:
+                interrupted.add(endpoint)
+                raise
+            finally:
+                active.discard(request)
 
     try:
         async with asyncio.timeout(PROBE_TIMEOUT):
@@ -560,6 +638,12 @@ async def equivalent_probe(
         return CIProbeResult(
             CIProbeOutcome.unavailable, "ci_equivalence_unproved", str(exc)
         )
+    finally:
+        # gather() can raise while independent reads are still outstanding.
+        finished = True
+        for request in active:
+            request.cancel()
+        await asyncio.gather(*active, return_exceptions=True)
 
 
 async def _equivalent(
@@ -574,61 +658,34 @@ async def _equivalent(
         return selection
     if contract_fingerprint != PILOT_CONTRACT:
         raise Unverified("project CI contract is outside the audited dispatch profile")
-    if isinstance(selection, dict):
-        ordinary_result = await _ordinary_proof(get, api, refs, runs, selection)
-        if ordinary_result.outcome == CIProbeOutcome.passed:
-            await _recheck(get, pull_path, run_path, refs, runs)
-            confirmed = await _ordinary_proof(get, api, refs, runs, selection)
-            return confirmed
-        return ordinary_result
-    old, new = selection
-    billing = old.get("conclusion") == "failure"
-    (
-        policy,
-        old_jobs,
-        new_jobs,
-        old_history,
-        new_history,
-        snapshot,
-    ) = await asyncio.gather(
+    ordinary = isinstance(selection, dict)
+    profile_runs = (selection,) if isinstance(selection, dict) else selection
+    audited = _history_runs(runs, profile_runs, sha, ordinary=ordinary)
+    policy, snapshot, histories = await asyncio.gather(
         policy_proof(get, api, sha, base, base_ref),
-        billing_jobs(get, api, old) if billing else attempt_jobs(get, api, old),
-        attempt_jobs(get, api, new),
-        previous_attempt_jobs(get, api, old),
-        previous_attempt_jobs(get, api, new),
         _commit_ci(get, api, sha),
+        _read_histories(get, api, audited),
     )
     checks, statuses = snapshot
-    profile = native_profile(
-        new_jobs, new, collector_required=WORKFLOW_BLOBS[policy[0]]
-    )
     bound = CheckSnapshot(checks)
-    bound.current(old, old_jobs, remove=billing)
-    bound.current(new, new_jobs, remove=True)
-    bound.superseded(old, old_history)
-    bound.superseded(new, new_history)
+    for run in audited:
+        optional = ordinary and run.get("event") == "workflow_dispatch"
+        if blocked := bound.normalize(run, histories[run["id"]], optional=optional):
+            return blocked
+    result = await _profile_result(
+        get, api, selection, histories, bound, collector=WORKFLOW_BLOBS[policy[0]]
+    )
     if blocked := _independent(list(bound.by_id.values()), statuses):
         return blocked
     await _recheck(get, pull_path, run_path, refs, runs)
-    fresh_policy, fresh_checks, fresh_statuses = await asyncio.gather(
-        policy_proof(get, api, sha, base, base_ref),
-        pages(get, f"{api}/commits/{sha}/check-runs?filter=all", "check_runs"),
-        pages(get, f"{api}/commits/{sha}/statuses"),
+    fresh_policy, fresh_snapshot = await asyncio.gather(
+        policy_proof(get, api, sha, base, base_ref), _commit_ci(get, api, sha)
     )
     if policy != fresh_policy:
         raise Unverified("workflow version changed during the probe")
-    if checks != fresh_checks or statuses != fresh_statuses:
+    if snapshot != fresh_snapshot:
         raise Unverified("independent checks or statuses changed during the probe")
-    return CIProbeResult(
-        CIProbeOutcome.passed,
-        "ci_equivalent_native_run" if billing else "ci_native_run_proved",
-        f"{label(new)}: {profile}; "
-        + (
-            f"supersedes billing-only {label(old)}"
-            if billing
-            else f"with successful {label(old)}"
-        ),
-    )
+    return result
 
 
 def _blocking_run(runs: list[Facts]) -> CIProbeResult | None:
@@ -642,8 +699,6 @@ def _blocking_run(runs: list[Facts]) -> CIProbeResult | None:
 def _ordinary_pr(
     runs: list[Facts], dispatches: list[Facts], ref: str, sha: str, pr: int
 ) -> Facts | CIProbeResult | None:
-    if not dispatches:
-        return _blocking_run(runs)
     relevant = [
         run
         for run in runs
@@ -651,6 +706,10 @@ def _ordinary_pr(
     ]
     if blocked := _blocking_run(relevant):
         return blocked
+    if not dispatches and all(
+        type(run.get("run_attempt")) is int and run["run_attempt"] == 1 for run in runs
+    ):
+        return None
     eligible = [
         run
         for run in relevant
@@ -713,14 +772,5 @@ async def _recheck(
     pr, fresh = await asyncio.gather(
         read(get, pull_path), pages(get, run_path, "workflow_runs")
     )
-    fields = ("id", "run_attempt", "status", "conclusion", "updated_at")
-
-    def identity(rows: list[Facts]) -> set[tuple[Any, ...]]:
-        return {tuple(row.get(key) for key in fields) for row in rows}
-
-    if (
-        pr_refs(pr) != refs
-        or len(fresh) != len(runs)
-        or identity(fresh) != identity(runs)
-    ):
+    if pr_refs(pr) != refs or index(fresh, "id") != index(runs, "id"):
         raise Unverified("PR refs or workflow runs changed during the probe")
