@@ -27,9 +27,11 @@ def _print_role_orders(result: Any) -> None:
         if view.get("unavailable"):
             print(f"Заказы ролей: {view['unavailable']}", file=sys.stderr)
         else:
+            recovered = view.get("recovery_of")
+            parent = f", восстановление #{recovered}" if recovered is not None else ""
             print(
                 f"Роль: вызван {view.get('label')} (заказ {view.get('id')}, "
-                f"{view.get('state')})",
+                f"{view.get('state')}){parent}",
                 file=sys.stderr,
             )
 

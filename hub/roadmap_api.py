@@ -2,12 +2,12 @@
 
 from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
-from typing import Annotated
+from typing import Annotated, Literal
 
 from hub.auth import current_identity, require_admin
 from hub.config import TokenIdentity
 from hub.executor_host_api import _db
-from hub.services import roadmap_requests, role_orders
+from hub.services import roadmap_recovery, roadmap_requests, role_orders
 
 router = APIRouter()
 
@@ -93,6 +93,37 @@ async def api_issue(
         body.request_id,
         body.question,
         body.source_order_id,
+    )
+
+
+class RoadmapRecovery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_update_id: int = Field(gt=0, le=_MAX_ID)
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_did_not_start: Literal[True]
+    runtime_smoke_passed: Literal[True]
+
+
+@router.post("/api/tasks/{task_id}/roadmap-orders/{order_id}/recover")
+async def api_recover(
+    task_id: ResourceId,
+    order_id: ResourceId,
+    body: RoadmapRecovery,
+    request: Request,
+    who: TokenIdentity = Depends(require_admin),
+):
+    return await roadmap_recovery.recover(
+        _db(request),
+        who,
+        task_id,
+        order_id,
+        roadmap_recovery.Attestation(
+            body.evidence_update_id,
+            body.evidence_sha256,
+            body.runtime_sha256,
+        ),
     )
 
 

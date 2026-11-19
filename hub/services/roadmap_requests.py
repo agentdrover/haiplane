@@ -333,13 +333,7 @@ async def _current(db: aiosqlite.Connection, row: aiosqlite.Row) -> bool:
     )
 
 
-async def _make_order(
-    db: aiosqlite.Connection,
-    row: aiosqlite.Row,
-    request_id: str,
-    question: str,
-    source_order_id: int | None,
-) -> int:
+async def _queue_order(db: aiosqlite.Connection, row: aiosqlite.Row) -> int:
     from hub.services import role_orders
 
     if await _one(
@@ -358,7 +352,17 @@ async def _make_order(
     )
     if result["status"] == "quota":
         raise HTTPException(429, "roadmap order quota exhausted")
-    order_id = int(result["id"])
+    return int(result["id"])
+
+
+async def _make_order(
+    db: aiosqlite.Connection,
+    row: aiosqlite.Row,
+    request_id: str,
+    question: str,
+    source_order_id: int | None,
+) -> int:
+    order_id = await _queue_order(db, row)
     await db.execute(
         "INSERT INTO roadmap_requests (grant_id, request_id, question, source_order_id, order_id) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -492,11 +496,15 @@ async def issue(
 async def _request(db: aiosqlite.Connection, order_id: int) -> aiosqlite.Row | None:
     return await _one(
         db,
-        "SELECT g.*, r.question, r.source_order_id, o.state, o.host, o.started_at, o.role, o.source_key "
+        "SELECT g.*, r.id AS request_pk, r.order_id AS initial_order_id, "
+        "r.question, r.source_order_id, o.state, o.host, o.started_at, o.closed_at, "
+        "o.outcome, o.role, o.source_key "
         "FROM roadmap_requests r JOIN roadmap_grants g ON g.id = r.grant_id "
-        "JOIN role_orders o ON o.id = r.order_id "
-        "WHERE o.id = ? AND o.role = 'roadmap' "
-        "AND o.task_id = g.task_id AND o.project_id = g.project_id",
+        "JOIN role_orders o ON o.id = ? "
+        "WHERE r.id = COALESCE("
+        "  (SELECT id FROM roadmap_requests WHERE order_id = o.id),"
+        "  (SELECT request_pk FROM roadmap_recoveries WHERE order_id = o.id)"
+        ") AND o.role = 'roadmap' AND o.task_id = g.task_id AND o.project_id = g.project_id",
         (order_id,),
     )
 

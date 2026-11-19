@@ -891,7 +891,7 @@
                     <dd data-role-order-unavailable="1">{{ ro.unavailable }}</dd>
                     {% else %}
                     <dt>Роль</dt>
-                    <dd data-role-order="{{ ro.id }}">роль: {{ ro.label }} — заказ {{ ro.id }}, {{ ro.state }}</dd>
+                    <dd data-role-order="{{ ro.id }}">роль: {{ ro.label }} — заказ {{ ro.id }}, {{ ro.state }}{% if ro.recovery_of is defined and ro.recovery_of is not none %}, восстановление #{{ ro.recovery_of }}{% endif %}</dd>
                     {% endif %}{% endfor %}{# #1956: история автоперезапуска CI на свежей базе - собрана хабом (services/delivery_rerun.card_view). #}{% if task.delivery_rerun %}
                     <dt>Перезапуск CI</dt>
                     <dd data-delivery-rerun="{{ task.delivery_rerun.state }}">{{ task.delivery_rerun.state }}{% if task.delivery_rerun.outcome %} / {{ task.delivery_rerun.outcome }}{% endif %}; run {{ task.delivery_rerun.run_id }}, после попытки {{ task.delivery_rerun.attempt_before }}; с {{ task.delivery_rerun.requested_at }}{% if task.delivery_rerun.failed_jobs %}; упали: {{ task.delivery_rerun.failed_jobs | join(', ') }}{% endif %}
