@@ -4394,14 +4394,14 @@ async def _vstep_pilot_approval(state: VerdictContext) -> None:
         raise HTTPException(
             409, detail={"reason": "pilot_submission_moved", "task_id": state.task_id}
         )
+    reason = await approval_refusal(state.db, fresh, automatic=not state.human_caller)
+    if reason:
+        raise HTTPException(409, detail={"reason": reason, "task_id": state.task_id})
     if state.diverged_tip or state.sha_note:
         raise HTTPException(
             409,
             detail={"reason": "pilot_branch_sha_unverified", "task_id": state.task_id},
         )
-    reason = await approval_refusal(state.db, fresh, automatic=not state.human_caller)
-    if reason:
-        raise HTTPException(409, detail={"reason": reason, "task_id": state.task_id})
 
 
 async def _require_pilot_verdict_actor(state: VerdictContext) -> None:

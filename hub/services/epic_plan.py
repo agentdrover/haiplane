@@ -541,6 +541,11 @@ async def _pilot_start_blocker(
 
 async def active_decision(db: aiosqlite.Connection) -> PlanDecision:
     """Prove the signed plan is still current independently of queue and WIP."""
+    row = await _decision_row(db, EPIC_ID)
+    if row is not None:
+        state, reason = _decision_state(row, row["version"], _now())
+        if state != "active":
+            _refuse(reason)
     current = await snapshot(db, EPIC_ID)
     if current.owner_principal_id is None:
         _refuse("owner_unassigned")
@@ -550,7 +555,6 @@ async def active_decision(db: aiosqlite.Connection) -> PlanDecision:
         db, current.owner_principal_id
     ):
         _refuse("owner_authority_revoked")
-    row = await _decision_row(db, EPIC_ID)
     if row is None:
         _refuse("plan_not_approved")
     version = _version(current)

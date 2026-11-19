@@ -76,6 +76,12 @@ async def _scope(
         current = await epic_plan.active_decision(db)
     except epic_plan.PlanRefusal as exc:
         return None, None, exc.reason
+    return await _check_review_scope(db, task, current)
+
+
+async def _check_review_scope(
+    db: aiosqlite.Connection, task: Any, current: PlanDecision
+) -> tuple[PlanDecision, Any, str]:
     if "order_bounded_independent_review" not in current.snapshot.allowed_actions:
         return current, None, "pilot_review_not_authorized"
     work = await execution(db, task)
@@ -107,6 +113,10 @@ async def review_blocker(
 ) -> ReviewBlocker | None:
     if not await managed(db, int(task["id"])):
         return None
+    try:
+        decision = await epic_plan.active_decision(db)
+    except epic_plan.PlanRefusal as exc:
+        return ReviewBlocker(exc.reason, "plan_owner", "check_plan_authorization")
     if not project_policy.review_dispatch_enabled(
         project_policy.gate_policy_of(project)
     ):
@@ -119,7 +129,7 @@ async def review_blocker(
             "operator",
             "restore_metered_review_transport",
         )
-    decision, _, reason = await _scope(db, task)
+    _, _, reason = await _check_review_scope(db, task, decision)
     if reason:
         if reason == "pilot_new_sha_required":
             return ReviewBlocker(reason, "author", "submit_new_sha")
@@ -399,21 +409,21 @@ async def approval_refusal(
 ) -> str:
     if not await managed(db, int(task["id"])):
         return ""
-    decision, _, reason = await _scope(db, task)
-    if decision is None or reason:
-        return reason
-    if not await _trusted_ci(db, task):
-        return "pilot_ci_unverified"
+    project = await repo.resolve_project_for_task(db, int(task["id"]))
+    if blocker := await review_blocker(db, task, project):
+        return blocker.reason
     if await _steward_stop(db, task):
         return "pilot_steward_stop"
     if not await _clean_independent_review(db, task):
         return "pilot_review_unavailable"
-    if task["risk_class"] not in {"R0", "R1", "R2"}:
-        return "pilot_risk_changed"
     if automatic:
+        try:
+            decision = await epic_plan.active_decision(db)
+        except epic_plan.PlanRefusal as exc:
+            return exc.reason
         if verdict_owner.written_owner(dict(task))[0] == verdict_owner.OWNER_HUMAN:
             return "pilot_verdict_reserved_for_owner"
-        policy = await project_policy.gate_policy_for_task(db, int(task["id"]))
+        policy = project_policy.gate_policy_of(project)
         if (
             not project_policy.verdict_is_delegated(policy)
             or "delegate_clean_r0_r2_verdict" not in decision.snapshot.allowed_actions

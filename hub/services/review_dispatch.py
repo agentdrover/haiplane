@@ -4608,6 +4608,8 @@ async def _launch_metered_review(
     if not ready or permit is None:
         return None
     if permit.reconcile:
+        if not await epic_plan_gates.can_prepare_review(db, task):
+            return None
         seen = await backend.lookup(request, permit.grant)
         if not seen.asked:
             return None

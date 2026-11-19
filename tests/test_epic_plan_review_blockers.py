@@ -14,6 +14,7 @@ from hub.services import (
     executor_orders,
     review_dispatch,
 )
+from tests.test_epic_plan_approval import _approved
 from tests.test_epic_plan_dispatch import (
     HEAD,
     _new_connection,
@@ -28,7 +29,7 @@ from tests.test_epic_plan_dispatch import (
 @pytest.mark.parametrize("policy_enabled", [False, True])
 @pytest.mark.parametrize("entry", ["submission", "poller"])
 async def test_review_blocker_names_same_action_for_submission_and_poller(
-    db, prepared, monkeypatch, policy_enabled, entry
+    client, db, pilot, prepared, monkeypatch, policy_enabled, entry
 ):
     from hub.models import TaskSubmitReview
     from hub.services import lifecycle
@@ -46,6 +47,8 @@ async def test_review_blocker_names_same_action_for_submission_and_poller(
         ),
     )
     monkeypatch.setattr(transport, "review_transport", lambda: None)
+    await db.commit()
+    await _approved(client, pilot)
     await repo.update_task(
         db,
         2377,
@@ -189,3 +192,75 @@ async def test_review_notice_survives_event_retention(
     assert not await hub_db.fetchall(db, sql)
     assert await repo.get_task_updates(db, 2377) == before
     assert len(await _rows(db, "epic_plan_review_notice_keys")) == 1
+
+
+@pytest.mark.parametrize("policy_enabled", [False, True])
+@pytest.mark.parametrize("transport_available", [False, True])
+@pytest.mark.parametrize("state", ["revoked", "stopped", "expired", "changed"])
+async def test_inactive_plan_precedes_review_preparation(
+    client, db, pilot, prepared, monkeypatch, policy_enabled, transport_available, state
+):
+    from hub.models import TaskReviewVerdict
+    from hub.services import epic_plan_authority, lifecycle
+    from hub.services.verdict_route import verdict_route
+
+    project = await repo.get_project_by_slug(db, epic_plan.PROJECT)
+    await repo.update_project(
+        db,
+        project["id"],
+        gate_policy=json.dumps({"review": "dispatch"} if policy_enabled else {}),
+    )
+    if not transport_available:
+        monkeypatch.setattr(transport, "review_transport", lambda: None)
+    await db.commit()
+    await _approved(client, pilot)
+
+    async def no_paid_probe(*args, **kwargs):
+        pytest.fail("An inactive plan must not ask the spending authority")
+
+    monkeypatch.setattr(epic_plan_authority, "get_grant", no_paid_probe)
+    if state in {"revoked", "stopped"}:
+        await db.execute(
+            "UPDATE epic_plan_decisions SET terminal_state=? WHERE id=(SELECT MAX(id) FROM epic_plan_decisions)",
+            (state,),
+        )
+    elif state == "expired":
+        await db.execute(
+            "UPDATE epic_plan_decisions SET expires_at='2000-01-01T00:00:00+00:00' "
+            "WHERE id=(SELECT MAX(id) FROM epic_plan_decisions)"
+        )
+    else:
+        await repo.update_task(db, 2377, title="Changed signed task")
+    await db.commit()
+    task = await _put_submission(db, 2377, 1, HEAD)
+    code = f"plan_{state}"
+    assert not await review_dispatch.maybe_dispatch_review(db, 2377)
+    await dispatch._follow_review(db)
+    [event] = await hub_db.fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id=2377 AND kind='epic_plan_review_blocked'",
+    )
+    assert json.loads(event["payload"]) == {
+        "generation": 1,
+        "sha": HEAD,
+        "reason": code,
+        "recipient": "plan_owner",
+        "next_action": "check_plan_authorization",
+    }
+    route = await verdict_route(db, 2377)
+    assert route.code == code and route.decider == "none"
+    verdict = lifecycle.VerdictContext(
+        db=db,
+        task_id=2377,
+        task=dict(task),
+        body=TaskReviewVerdict(verdict="approved"),
+        human_caller=True,
+        principal_id=prepared[0],
+    )
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle._vstep_pilot_approval(verdict)
+    assert refused.value.detail["reason"] == code
+    assert not await _rows(db, "epic_plan_escalations")
+    assert not await _rows(db, "review_dispatches")
