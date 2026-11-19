@@ -94,17 +94,112 @@ async def _trusted_ci(db: aiosqlite.Connection, task: Any) -> bool:
     return ci_trust.green_gap(dict(report), contract) is None
 
 
-async def can_prepare_review(db: aiosqlite.Connection, task: Any) -> bool:
+@dataclass(frozen=True)
+class ReviewBlocker:
+    reason: str
+    recipient: str
+    next_action: str
+    decision: PlanDecision | None = None
+
+
+async def review_blocker(
+    db: aiosqlite.Connection, task: Any, project: Any
+) -> ReviewBlocker | None:
     if not await managed(db, int(task["id"])):
-        return True
+        return None
+    if not project_policy.review_dispatch_enabled(
+        project_policy.gate_policy_of(project)
+    ):
+        return ReviewBlocker(
+            "pilot_review_policy_disabled", "project_owner", "enable_independent_review"
+        )
     if transport.review_transport() is None:
-        return False
-    _, _, reason = await _scope(db, task)
-    return (
-        not reason
-        and task["risk_class"] in {"R0", "R1", "R2"}
-        and await _trusted_ci(db, task)
-    )
+        return ReviewBlocker(
+            "pilot_metered_transport_unavailable",
+            "operator",
+            "restore_metered_review_transport",
+        )
+    decision, _, reason = await _scope(db, task)
+    if reason:
+        if reason == "pilot_new_sha_required":
+            return ReviewBlocker(reason, "author", "submit_new_sha")
+        return ReviewBlocker(reason, "project_owner", "check_signed_plan_and_execution")
+    if not task["risk_class"]:
+        return ReviewBlocker(
+            "pilot_risk_unverified", "operator", "verify_submission_risk"
+        )
+    if task["risk_class"] not in {"R0", "R1", "R2"}:
+        return ReviewBlocker(
+            "pilot_risk_changed", "plan_owner", "decide_on_changed_risk", decision
+        )
+    if not await _trusted_ci(db, task):
+        return ReviewBlocker("pilot_ci_unverified", "ci", "wait_for_trusted_ci_on_sha")
+    return None
+
+
+async def can_prepare_review(db: aiosqlite.Connection, task: Any) -> bool:
+    project = await repo.resolve_project_for_task(db, int(task["id"]))
+    return await review_blocker(db, task, project) is None
+
+
+async def note_review_blocker(
+    db: aiosqlite.Connection, task: Any, blocker: ReviewBlocker
+) -> None:
+    """One actionable notice per pinned submission and cause."""
+    if blocker.decision is not None:
+        from hub.services import epic_plan_escalation
+
+        await epic_plan_escalation.maybe_notify(
+            db,
+            blocker.decision,
+            task,
+            blocker.reason,
+            recipient=blocker.recipient,
+            next_action=blocker.next_action,
+        )
+        return
+    task_id = int(task["id"])
+    generation, sha = task["submission_generation"], task["submission_sha"]
+    payload = {
+        "generation": generation,
+        "sha": sha,
+        "reason": blocker.reason,
+        "recipient": blocker.recipient,
+        "next_action": blocker.next_action,
+    }
+    async with write_transaction(db):
+        live = await repo.get_task(db, task_id)
+        if (
+            live is None
+            or live["status"] != "review"
+            or live["submission_generation"] != generation
+            or live["submission_sha"] != sha
+        ):
+            return
+        exists = await _one(
+            db,
+            """SELECT 1 FROM events WHERE task_id=? AND kind='epic_plan_review_blocked'
+               AND json_extract(payload,'$.generation')=? AND json_extract(payload,'$.sha')=?
+               AND json_extract(payload,'$.reason')=? LIMIT 1""",
+            (task_id, generation, sha, blocker.reason),
+        )
+        if exists:
+            return
+        await repo.insert_event(
+            db,
+            kind="epic_plan_review_blocked",
+            task_id=task_id,
+            actor="hub",
+            payload=payload,
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status" if blocker.recipient == "ci" else "alert",
+            f"Ревью пилота ожидает: {blocker.reason}. "
+            f"Адресат: {blocker.recipient}. Следующее действие: {blocker.next_action}.",
+        )
 
 
 async def independent_reviewer(
@@ -160,6 +255,15 @@ async def reserve_review(
     if principal_id is None or not await _reviewer_still_independent(
         db, decision, work, principal_id
     ):
+        await note_review_blocker(
+            db,
+            task,
+            ReviewBlocker(
+                "pilot_independent_reviewer_unavailable",
+                "operator",
+                "restore_independent_reviewer_principal",
+            ),
+        )
         return False, None
     if not 1 <= attempt <= decision.snapshot.terms.technical_retries + 1:
         return False, None
@@ -178,10 +282,14 @@ async def reserve_review(
     )
     grant = await authority.get_grant(binding)
     if grant is None or not grant.covers(binding):
-        from hub.services import epic_plan_escalation
-
-        await epic_plan_escalation.maybe_notify(
-            db, decision, task, "pilot_spending_authority_unavailable"
+        await note_review_blocker(
+            db,
+            task,
+            ReviewBlocker(
+                "pilot_spending_authority_unavailable",
+                "operator",
+                "restore_spending_authority",
+            ),
         )
         return False, None
     return await _write_review_reservation(db, grant)

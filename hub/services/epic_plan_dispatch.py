@@ -420,27 +420,18 @@ async def sweep(db: aiosqlite.Connection) -> None:
 
 async def _follow_review(db: aiosqlite.Connection) -> None:
     """The CI report can arrive after submission; retry its normal review door."""
-    from hub.services import epic_plan_gates, review_dispatch
+    from hub.services import review_dispatch
 
-    try:
-        decision = await epic_plan.active_decision(db)
-    except epic_plan.PlanRefusal:
-        return
-    if "order_bounded_independent_review" not in decision.snapshot.allowed_actions:
-        return
     for task_id in sorted(epic_plan.LEAVES):
         task = await repo.get_task(db, task_id)
-        if task is None or task["status"] != "review":
+        if (
+            task is None
+            or task["status"] != "review"
+            or not await epic_plan._under_pilot(db, task_id)
+        ):
             continue
         if await repo.get_review_dispatch_for_generation(
             db, task_id, int(task["submission_generation"] or 0)
         ):
             continue
-        if task["risk_class"] not in {"R0", "R1", "R2"}:
-            from hub.services import epic_plan_escalation
-
-            await epic_plan_escalation.maybe_notify(
-                db, decision, task, "pilot_risk_changed"
-            )
-        elif await epic_plan_gates.can_prepare_review(db, task):
-            await review_dispatch.maybe_dispatch_review(db, task_id)
+        await review_dispatch.maybe_dispatch_review(db, task_id)

@@ -3294,11 +3294,12 @@ async def _policy_and_novelty_allow(
     там, а здесь остаётся прежнее «можно ли заказывать». Вынесена отдельно,
     потому что maybe_dispatch_review стоит на потолке сложности вплотную.
     """
-    from hub.services.epic_plan_gates import can_prepare_review
+    from hub.services.epic_plan_gates import note_review_blocker, review_blocker
 
-    return await can_prepare_review(db, task) and not await dispatch_refusal(
-        db, task, project, force_profile, force_model
-    )
+    if blocker := await review_blocker(db, task, project):
+        await note_review_blocker(db, task, blocker)
+        return False
+    return not await dispatch_refusal(db, task, project, force_profile, force_model)
 
 
 #: Метка записи об отсутствующем ревьюере, по которой она находится снова.
@@ -3328,6 +3329,10 @@ async def _name_the_missing_reviewer(
     в слово с тем, что человек видит в форме проекта и в отказе на записи
     политики (#1188). Второй копии этого знания не заводим.
     """
+    from hub.services.epic_plan_gates import managed
+
+    if await managed(db, int(task["id"])):
+        return False  # The pilot gate supplies its own reason and recipient.
     if review_dispatch_enabled(gate_policy_of(project)):
         # Отказала не политика, а проверка новизны: код уже читали, и она
         # говорит об этом сама (#1152). Накрывать её вторым алертом значило бы
@@ -4378,6 +4383,25 @@ async def _cloud_config_missing(
         if not ok
     ]
     if missing:
+        from hub.services.epic_plan_gates import (
+            ReviewBlocker,
+            managed,
+            note_review_blocker,
+        )
+
+        if await managed(db, task_id):
+            task = await repo.get_task(db, task_id)
+            if task is not None:
+                await note_review_blocker(
+                    db,
+                    task,
+                    ReviewBlocker(
+                        "pilot_review_configuration_unavailable",
+                        "operator",
+                        "restore_independent_reviewer_configuration",
+                    ),
+                )
+            return True
         await repo.add_task_update(
             db,
             task_id,

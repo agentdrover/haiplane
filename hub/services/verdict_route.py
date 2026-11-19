@@ -380,8 +380,18 @@ async def _decide_route(
         # автопилота не доходим: она ищет машинный отчёт, которого у такой
         # задачи нет, и отвечала бы «нет отчёта» вместо настоящей причины.
         return _human(AUTOMATION_REFUSAL_CODE, AUTOMATION_REFUSAL)
-    from hub.services.epic_plan_gates import approval_refusal
+    from hub.services.epic_plan_gates import approval_refusal, review_blocker
 
+    if blocker := await review_blocker(
+        db, task, await repo.resolve_project_for_task(db, task_id)
+    ):
+        return VerdictRoute(
+            DECIDER_NONE,
+            DECIDER_NONE,
+            "",
+            blocker.reason,
+            f"{blocker.recipient}: {blocker.next_action}",
+        )
     blocked = await approval_refusal(db, task, automatic=False)
     if blocked:
         return VerdictRoute(DECIDER_NONE, DECIDER_NONE, "", blocked, blocked)

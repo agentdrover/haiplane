@@ -29,7 +29,13 @@ OWNER_REASONS = frozenset(
 
 
 async def maybe_notify(
-    db: aiosqlite.Connection, decision: PlanDecision, task: Any, reason: str
+    db: aiosqlite.Connection,
+    decision: PlanDecision,
+    task: Any,
+    reason: str,
+    *,
+    recipient: str = "plan_owner",
+    next_action: str = "decide_retry_or_stop",
 ) -> bool:
     if reason not in OWNER_REASONS or task["status"] not in {
         "open",
@@ -69,6 +75,8 @@ async def maybe_notify(
             "generation": generation,
             "sha": sha,
             "reason": reason,
+            "recipient": recipient,
+            "next_action": next_action,
             "options": [
                 {
                     "action": "retry",
