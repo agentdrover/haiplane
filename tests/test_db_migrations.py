@@ -1171,11 +1171,11 @@ _REKEY_PREFIX = "rekey_pipeline_merges_"
 
 
 def _before_rekey() -> list[tuple[str, str]]:
-    first = next(
-        i for i, step in enumerate(_MIGRATIONS) if step[0].startswith(_REKEY_PREFIX)
+    trimmed = [m for m in _MIGRATIONS if not m[0].startswith(_REKEY_PREFIX)]
+    assert len(trimmed) < len(_MIGRATIONS), (
+        "the rekey migrations under test must exist in _MIGRATIONS"
     )
-    # The historical schema cannot include later views of the rebuilt table.
-    return _MIGRATIONS[:first]
+    return trimmed
 
 
 _OLD_MERGE_ROWS = [

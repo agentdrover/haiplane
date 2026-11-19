@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Collection, Sequence
-from typing import Any, NamedTuple
+from typing import Any, LiteralString, NamedTuple
 from urllib.parse import urlencode
 
 import aiosqlite
@@ -4058,6 +4058,53 @@ async def remove_task_dependency(
     return cur.rowcount > 0
 
 
+# Legacy gate rows remain task-scoped. An observed external merge only
+# confirms the task while the exact attestation still identifies its submission.
+_CURRENT_PIPELINE_MERGES = """
+WITH current_pipeline_merges AS (
+    SELECT m.* FROM pipeline_merges m JOIN tasks t ON t.id = m.task_id
+    WHERE (m.reconciliation = '' OR (
+            m.pr_number = t.pr_number
+            AND json_extract(m.reconciliation, '$.pin.branch') = t.branch
+            AND json_extract(m.reconciliation, '$.pin.head') = t.submission_sha
+            AND json_extract(m.reconciliation, '$.pin.generation') = t.submission_generation
+            AND json_extract(m.reconciliation, '$.pin.verdict_revision') = t.review_verdict_revision
+            AND t.review_verdict = 'approved'
+            AND t.review_verdict_generation = t.submission_generation
+            AND t.review_verdict_closed_generation IS NOT t.submission_generation
+            AND t.behavior_approval_void = 0
+            AND t.review_self_approved = 0
+            AND EXISTS (
+                SELECT 1 FROM projects p
+                WHERE p.id = m.project_id
+                  AND p.id = COALESCE(
+                    (WITH RECURSIVE ancestors(project_id, parent_id, depth) AS (
+                        SELECT t.project_id, t.parent_id, 0
+                        UNION ALL
+                        SELECT parent.project_id, parent.parent_id, a.depth + 1
+                        FROM ancestors a JOIN tasks parent ON parent.id = a.parent_id
+                        WHERE a.project_id IS NULL AND a.depth < 19
+                     )
+                     SELECT project_id FROM ancestors WHERE project_id IS NOT NULL LIMIT 1),
+                    (SELECT id FROM projects WHERE slug = 'default')
+                  )
+                  AND p.status = 'active'
+                  AND p.forge = 'github'
+                  AND p.repo = json_extract(m.reconciliation, '$.pin.repository')
+                  AND p.default_branch = json_extract(m.reconciliation, '$.pin.base')
+            )
+        ))
+)
+"""
+
+
+async def _fetchall_with_current_merges(
+    db: aiosqlite.Connection, query: LiteralString, params: tuple[Any, ...]
+) -> list[aiosqlite.Row]:
+    # Compose fixed SQL literals; values stay in bound parameters.
+    return await fetchall(db, _CURRENT_PIPELINE_MERGES + query, params)  # nosec B608
+
+
 async def list_task_dependencies(
     db: aiosqlite.Connection, task_id: int
 ) -> dict[str, list[dict[str, Any]]]:
@@ -4070,7 +4117,7 @@ async def list_task_dependencies(
     """
     # #485: delivery travels beside the status. A closed task whose PR is not merged
     # blocks as much as an open one (#830); a reader given only the status repeats it.
-    blocked_by = await fetchall(
+    blocked_by = await _fetchall_with_current_merges(
         db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
         "(SELECT COUNT(*) FROM current_pipeline_merges m WHERE m.task_id = t.id) AS merges "
@@ -4116,7 +4163,7 @@ async def task_as_blocker(
     голый id: без ``merges`` и ``pr_number`` мерж гейта не виден, и
     доставленная задача читалась бы недоставленной. None — задачи нет.
     """
-    rows = await fetchall(
+    rows = await _fetchall_with_current_merges(
         db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
         "(SELECT COUNT(*) FROM current_pipeline_merges m WHERE m.task_id = t.id) AS merges "
@@ -4131,7 +4178,7 @@ async def children_as_blockers(
 ) -> list[dict[str, Any]]:
     """Дети контейнера в форме строки блокера (#1442): та же доставка по
     pipeline_merges, что у ``_blocker_entry`` — второго правила нет."""
-    rows = await fetchall(
+    rows = await _fetchall_with_current_merges(
         db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
         "(SELECT COUNT(*) FROM current_pipeline_merges m WHERE m.task_id = t.id) AS merges "
@@ -4159,7 +4206,7 @@ async def undelivered_blockers(
     branch are forbidden and the drift guard catches them), and the gate this
     feeds is advisory anyway.
     """
-    rows = await fetchall(
+    rows = await _fetchall_with_current_merges(
         db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
         "(SELECT COUNT(*) FROM current_pipeline_merges m WHERE m.task_id = t.id) AS merges "
@@ -5954,7 +6001,7 @@ async def list_live_checks(
 
 async def last_merge_origin(db: aiosqlite.Connection, task_id: int) -> str:
     """The provenance of the same recorded merge used by merge_sha_for_task."""
-    rows = await fetchall(
+    rows = await _fetchall_with_current_merges(
         db,
         "SELECT reconciliation FROM current_pipeline_merges WHERE task_id = ? "
         "AND COALESCE(merge_sha, '') != '' ORDER BY id DESC LIMIT 1",
@@ -5971,7 +6018,7 @@ async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:
     recorded as unknown rather than guessed (#725).
     """
     rows = list(
-        await fetchall(
+        await _fetchall_with_current_merges(
             db,
             "SELECT merge_sha FROM current_pipeline_merges WHERE task_id = ? "
             "AND COALESCE(merge_sha, '') != '' ORDER BY id DESC LIMIT 1",
@@ -6055,7 +6102,7 @@ async def completed_tasks_awaiting_delivery(
     a call per sweep). Blind spot: no row means "never asked", not "delivered".
     """
     return list(
-        await fetchall(
+        await _fetchall_with_current_merges(
             db,
             """
             SELECT t.* FROM tasks t

@@ -723,12 +723,6 @@ async def _src_hub_string_literals(env):
                 and id(node) not in docs
                 and AGENT_CHANNELS.search(node.value)
                 and not re.match(r"\s*(SELECT|UPDATE|INSERT|DELETE|WITH)\b", node.value)
-                # Migration step DDL is literal SQL consumed by the migration
-                # loader. Runtime strings still use the same exclusions.
-                and not (
-                    path.parent == ROOT / "hub" / "migrations" / "steps"
-                    and re.match(r"\s*CREATE VIEW\b", node.value)
-                )
             ):
                 out.append(node.value)
     assert out
