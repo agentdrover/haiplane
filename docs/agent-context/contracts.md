@@ -267,7 +267,7 @@ put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
 - Access is the same as `GET /api/dashboard` (no permission of its own; the middleware allowlists decide: watcher reads, steward/chat-pair/ci_reader/ci_auditor are refused). Consumers: MCP `hub_list_decisions`, the dashboard (`recent_decisions`, 8) and `hub_project_status`.
 - The CLI link to n4l is gone (`hub/integrations/notes.py`, `N4L_BIN`, `N4L_SPACE`, `NotesPlugin`). `record_decision` is still accepted on REST/CLI/MCP and ignored; `GET /api/integrations/notes` answers 410.
 
-## Запрос консультации roadmap по плану (#2397)
+## Запрос консультации и решение roadmap по плану (#2397, #2402)
 
 Администратор Hub задаёт адресный мандат через `PUT /api/tasks/{task_id}/roadmap-grant`
 или `hp-hub roadmap grant`. Укажите `plan_id`, `steward_principal_id` с ролью
@@ -281,9 +281,16 @@ put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
 С `signal_task_id` мандат разрешает консультации по закрытым заказам этой
 задачи с отчётом `failed/redeem_failed`. Выбирать заранее номера заказов
 не требуется. Стюард использует отдельный API-ключ с ограниченным сроком и
-обращается только к GET того же ресурса и
-`POST /api/tasks/{task_id}/roadmap-requests`. GET показывает до 20 ещё
-не обработанных сигналов в `signals` по возрастанию ID. Периодический опрос
+обращается только к этим маршрутам:
+
+- `GET /api/tasks/{task_id}/roadmap-grant`
+- `POST /api/tasks/{task_id}/roadmap-requests`
+- `POST /api/tasks/{task_id}/roadmap-orders/{order_id}/decision`
+
+GET показывает до 20 ещё не обработанных сигналов в `signals` по возрастанию
+ID. Поле `pending_decision_order_id` содержит ID первого завершённого заказа
+текущего мандата со структурированным выводом, ожидающим решения, либо `null`.
+Периодический опрос
 начинается с `after_order_id=0`, чтобы увидеть старый заказ, который
 закрылся позже нового. POST принимает `plan_id`, наблюдавшийся в GET
 `grant_id`, повторяемый `request_id`, `question` и, при наличии источника,
@@ -296,11 +303,52 @@ put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
 есть случайный `steward_request:<32 hex>`. Аутентифицированный агент roadmap
 читает вопрос через `GET /api/roadmap/orders/{order_id}` со своим ключом
 источника в заголовке `X-Hub-Roadmap-Source` только по актуальному started-заказу.
-Hub хранит вопрос вне lease и аудита. Итог
-передаётся через обычный отчёт роли от хоста. Существующий
-`needs_decision:<event_id>` и его автоматический маршрут сохраняются.
-Новые операции доступны через REST и CLI. Токен выделенного стюарда
-не допускается к MCP и остальным операциям Hub.
+Ответ содержит `question` и отдельный `decision_context`:
+
+- `plan` содержит `task_id`, `approval_id` и `statement_generation`.
+- `signal` содержит `task_id`, `order_id`, `outcome: "failed"` и
+  `reason: "redeem_failed"` для назначенного сигнала либо `null`.
+- `checks` содержит применимые проверки с полями `id` (ID критерия AC),
+  `metric: "successful_fresh_redeems"`, `operator: "gte"` и положительным
+  целым `target`. Hub берёт порог из `test_ref` вида
+  `roadmap:successful_fresh_redeems>=N` у критерия `log_check`. При выдаче
+  мандата Hub закрепляет эти проверки, если отпечаток действующей постановки
+  совпадает с отпечатком из одобрения человеком с DB-учётными данными.
+- `missing` перечисляет отсутствующие факты (`signal`, `plan_check`).
+  Прежние мандаты сохраняют чтение вопроса. Для технического решения нужен
+  закреплённый порог.
+
+Hub хранит вопрос вне lease и аудита. Хост передаёт итог через
+`POST /api/executor-hosts/{name}/role-orders/{order_id}/report`. Для
+успешного явного заказа помимо `lease_id`, `outcome: "done"` и краткого
+`note` клиент может передать `roadmap_result`:
+
+- `recommendation` принимает `hold_expansion`, `owner_required` или
+  `insufficient_facts`.
+- `basis` содержит `source_order_id` и `check_id` из контекста либо `null`.
+- `risk` принимает `repeat_redeem_failure` или `unknown`.
+
+Hub проверяет текущий lease и мандат и сохраняет вывод отдельно от заметки
+в той же транзакции, что и закрытие заказа. Идентичный отчёт идемпотентен.
+Завершение со старым форматом отчёта (одной заметкой) остаётся допустимым и
+не создаёт ожидающего решения. Автоматические заказы
+`needs_decision:<event_id>` сохраняют исходный формат и маршрут к владельцу.
+
+Получив `pending_decision_order_id`, привязанный к мандату стюард передаёт
+`{"grant_id": …}` в POST решения (CLI: `hp-hub roadmap decision TASK ORDER
+--grant-id GRANT`). Hub возвращает `order_id`, `status`, `reason`, `repeat`,
+`recipient`, `plan`, `signal`, `risk` и `verification_condition`.
+Первый вызов записывает решение и аудит реального принципала. Повтор в
+действующем мандате возвращает прежнее решение с `repeat: true`.
+
+`accepted/hold_expansion` означает удержать расширение до предъявления
+утверждённой проверки. В `verification_condition` указан её порог;
+`observed: null` означает, что измерение ещё не предъявлено. При недостатке
+фактов или неподтверждённом основании Hub записывает `blocked` с причиной.
+При выходе за технический допуск Hub записывает `owner_required` с адресатом
+`owner`. Ни один из этих исходов не запускает работу, не меняет план и не
+принимает решение за владельца. Токен выделенного стюарда предназначен для
+этих REST и CLI вызовов. Остальные операции Hub, включая MCP, закрыты.
 
 
 ## Восстановление явного поручения roadmap (#2401)
