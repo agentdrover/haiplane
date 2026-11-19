@@ -1,5 +1,6 @@
 """A stop committed by another connection takes precedence in live admission."""
 
+# ruff: noqa: F811 - imported pytest fixtures
 import asyncio
 from unittest.mock import AsyncMock
 
