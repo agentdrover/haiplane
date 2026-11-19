@@ -290,8 +290,10 @@ def _decision_state(
     return "active", "plan_active"
 
 
-def _decision(row: aiosqlite.Row, current: str) -> PlanDecision:
-    state, reason = _decision_state(row, current, _now())
+def _decision(
+    row: aiosqlite.Row, current: str, *, checked_at: datetime | None = None
+) -> PlanDecision:
+    state, reason = _decision_state(row, current, checked_at or _now())
     return PlanDecision(
         version=row["version"],
         snapshot=PlanSnapshot.model_validate_json(row["snapshot"]),
@@ -539,29 +541,39 @@ async def _pilot_start_blocker(
     return None
 
 
+def _refuse_inactive_signature(row: aiosqlite.Row | None, now: datetime) -> None:
+    if row is not None:
+        state, reason = _decision_state(row, row["version"], now)
+        if state != "active":
+            _refuse(reason)
+
+
 async def active_decision(db: aiosqlite.Connection) -> PlanDecision:
     """Prove the signed plan is still current independently of queue and WIP."""
     row = await _decision_row(db, EPIC_ID)
-    if row is not None:
-        state, reason = _decision_state(row, row["version"], _now())
-        if state != "active":
-            _refuse(reason)
+    _refuse_inactive_signature(row, _now())
     current = await snapshot(db, EPIC_ID)
-    if current.owner_principal_id is None:
-        _refuse("owner_unassigned")
+    owner = current.owner_principal_id
     from hub.services.admin import get_principal_permissions
 
-    if "tasks.human_gate" not in await get_principal_permissions(
-        db, current.owner_principal_id
-    ):
-        _refuse("owner_authority_revoked")
-    if row is None:
-        _refuse("plan_not_approved")
+    permissions = (
+        await get_principal_permissions(db, owner) if owner is not None else frozenset()
+    )
     version = _version(current)
-    state, reason = _decision_state(row, version, _now())
-    if state != "active":
-        _refuse(reason)
-    return _decision(row, version)
+    # Readers without the caller's reservation lock may have crossed a stop
+    # on another connection while assembling the snapshot or reading roles.
+    fresh = await _decision_row(db, EPIC_ID)
+    checked_at = _now()
+    _refuse_inactive_signature(fresh, checked_at)
+    if owner is None:
+        _refuse("owner_unassigned")
+    if "tasks.human_gate" not in permissions:
+        _refuse("owner_authority_revoked")
+    if fresh is None:
+        _refuse("plan_not_approved")
+    if row is None or fresh["id"] != row["id"] or fresh["version"] != version:
+        _refuse("plan_changed")
+    return _decision(fresh, version, checked_at=checked_at)
 
 
 async def _dependency_blockers(
