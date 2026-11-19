@@ -13,8 +13,10 @@ from typing import Any
 
 import aiosqlite
 
+from hub import config
 from hub import repository as repo
 from hub.db import connect, fetchall, write_transaction
+from hub.hub_instance import hub_base_url
 from hub.services import (
     admin,
     executor_slot_launch,
@@ -49,6 +51,7 @@ _MANDATE = _Mandate(
     roadmap_id=31,
 )
 _ACTOR = "hub.local.roadmap_activation"
+_PUBLIC_HUB_URL = "https://agenthai.ru"
 
 
 class ActivationRefused(Exception):
@@ -230,6 +233,8 @@ async def _issue_once(db: aiosqlite.Connection) -> dict[str, Any]:
         if receipt["state"] != "active":
             raise ActivationRefused("pilot_grant_not_active")
         await _verify_approval(db, mandate)
+        if config.HUB_AUTH_DISABLED or hub_base_url() != _PUBLIC_HUB_URL:
+            raise ActivationRefused("pilot_hub_runtime_config_invalid")
         task = await repo.get_task(db, mandate.task_id)
         if task is None or task["status"] != "open":
             raise ActivationRefused("pilot_task_not_open")

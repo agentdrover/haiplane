@@ -8,6 +8,7 @@ import pytest
 
 from hub import repository as repo
 from hub.db import connect
+from hub.hub_instance import hub_base_url
 from hub.services import admin, roadmap_activation, roadmap_requests
 from tests import role_orders_support as support
 from tests import test_executor_orders as executor_tests
@@ -71,6 +72,7 @@ async def approved(world, monkeypatch):
     )
     monkeypatch.setattr(roadmap_activation, "_MANDATE", mandate)
     world.slug = "home-infra"
+    monkeypatch.setattr(roadmap_activation, "_PUBLIC_HUB_URL", hub_base_url())
     return world, mandate, auth
 
 
@@ -251,8 +253,12 @@ async def test_one_system_slot_order_fences_historical_signals(approved):
     assert len(audit) == 1 and audit[0]["actor_principal_id"] is None
 
 
-@pytest.mark.parametrize("block", ["no_grant", "expired_grant", "out_of_band"])
-async def test_one_system_slot_order_stops_when_preconditions_fail(approved, block):
+@pytest.mark.parametrize(
+    "block", ["no_grant", "expired_grant", "out_of_band", "wrong_hub"]
+)
+async def test_one_system_slot_order_stops_when_preconditions_fail(
+    approved, monkeypatch, block
+):
     world, mandate, auth = approved
     if block != "no_grant":
         receipt = await roadmap_activation._run(world.db, apply=True)
@@ -262,6 +268,10 @@ async def test_one_system_slot_order_stops_when_preconditions_fail(approved, blo
                 (receipt["grant_id"],),
             )
             await world.db.commit()
+        elif block == "wrong_hub":
+            monkeypatch.setattr(
+                roadmap_activation, "_PUBLIC_HUB_URL", "https://wrong.example.test"
+            )
         else:
             issued = await world.client.post(
                 "/api/projects/home-infra/executor-launch",
