@@ -85,6 +85,8 @@ async def test_admitted_run_history_uses_exact_attempt_jobs(monkeypatch, route, 
         ("wrong_head", UNKNOWN),
         ("unreadable_history", UNKNOWN),
         ("foreign_run", UNKNOWN),
+        ("malformed_attempt", UNKNOWN),
+        ("malformed_job_name", UNKNOWN),
         ("duplicate_job", UNKNOWN),
         ("missing_current_check", UNKNOWN),
         ("partial_rerun", FAILED),
@@ -116,6 +118,11 @@ async def test_normalization_preserves_current_and_unproved_blockers(
         e.missing.add((f"actions/runs/{run['id']}/attempts/1/jobs", "1"))
     elif scenario == "foreign_run":
         run["head_repository"] = {"full_name": "foreign/home-infra"}
+    elif scenario == "malformed_attempt":
+        run["run_attempt"] = True
+    elif scenario == "malformed_job_name":
+        _update_job_check(e, current, name=13)
+        _update_job_check(e, prior, name=13)
     elif scenario == "duplicate_job":
         prior["id"] = current["id"]
     elif scenario == "missing_current_check":

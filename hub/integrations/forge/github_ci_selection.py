@@ -208,6 +208,8 @@ async def attempt_jobs(get: Get, api: str, run: Facts) -> dict[str, Facts]:
             or job.get("head_sha") != run["head_sha"]
             or type(job.get("id")) is not int
             or job["id"] <= 0
+            or not isinstance(job.get("name"), str)
+            or not job["name"]
         ):
             raise Unverified(f"job identity mismatch: {label(run)}")
     return index(rows, "name")
@@ -365,6 +367,10 @@ def _validate_history_run(run: Facts, sha: str) -> None:
         raise Unverified("workflow attempt history exceeds proof limit")
 
 
+def _first_attempt(run: Facts) -> bool:
+    return type(run.get("run_attempt")) is int and run["run_attempt"] == 1
+
+
 def _history_runs(
     runs: list[Facts], profile_runs: tuple[Facts, ...], sha: str, *, ordinary: bool
 ) -> list[Facts]:
@@ -374,7 +380,7 @@ def _history_runs(
         run
         for run in runs
         if run["id"] in required
-        or run.get("run_attempt") != 1
+        or not _first_attempt(run)
         or (ordinary and run.get("event") == "workflow_dispatch")
     ]
     for run in selected:
@@ -706,9 +712,7 @@ def _ordinary_pr(
     ]
     if blocked := _blocking_run(relevant):
         return blocked
-    if not dispatches and all(
-        type(run.get("run_attempt")) is int and run["run_attempt"] == 1 for run in runs
-    ):
+    if not dispatches and all(_first_attempt(run) for run in runs):
         return None
     eligible = [
         run
