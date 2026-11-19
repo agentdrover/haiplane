@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import aiosqlite
 
@@ -4322,14 +4322,19 @@ async def record_delivery_outcome(
     явное объяснение (``_note_approval_gone``), а ``write`` не вызывается.
     Возвращает ``(записано ли, результат write либо fallback)``.
     """
+    from hub.services import merged_delivery
+
     async with write_transaction(db):
         # The read and the first SQL of ``write`` share one write transaction:
         # a verdict writer on another connection cannot land between them.
         stands = await approval_stands(db, task)
-        result = await write() if stands else fallback
+        gap = await merged_delivery.completion_gap(db, task) if stands else ""
+        if gap:
+            await merged_delivery.note_completion_wait(db, task, gap)
+        result = await write() if stands and not gap else fallback
     if not stands:
         await delivery_notes.note_approval_gone(db, task, merged=merged)
-    return stands, result
+    return stands and not gap, result
 
 
 async def _gate_merge_step(
@@ -4493,7 +4498,7 @@ async def _merged_by_gate(
 ) -> GateTrace:
     """Влит ли MERGED-PR гейтом — по его собственным следам (#1398)."""
     task_id = task["id"]
-    if await repo.pipeline_merge_recorded(db, task_id, pr_num):
+    if await repo.pipeline_merge_recorded(db, task_id, pr_num, gate_only=True):
         return GateTrace.GATE
     seen = await _gate_merge_outcome((task_id, pr_num))
     if seen is GateMergeSeen.MERGED:
@@ -4518,7 +4523,7 @@ async def _merged_by_gate(
     # пуст по определению (known_pipeline_shas намеренно не берёт строки с
     # NULL project_id, #534). Мерж самой задачи уже поймал
     # pipeline_merge_recorded выше.
-    if proj and sha in await repo.known_pipeline_shas(db, dict(proj)["id"]):
+    if proj and sha in await repo.known_pipeline_shas(db, proj["id"], gate_only=True):
         return GateTrace.GATE
     return GateTrace.NOT_GATE
 
@@ -4829,8 +4834,9 @@ async def merge_before_completion(
         # safety: GitHub refuses the second merge and the refusal would flip
         # a DELIVERED task into needs_decision (#363's exactly-once guard
         # caught precisely this).
-        if await repo.pipeline_merge_recorded(db, task_id, pr_num):
-            return True, "already delivered"
+        decision = await _existing_delivery(db, task, int(pr_num))
+        if decision is not None:
+            return decision
 
         # #612: does the branch still stand where the reviewer approved it? #572
         # closed "push, then approve"; "approve, THEN push" left the verdict current
@@ -4954,7 +4960,11 @@ class DeliveryPR:
 
 
 async def _recorded_pr_state(
-    db: aiosqlite.Connection, task: dict[str, Any], pr_number: int
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    pr_number: int,
+    *,
+    ctx: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Where the recorded PR stands, and a cause when it cannot be asked (#802).
 
@@ -4963,7 +4973,8 @@ async def _recorded_pr_state(
     verdict is the mistake #725 catalogued.
     """
     try:
-        ctx = await project_git_context(db, task["id"])
+        if ctx is None:
+            ctx = await project_git_context(db, task["id"])
         state = await plugins.git_ops.pr_state(
             pr_number,
             repo=ctx.get("repo"),
@@ -4981,6 +4992,23 @@ async def _recorded_pr_state(
             f"состояние PR #{pr_number} неизвестно — доставка идёт по нему как раньше",
         )
     return state, ""
+
+
+async def _existing_delivery(
+    db: aiosqlite.Connection, task: dict[str, Any], pr_num: int
+) -> tuple[bool, str] | None:
+    from hub.services import merged_delivery
+
+    task_id = int(task["id"])
+    if await repo.pipeline_merge_recorded(db, task_id, pr_num, gate_only=True):
+        return True, "already delivered"
+    ctx = await project_git_context(db, task_id)
+    if (task_id, pr_num) in _gate_merges or ctx.get("forge") != "github":
+        return None
+    state, _ = await _recorded_pr_state(db, task, pr_num, ctx=ctx)
+    return await merged_delivery.reconcile(
+        db, task, ctx, state=state, gate_busy=lambda: (task_id, pr_num) in _gate_merges
+    )
 
 
 async def _live_pr_for_branch(
@@ -5601,6 +5629,8 @@ async def _complete_without_review(
     pr_delivered = bool(task.get("pr_number"))
     if (written := await _write_completed(db, task, exit_code, result_text)) is None:
         return "needs_decision"
+    if written == "reconciliation_wait":
+        return "running"
     if not written:
         await delivery_notes.note_approval_gone(db, task, merged=pr_delivered)
         return "running"
@@ -5612,7 +5642,7 @@ async def _write_completed(
     task: dict[str, Any],
     exit_code: int | None,
     result_text: str | None,
-) -> bool | None:
+) -> bool | None | Literal["reconciliation_wait"]:
     """The write of ``completed`` after a done report, with its validation gate.
 
     ``None``: the defect gate holds it, asked again of the row here (#1791).
@@ -5633,10 +5663,15 @@ async def _write_completed(
     gate again, of the database; GitHub was asked before it (the caller),
     and the network delivery (merge) happened before it too.
     """
+    from hub.services import merged_delivery
+
     task_id = task["id"]
     async with write_transaction(db):
         if not await approval_stands(db, task):
             return False
+        if gap := await merged_delivery.completion_gap(db, task):
+            await merged_delivery.note_completion_wait(db, task, gap)
+            return "reconciliation_wait"
         if await hold_completion(db, task_id, via="report_done_write", actor="hub"):
             return None
         row = await repo.get_task(db, task_id)

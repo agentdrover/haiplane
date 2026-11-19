@@ -203,7 +203,7 @@ async def check_project(
 
     known: set[str] = set()
     if db is not None:
-        known = await repo.known_pipeline_shas(db, project["id"])
+        known = await repo.known_pipeline_shas(db, project["id"], gate_only=True)
 
     commits = classify_commits(raw, known_shas=known, baseline_sha=baseline)
 
