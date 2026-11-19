@@ -15,11 +15,23 @@ class RoadmapBasis(BaseModel):
     check_id: CheckId
 
 
+class ObservationBasis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observation_batch_id: PositiveId
+
+
 class RoadmapResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    recommendation: Literal["hold_expansion", "owner_required", "insufficient_facts"]
-    basis: RoadmapBasis | None
+    recommendation: Literal[
+        "hold_expansion",
+        "owner_required",
+        "insufficient_facts",
+        "verify_version_read",
+        "hold_pilot",
+    ]
+    basis: RoadmapBasis | ObservationBasis | None
     risk: Literal["repeat_redeem_failure", "unknown"]
 
 

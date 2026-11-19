@@ -602,8 +602,9 @@ async def has_work(db: aiosqlite.Connection, host: str) -> bool:
         db,
         "SELECT 1 FROM role_orders o WHERE (o.state = 'leased' AND o.host = ?1) "
         "OR (o.state = 'open' AND EXISTS (SELECT 1 FROM role_host_admissions a "
-        "WHERE a.host = ?1 AND a.role = o.role AND a.project_id = o.project_id)) "
-        "LIMIT 1",
+        "WHERE a.host = ?1 AND a.role = o.role AND a.project_id = o.project_id) "
+        "AND (?1 = 'k8' OR NOT EXISTS (SELECT 1 FROM roadmap_observation_pilots p "
+        "WHERE p.order_id=o.id))) LIMIT 1",
         (host,),
     )
     return bool(rows)
@@ -613,8 +614,10 @@ async def _claim_first(db: aiosqlite.Connection, host: str) -> dict[str, Any] | 
     candidates = await fetchall(
         db,
         "SELECT o.* FROM role_orders o JOIN role_host_admissions a "
-        "ON a.host = ? AND a.role = o.role AND a.project_id = o.project_id "
-        "WHERE o.state = 'open' ORDER BY o.id LIMIT 50",
+        "ON a.host = ?1 AND a.role = o.role AND a.project_id = o.project_id "
+        "WHERE o.state = 'open' AND (?1 = 'k8' OR NOT EXISTS "
+        "(SELECT 1 FROM roadmap_observation_pilots p WHERE p.order_id=o.id)) "
+        "ORDER BY o.id LIMIT 50",
         (host,),
     )
     for order in candidates:

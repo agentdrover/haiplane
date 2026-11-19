@@ -61,7 +61,17 @@ def add_parser(
         ),
         ("revoke", "DELETE", ()),
         ("signal", "GET", ()),
-        ("request", "POST", ("plan_id", "grant_id", "request_id", "source_order_id")),
+        (
+            "request",
+            "POST",
+            (
+                "plan_id",
+                "grant_id",
+                "request_id",
+                "source_order_id",
+                "observation_batch_id",
+            ),
+        ),
     ):
         parser = operations.add_parser(name)
         parser.add_argument("task_id", type=int)
@@ -74,7 +84,13 @@ def add_parser(
         for field in fields:
             parser.add_argument(
                 "--" + field.replace("_", "-"),
-                required=field not in ("signal_task_id", "source_order_id", "ttl_days"),
+                required=field
+                not in (
+                    "signal_task_id",
+                    "source_order_id",
+                    "observation_batch_id",
+                    "ttl_days",
+                ),
                 type=str if field == "request_id" else int,
             )
         parser.set_defaults(func=call, method=method, fields=fields)
