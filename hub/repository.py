@@ -4058,43 +4058,6 @@ async def remove_task_dependency(
     return cur.rowcount > 0
 
 
-# The legacy gate ledger stays task-scoped. A reconciled observation is
-# about one exact submission and must not answer for a replacement PR.
-_CURRENT_DELIVERY_MERGE = """
-    (m.reconciliation = '' OR (
-        m.pr_number = t.pr_number
-        AND json_extract(m.reconciliation, '$.pin.branch') = t.branch
-        AND json_extract(m.reconciliation, '$.pin.head') = t.submission_sha
-        AND json_extract(m.reconciliation, '$.pin.generation') = t.submission_generation
-        AND json_extract(m.reconciliation, '$.pin.verdict_revision') = t.review_verdict_revision
-        AND t.review_verdict = 'approved'
-        AND t.review_verdict_generation = t.submission_generation
-        AND t.review_verdict_closed_generation IS NOT t.submission_generation
-        AND t.behavior_approval_void = 0
-        AND t.review_self_approved = 0
-        AND EXISTS (
-            SELECT 1 FROM projects p
-            WHERE p.id = m.project_id
-              AND p.id = COALESCE(
-                (WITH RECURSIVE ancestors(project_id, parent_id, depth) AS (
-                    SELECT t.project_id, t.parent_id, 0
-                    UNION ALL
-                    SELECT parent.project_id, parent.parent_id, a.depth + 1
-                    FROM ancestors a JOIN tasks parent ON parent.id = a.parent_id
-                    WHERE a.project_id IS NULL AND a.depth < 19
-                 )
-                 SELECT project_id FROM ancestors WHERE project_id IS NOT NULL LIMIT 1),
-                (SELECT id FROM projects WHERE slug = 'default')
-              )
-              AND p.status = 'active'
-              AND p.forge = 'github'
-              AND p.repo = json_extract(m.reconciliation, '$.pin.repository')
-              AND p.default_branch = json_extract(m.reconciliation, '$.pin.base')
-        )
-    ))
-"""
-
-
 async def list_task_dependencies(
     db: aiosqlite.Connection, task_id: int
 ) -> dict[str, list[dict[str, Any]]]:
@@ -4110,8 +4073,7 @@ async def list_task_dependencies(
     blocked_by = await fetchall(
         db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
-        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id "
-        f"AND {_CURRENT_DELIVERY_MERGE}) AS merges "
+        "(SELECT COUNT(*) FROM current_pipeline_merges m WHERE m.task_id = t.id) AS merges "
         "FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id "
         "WHERE d.task_id = ? ORDER BY t.id",
         (task_id,),
@@ -4157,8 +4119,7 @@ async def task_as_blocker(
     rows = await fetchall(
         db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
-        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id "
-        f"AND {_CURRENT_DELIVERY_MERGE}) AS merges "
+        "(SELECT COUNT(*) FROM current_pipeline_merges m WHERE m.task_id = t.id) AS merges "
         "FROM tasks t WHERE t.id = ?",
         (task_id,),
     )
@@ -4173,8 +4134,7 @@ async def children_as_blockers(
     rows = await fetchall(
         db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
-        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id "
-        f"AND {_CURRENT_DELIVERY_MERGE}) AS merges "
+        "(SELECT COUNT(*) FROM current_pipeline_merges m WHERE m.task_id = t.id) AS merges "
         "FROM tasks t WHERE t.parent_id = ? AND t.archived = 0 ORDER BY t.id",
         (parent_id,),
     )
@@ -4202,8 +4162,7 @@ async def undelivered_blockers(
     rows = await fetchall(
         db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
-        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id "
-        f"AND {_CURRENT_DELIVERY_MERGE}) AS merges "
+        "(SELECT COUNT(*) FROM current_pipeline_merges m WHERE m.task_id = t.id) AS merges "
         "FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id "
         "WHERE d.task_id = ? ORDER BY t.id",
         (task_id,),
@@ -5997,9 +5956,8 @@ async def last_merge_origin(db: aiosqlite.Connection, task_id: int) -> str:
     """The provenance of the same recorded merge used by merge_sha_for_task."""
     rows = await fetchall(
         db,
-        "SELECT m.reconciliation FROM pipeline_merges m JOIN tasks t ON t.id = m.task_id "
-        "WHERE m.task_id = ? AND COALESCE(m.merge_sha, '') != '' "
-        f"AND {_CURRENT_DELIVERY_MERGE} ORDER BY m.id DESC LIMIT 1",
+        "SELECT reconciliation FROM current_pipeline_merges WHERE task_id = ? "
+        "AND COALESCE(merge_sha, '') != '' ORDER BY id DESC LIMIT 1",
         (task_id,),
     )
     return ("outside_gate" if rows[0]["reconciliation"] else "gate") if rows else ""
@@ -6015,9 +5973,8 @@ async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:
     rows = list(
         await fetchall(
             db,
-            "SELECT m.merge_sha FROM pipeline_merges m JOIN tasks t ON t.id = m.task_id "
-            "WHERE m.task_id = ? AND COALESCE(m.merge_sha, '') != '' "
-            f"AND {_CURRENT_DELIVERY_MERGE} ORDER BY m.id DESC LIMIT 1",
+            "SELECT merge_sha FROM current_pipeline_merges WHERE task_id = ? "
+            "AND COALESCE(merge_sha, '') != '' ORDER BY id DESC LIMIT 1",
             (task_id,),
         )
     )
@@ -6100,14 +6057,13 @@ async def completed_tasks_awaiting_delivery(
     return list(
         await fetchall(
             db,
-            f"""
+            """
             SELECT t.* FROM tasks t
             WHERE t.status = 'completed'
               AND t.archived = 0
               AND t.pr_number IS NOT NULL
               AND NOT EXISTS (
-                    SELECT 1 FROM pipeline_merges m WHERE m.task_id = t.id
-                    AND {_CURRENT_DELIVERY_MERGE}
+                    SELECT 1 FROM current_pipeline_merges m WHERE m.task_id = t.id
               )
               AND NOT EXISTS (
                     SELECT 1 FROM delivery_discrepancies d
