@@ -585,6 +585,7 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        contract_fingerprint: str = "",
     ) -> CIProbeResult: ...
     # #1914: ``on_send`` ОБЯЗАТЕЛЕН для любой реализации с отправкой (POST):
     # вызвать его ровно перед ней. Всё до вызова - отказ, не тратящий попытку.
@@ -1003,7 +1004,12 @@ class ForgePlugin(Protocol):
         gh_repo: str | None = None,
     ) -> bool | None: ...
     async def check_pr_ci(
-        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        contract_fingerprint: str = "",
     ) -> CIProbeResult: ...
     # #1197: породить прогон на УЖЕ существующем коммите. Форж умеет это
     # по-разному или не умеет вовсе, поэтому ответ типизирован, а не булев:
