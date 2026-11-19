@@ -39,7 +39,7 @@ _MANDATE = _Mandate(
     approval_id=26222,
     approver_id=1,
     generation=2,
-    fingerprint="ea82f6dcbb2f100bd00c3905b7b486af1d4b21ad5f1be9c2e0e98d7a99f315f2",
+    fingerprint="ea82f6dcbb2f100bd00c3905b7b486af1d4b21ad5f1be9c2e0e98d7a99f315f2",  # pragma: allowlist secret (public statement digest)
     steward_id=42,
     roadmap_id=31,
 )
