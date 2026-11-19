@@ -32,7 +32,6 @@ from hub.services.return_running import work_signs
 log = logging.getLogger(__name__)
 
 EVENT_CLAIM_RELEASED = "executor_claim_released"
-EVENT_ANSWER_REOPEN_WANTED = "executor_answer_reopen_wanted"
 #: Статусы, в которых захват доказанного прогона ещё может стоять и подлежит
 #: страховочному снятию: попытка снять при сдаче могла отказать (чужая живая
 #: сессия), а статус — уйти дальше (review, needs_decision).
@@ -358,13 +357,15 @@ async def _try_answer_reopen(
         return "stale"
     if _claim_fingerprint(current) != claim:
         return "stale"
-    # needs_info can recur with exactly the same claim after another answer.
-    if await fetchall(
+    # Only the canonical question/answer routes write Hub-authored Q&A.
+    # A note with a caller-controlled kind does not supersede this answer.
+    latest = await fetchall(
         db,
-        "SELECT 1 FROM task_updates WHERE task_id = ? AND id > ? "
-        "AND kind IN ('question', 'answer') LIMIT 1",
-        (task_id, answer_id),
-    ):
+        "SELECT id, kind FROM task_updates WHERE task_id=? AND author_kind='hub' "
+        "AND kind IN ('question','answer') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    if not latest or latest[0]["id"] != answer_id or latest[0]["kind"] != "answer":
         return "stale"
     run_id = current["executor_run_id"]
     if run_id is not None and not await release_run_claim(
@@ -393,45 +394,47 @@ async def reopen_after_answer(
             db, task_id, answer_id=answer_id, claim=claim
         )
         if outcome == "blocked":
-            await repo.insert_event(
-                db,
-                kind=EVENT_ANSWER_REOPEN_WANTED,
-                task_id=task_id,
-                actor="hub",
-                payload={
-                    "answer_id": answer_id,
-                    "claim": claim,
-                    "run_id": answered["executor_run_id"],
-                },
+            await db.execute(
+                "INSERT INTO executor_answer_reopens "
+                "(task_id, answer_update_id, claim_fingerprint) VALUES (?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET "
+                "answer_update_id=excluded.answer_update_id, "
+                "claim_fingerprint=excluded.claim_fingerprint",
+                (task_id, answer_id, claim),
             )
         return outcome == "opened"
 
 
+async def _retry_answer_reopen(db: aiosqlite.Connection, task_id: int) -> None:
+    async with write_transaction(db):
+        pending = await fetchall(
+            db,
+            "SELECT answer_update_id, claim_fingerprint "
+            "FROM executor_answer_reopens WHERE task_id=?",
+            (task_id,),
+        )
+        if not pending:
+            return
+        intent = pending[0]
+        outcome = await _try_answer_reopen(
+            db,
+            task_id,
+            answer_id=int(intent["answer_update_id"]),
+            claim=str(intent["claim_fingerprint"]),
+        )
+        if outcome != "blocked":
+            await db.execute(
+                "DELETE FROM executor_answer_reopens WHERE task_id=?", (task_id,)
+            )
+
+
 async def retry_answer_reopens(db: aiosqlite.Connection) -> None:
-    """Settle recorded fallback answers after the run and its sessions end."""
-    rows = await fetchall(
-        db,
-        "SELECT e.task_id, e.payload FROM events e WHERE e.id IN ("
-        "  SELECT MAX(p.id) FROM events p JOIN tasks t ON t.id=p.task_id "
-        "  WHERE p.kind=? AND t.status='needs_info' AND t.archived=0 "
-        "  GROUP BY p.task_id"
-        ") AND EXISTS ("
-        "  SELECT 1 FROM tasks t JOIN task_updates a ON a.task_id=t.id "
-        "  WHERE t.id=e.task_id AND t.executor_run_id=json_extract(e.payload,'$.run_id') "
-        "  AND a.id=json_extract(e.payload,'$.answer_id') AND a.kind='answer' "
-        "  AND NOT EXISTS (SELECT 1 FROM task_updates newer WHERE newer.task_id=t.id "
-        "    AND newer.id>a.id AND newer.kind IN ('question','answer'))"
-        ")",
-        (EVENT_ANSWER_REOPEN_WANTED,),
-    )
+    """Settle current fallback answers after the run and its sessions end."""
+    rows = await fetchall(db, "SELECT task_id FROM executor_answer_reopens")
     for row in rows:
         task_id = int(row["task_id"])
         try:
-            payload = json.loads(row["payload"])
-            async with write_transaction(db):
-                await _try_answer_reopen(
-                    db, task_id, answer_id=payload["answer_id"], claim=payload["claim"]
-                )
+            await _retry_answer_reopen(db, task_id)
         except Exception:  # noqa: BLE001 - a broken intent must not stall unrelated tasks
             log.exception("Answer reopen failed for task #%d", task_id)
 

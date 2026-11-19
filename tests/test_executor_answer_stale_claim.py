@@ -221,6 +221,7 @@ async def test_recorded_answer_reopens_after_live_blocker_ends(
     assert waiting["status"] == "needs_info"
     assert waiting["executor_run_id"] == run_id
     assert waiting["claim_session_id"] == f"slot-{task_id}"
+    await _assert_pending(world, task_id, 1)
 
     worker = await _other_connection(world)
     try:
@@ -250,6 +251,7 @@ async def test_recorded_answer_reopens_after_live_blocker_ends(
         (run_claim.EVENT_CLAIM_RELEASED, task_id),
     )
     assert len(released) == 1
+    await _assert_pending(world, task_id, 0)
     next_run = await _launch_redeem(world, task_id)
     await _claim_and_start(world, task_id, next_run["session"])
     await _poll_orders(world.db)
@@ -278,6 +280,7 @@ async def test_new_question_supersedes_deferred_answer(slot_world):  # noqa: F81
     current = dict(await repo.get_task(world.db, task_id))
     assert current["status"] == "needs_info"
     assert current["executor_run_id"] == run_id
+    await _assert_pending(world, task_id, 0)
     assert (await _answered(world, task_id))["status"] == "open"
 
 
@@ -309,3 +312,39 @@ async def test_new_holder_supersedes_deferred_answer(slot_world):  # noqa: F811
     assert current["status"] == "running"
     assert current["executor_run_id"] == order["executor_run_id"] != run_id
     assert current["claimed_by"]
+    await _assert_pending(world, task_id, 0)
+
+
+async def _assert_pending(world, task_id, count):
+    assert (
+        len(
+            await _rows(
+                world.db,
+                "SELECT answer_update_id FROM executor_answer_reopens WHERE task_id=?",
+                (task_id,),
+            )
+        )
+        == count
+    )
+
+
+async def test_agent_feed_note_does_not_supersede_deferred_owner_answer(
+    slot_world,  # noqa: F811
+):
+    world = slot_world
+    task_id, run_id = await _question_with_stale_claim(world, live_session=True)
+    assert (await _answered(world, task_id))["status"] == "needs_info"
+
+    note = await world.client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "hub", "kind": "answer", "content": "Откройте позже"},
+        headers=world.agent_auth,
+    )
+    assert note.status_code == 200, note.text
+    assert note.json()["author_kind"] != "hub"
+    await _expire_session(world.db, run_id)
+    await world.db.commit()
+    await _poll_orders(world.db)
+
+    assert (await repo.get_task(world.db, task_id))["status"] == "open"
+    await _assert_pending(world, task_id, 0)
