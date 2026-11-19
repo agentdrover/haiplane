@@ -39,14 +39,14 @@ from typing import Any, Final
 import aiosqlite
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from fastapi import HTTPException
 
 from hub import config
 from hub import repository as repo
 from hub.auth import SLOT_RUNNER_USER_PREFIX
 from hub.db import fetchall, write_transaction
 from hub.models import _SLOT_NAME
-from hub.services import admin as admin_svc, epic_plan
+from hub.services import admin as admin_svc
+from hub.services.executor_slot_launch import launch_on_slot as launch_on_slot
 from hub.services import (
     chat_pair,
     executor_skill_bundle as skills,
@@ -427,6 +427,12 @@ async def close_order(
     кода ``redeemed_at`` уже стоит и строку DELETE не трогает, а у непотраченного
     после сдачи другим путём применения не остаётся.
     """
+    from hub.services.epic_plan_gates import by_order_refusal
+
+    if return_task and await by_order_refusal(
+        db, int(order["id"]), enforce_grant=False
+    ):
+        return_task = False
     # #1817: фактический исход на момент закрытия — до снятия захвата, который
     # уберёт держателя задачи: сдала ли задачу прогон ЭТОГО заказа. Сдача сильнее
     # любой иной причины (в том числе слова хоста failed до закрытия): причина
@@ -815,62 +821,6 @@ async def _book(
     return _Booking(task, host, bundle, returning=task["status"] == "running")
 
 
-async def launch_on_slot(
-    db: aiosqlite.Connection,
-    project: Any,
-    *,
-    host: str,
-    task_id: int | None,
-    issuer_principal_id: int,
-    issuer_human: bool = False,
-) -> Any:
-    """Запуск исполнителя на слот хоста по нажатию человека (#1712).
-
-    Проект в режиме manual; облако (github, наблюдение прав токена, модель)
-    слоту не нужно. Прогон, код и заказ — ОДНА write-транзакция без внутренних
-    commit: любой сбой до вставки заказа откатывает и код, и прогон.
-    """
-    from hub.services import executor_launch as el
-    from hub.services.executor_launch import LaunchResult
-
-    if el.launch_mode_of(project_policy.gate_policy_of(project)) != el.LAUNCH_MANUAL:
-        return el._refused(el.REASON_OFF)
-    if await chat_pair.get_acting_agent(db) is None:
-        return el._refused(f"{el.REASON_NO_ACTING_AGENT} (CHAT_PAIR_AGENT)")
-    try:
-        async with write_transaction(db):
-            bundle = await skills.read_active_bundle(db)
-            booked = await _book(db, project, host, task_id, bundle)
-            if isinstance(booked, str):
-                return el._refused(booked, task_id)
-            order_id, row_id = await _issue_atomically(
-                db,
-                project,
-                booked,
-                issuer_principal_id=issuer_principal_id,
-                issuer_human=issuer_human,
-            )
-    except skills.SkillBundleError as exc:
-        return el._refused(str(exc), task_id)
-    except aiosqlite.IntegrityError:
-        # Второе соединение заняло последнее место раньше: триггер слотов хоста.
-        return el._refused(f"{REASON_SLOT_BUSY}: {host}", task_id)
-    except HostError as exc:
-        # Сохранённый ключ хоста не годится: код не выписан, ничего не осталось.
-        return el._refused(f"{REASON_HOST_OFF}: {exc.detail}", task_id)
-    except epic_plan.PlanRefusal as exc:
-        return el._refused(
-            epic_plan.format_start_blocker(exc.details),
-            exc.details.get("task_id", task_id),
-        )
-    except HTTPException as exc:
-        # Задача ушла из running между проверкой и возвратом: откат уже сделан.
-        return el._refused(f"{REASON_NOT_OPEN}: {exc.detail}", task_id)
-    return LaunchResult(
-        True, "", int(booked.task["id"]), row_id=row_id, order_id=order_id, host=host
-    )
-
-
 async def _issue_atomically(
     db: aiosqlite.Connection,
     project: Any,
@@ -878,6 +828,7 @@ async def _issue_atomically(
     *,
     issuer_principal_id: int,
     issuer_human: bool = False,
+    pilot_start: tuple[str, str] | None = None,
 ) -> tuple[int, int]:
     """``_issue`` под SAVEPOINT: сбой откатывает ЕГО записи, а не только свои.
 
@@ -889,7 +840,6 @@ async def _issue_atomically(
     Круг починки running-задачи (#1998): возврат в open — ВНУТРИ этой же точки,
     поэтому сбой выпуска откатывает и его, а не оставляет open без заказа.
     """
-    await epic_plan.refuse_legacy_start(db, int(booked.task["id"]))
     await db.execute("SAVEPOINT executor_slot_issue")
     try:
         if booked.returning:
@@ -900,6 +850,7 @@ async def _issue_atomically(
             booked,
             issuer_principal_id=issuer_principal_id,
             issuer_human=issuer_human,
+            pilot_start=pilot_start,
         )
     except BaseException:
         await db.execute("ROLLBACK TO executor_slot_issue")
@@ -937,19 +888,24 @@ async def _issue(
     *,
     issuer_principal_id: int,
     issuer_human: bool = False,
+    pilot_start: tuple[str, str] | None = None,
 ) -> tuple[int, int]:
     """Прогон, код, шифротекст и заказ — без commit; (id заказа, id прогона)."""
     task, host = booked.task, booked.host
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0) + 1
     text, starting_ref = await _order_text(db, project, task, booked.bundle)
+    if pilot_start is not None:
+        starting_ref, model = pilot_start
+    else:
+        model = ""
     row_id = await repo.create_executor_run(
         db,
         task_id=task_id,
         submission_generation=generation,
         agent_id="",
         run_id="",
-        model="",
+        model=model,
         channel="slot",
         slot=host["name"],
         launched_by=issuer_principal_id,
@@ -1007,12 +963,17 @@ async def _issue(
         channel="slot",
         host=host["name"],
     )
+    source = (
+        "по действующему плану пилота"
+        if pilot_start is not None
+        else "по нажатию человека"
+    )
     await repo.add_task_update(
         db,
         task_id,
         "hub",
         "status",
-        f"Исполнитель заказан хабом на слот {host['name']} по нажатию человека "
+        f"Исполнитель заказан хабом на слот {host['name']} {source} "
         f"(#1712): заказ #{order_id}, сдача {generation}, от {starting_ref}, "
         f"срок прогона {order_deadline.hours_text(run_seconds)}.",
     )
@@ -1050,6 +1011,8 @@ async def deliver_orders(db: aiosqlite.Connection, host: str) -> list[dict[str, 
     Повторная отдача до ack — тот же id: ответ мог потеряться по дороге, и хост
     дедуплицирует по id. Коммитит только то, что изменилось.
     """
+    from hub.services.epic_plan_gates import by_order_refusal
+
     async with write_transaction(db):
         await settle(db, host=host)
         rows = [
@@ -1061,6 +1024,7 @@ async def deliver_orders(db: aiosqlite.Connection, host: str) -> list[dict[str, 
                 (host,),
             )
         ]
+        rows = [row for row in rows if not await by_order_refusal(db, int(row["id"]))]
         for row in rows:
             if row["state"] != STATE_PENDING:
                 continue
@@ -1452,7 +1416,10 @@ async def report_outcome(
                     f"итог по заказу уже записан: {order['report_outcome']}",
                 )
             return {"id": order["id"], "outcome": outcome, "duplicate": True}
-        if outcome in ("failed", "rescued"):
+        from hub.services.epic_plan_gates import by_order_refusal
+
+        plan_stopped = await by_order_refusal(db, order_id, enforce_grant=False)
+        if not plan_stopped and outcome in ("failed", "rescued"):
             # #1942: граница включения разбора закрепляется ДО закрытия заказа и вне
             # SAVEPOINT рекомендации: откат разбора её не уносит, а закрытие этого
             # заказа не может оказаться «историей» из-за ленивого создания.
@@ -1469,6 +1436,8 @@ async def report_outcome(
             "WHERE id = ? AND report_outcome = ''",
             (outcome, sha, branch, note, reason_code, reason, order["id"]),
         )
+        if plan_stopped:
+            return {"id": order["id"], "outcome": outcome, "duplicate": False}
         text = _report_text(
             order, host, outcome, sha, branch, note, reason_code, reason
         )

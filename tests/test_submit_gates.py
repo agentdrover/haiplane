@@ -129,6 +129,7 @@ EXPECTED_SUBMIT_ORDER = (
 
 EXPECTED_VERDICT_ORDER = (
     "has_a_submission",
+    "pilot_approval",
     "default_approval_is_the_stewards",
     "changes_requested_has_content",
     "verdict_matches_its_text",

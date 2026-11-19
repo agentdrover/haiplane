@@ -3294,6 +3294,11 @@ async def _policy_and_novelty_allow(
     там, а здесь остаётся прежнее «можно ли заказывать». Вынесена отдельно,
     потому что maybe_dispatch_review стоит на потолке сложности вплотную.
     """
+    from hub.services.epic_plan_gates import note_review_blocker, review_blocker
+
+    if blocker := await review_blocker(db, task, project):
+        await note_review_blocker(db, task, blocker)
+        return False
     return not await dispatch_refusal(db, task, project, force_profile, force_model)
 
 
@@ -3324,6 +3329,10 @@ async def _name_the_missing_reviewer(
     в слово с тем, что человек видит в форме проекта и в отказе на записи
     политики (#1188). Второй копии этого знания не заводим.
     """
+    from hub.services.epic_plan_gates import managed
+
+    if await managed(db, int(task["id"])):
+        return False  # The pilot gate supplies its own reason and recipient.
     if review_dispatch_enabled(gate_policy_of(project)):
         # Отказала не политика, а проверка новизны: код уже читали, и она
         # говорит об этом сама (#1152). Накрывать её вторым алертом значило бы
@@ -4374,6 +4383,25 @@ async def _cloud_config_missing(
         if not ok
     ]
     if missing:
+        from hub.services.epic_plan_gates import (
+            ReviewBlocker,
+            managed,
+            note_review_blocker,
+        )
+
+        if await managed(db, task_id):
+            task = await repo.get_task(db, task_id)
+            if task is not None:
+                await note_review_blocker(
+                    db,
+                    task,
+                    ReviewBlocker(
+                        "pilot_review_configuration_unavailable",
+                        "operator",
+                        "restore_independent_reviewer_configuration",
+                    ),
+                )
+            return True
         await repo.add_task_update(
             db,
             task_id,
@@ -4513,6 +4541,114 @@ async def _prepare_claimed_order(
     return order
 
 
+async def _start_paid_review(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    order: ReviewOrder,
+    forge: str,
+    gh_repo: str,
+    branch: str,
+    reviewer_token: str,
+    principal_id: int | None,
+) -> tuple[_Started, Any] | None:
+    from hub.services import epic_plan_gates, epic_plan_transport
+
+    task_id = int(task["id"])
+    generation = int(task["submission_generation"] or 0)
+    ordinal = await _attempt_ordinal(db, task_id, generation)
+    marker = cursor_cloud.agent_marker("review", task_id, generation, ordinal)
+    repo_url = forge_urls.repo_url(forge, gh_repo)
+    hub_url = f"{instance_base_url().rstrip('/')}/mcp"
+    if await epic_plan_gates.managed(db, task_id):
+        request = epic_plan_transport.ReviewRequest(
+            marker,
+            repo_url,
+            branch,
+            task["submission_sha"],
+            order.model,
+            order.prompt,
+            hub_url,
+        )
+        return await _launch_metered_review(db, task, request, principal_id, ordinal)
+    started = await _create_or_adopt(
+        marker,
+        task_id=task_id,
+        repo_url=repo_url,
+        starting_ref=branch,
+        model_id=order.model,
+        prompt_text=order.prompt,
+        hub_mcp_url=hub_url,
+        reviewer_token=reviewer_token,
+        model_params=await cursor_cloud.review_params_for(order.model),
+        db=db,
+    )
+    return started, None
+
+
+async def _launch_metered_review(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    request: Any,
+    principal_id: int | None,
+    ordinal: int,
+) -> tuple[_Started, Any] | None:
+    from hub.services import epic_plan_gates, epic_plan_transport
+
+    backend = epic_plan_transport.review_transport()
+    if backend is None:
+        return None
+    ready, permit = await epic_plan_gates.reserve_review(
+        db,
+        task,
+        channel="cloud",
+        model=request.model,
+        principal_id=principal_id,
+        attempt=ordinal,
+    )
+    if not ready or permit is None:
+        return None
+    if permit.reconcile:
+        if not await epic_plan_gates.can_prepare_review(db, task):
+            return None
+        seen = await backend.lookup(request, permit.grant)
+        if not seen.asked:
+            return None
+        if seen.agent_id:
+            return _Started(seen.agent_id, seen.run_id, True, False, 0, None), permit
+    if not await epic_plan_gates.ready_to_send(db, permit):
+        return None
+    return await backend.launch(request, permit.grant), permit
+
+
+async def _release_pilot_review_refusal(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    force_profile: str,
+    replaces_dispatch_id: int | None,
+    force_model: str,
+) -> bool:
+    await _release_the_order(
+        db, task_id, generation, force_profile, replaces_dispatch_id, force_model
+    )
+    await db.commit()
+    return False
+
+
+def _note_unknown_reviewer(task_id: int, expected_principal: int | None) -> None:
+    # #1025: pin whose report this dispatch waits for, resolved from the
+    # reviewer token at dispatch time (above, where the code was minted under
+    # it). An unresolved token is logged and falls back to the old
+    # task+generation match rather than blocking the dispatch — degradation is
+    # this module's contract.
+    if expected_principal is None:
+        log.warning(
+            "reviewer token resolves to no principal — dispatch for task #%s "
+            "matches its report by task+generation only",
+            task_id,
+        )
+
+
 async def maybe_dispatch_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -4615,24 +4751,15 @@ async def maybe_dispatch_review(
     )
     if order is None:
         return False
-    model_id, profile, profile_reasons = order.model, order.profile, order.reasons
-    started = await _create_or_adopt(
-        cursor_cloud.agent_marker(
-            "review",
-            task_id,
-            generation,
-            await _attempt_ordinal(db, task_id, generation),
-        ),
-        task_id=task_id,
-        repo_url=forge_urls.repo_url(forge, gh_repo),
-        starting_ref=branch,
-        model_id=model_id,
-        prompt_text=order.prompt,
-        hub_mcp_url=f"{instance_base_url().rstrip('/')}/mcp",
-        reviewer_token=reviewer_token,
-        model_params=await cursor_cloud.review_params_for(model_id),
-        db=db,
+    purchase = await _start_paid_review(
+        db, task, order, forge, gh_repo, branch, reviewer_token, expected_principal
     )
+    if purchase is None:
+        return await _release_pilot_review_refusal(
+            db, task_id, generation, force_profile, replaces_dispatch_id, force_model
+        )
+    started, permit = purchase
+    model_id, profile, profile_reasons = order.model, order.profile, order.reasons
     agent_id, run_id = started.agent_id, started.run_id
     variant = await _name_the_dropped_params(db, task_id, model_id, started)
     if not agent_id:
@@ -4678,17 +4805,7 @@ async def maybe_dispatch_review(
         await db.commit()
         return owed
 
-    # #1025: pin whose report this dispatch waits for, resolved from the
-    # reviewer token at dispatch time (above, where the code was minted under
-    # it). An unresolved token is logged and falls back to the old
-    # task+generation match rather than blocking the dispatch — degradation is
-    # this module's contract.
-    if expected_principal is None:
-        log.warning(
-            "reviewer token resolves to no principal — dispatch for task #%s "
-            "matches its report by task+generation only",
-            task_id,
-        )
+    _note_unknown_reviewer(task_id, expected_principal)
     placed_id = await repo.create_review_dispatch(
         db,
         task_id=task_id,
@@ -4702,6 +4819,9 @@ async def maybe_dispatch_review(
         replaces_dispatch_id=replaces_dispatch_id,
         only_tests=order.only_tests,
     )
+    from hub.services import epic_plan_gates
+
+    await epic_plan_gates.attach_dispatch(db, permit, placed_id)
     # #1946: код выписан до строки заказа - привязать его к заказу.
     await report_binding.bind_code_to_dispatch(
         db, order.access_code, placed_id, task_id, generation, expected_principal
@@ -5285,6 +5405,14 @@ async def dispatch_local_review(
     task_id = int(task["id"])
     if automation_not_applicable(task):
         # #1647: свой затвор у второй двери — её зовут и мимо maybe_dispatch_review.
+        return False
+    from hub.services.epic_plan_gates import managed
+
+    if await managed(db, task_id):
+        if local_first:
+            raise _LocalFirstDeclined(
+                "Локальный ревьюер не поддерживает ограничение расходов пилота."
+            )
         return False
     reach = await review_reach(db, forge)
     principal_id = await local_reviewer_principal_id(db)
