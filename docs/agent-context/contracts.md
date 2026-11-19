@@ -266,3 +266,38 @@ put the code into `order_text` instead of `{{PAIR_CODE}}`, redeem it at
 - These are task-feed rows with `kind='decision'` WITH ORIGIN, not "owner decisions": `kind` is a free string, so an agent may write one too. Archived tasks and the project (task subtree, descendants inherit it) are filtered in the same query, BEFORE `LIMIT`. Other journals (dispatcher events, steward judgements, review verdicts, approve/reject) are not sources.
 - Access is the same as `GET /api/dashboard` (no permission of its own; the middleware allowlists decide: watcher reads, steward/chat-pair/ci_reader/ci_auditor are refused). Consumers: MCP `hub_list_decisions`, the dashboard (`recent_decisions`, 8) and `hub_project_status`.
 - The CLI link to n4l is gone (`hub/integrations/notes.py`, `N4L_BIN`, `N4L_SPACE`, `NotesPlugin`). `record_decision` is still accepted on REST/CLI/MCP and ignored; `GET /api/integrations/notes` answers 410.
+
+## Запрос консультации roadmap по плану (#2397)
+
+Администратор Hub задаёт адресный мандат через `PUT /api/tasks/{task_id}/roadmap-grant`
+или `hp-hub roadmap grant`. Укажите `plan_id`, `steward_principal_id` с ролью
+`roadmap_steward` и `roadmap_principal_id` агента roadmap. Мандат действует для
+самого плана или выбранного потомка в том же активном публичном проекте. Hub
+закрепляет событие человеческого одобрения, текущие версии постановки плана и
+задачи и срок `ttl_days` (7 дней по умолчанию, 1–30 допустимо). При изменении
+постановки или снятии мандата нужен новый явный grant. Для отзыва используйте
+`DELETE` того же ресурса или `hp-hub roadmap revoke`.
+
+С `signal_task_id` мандат разрешает консультации по закрытым заказам этой
+задачи с отчётом `failed/redeem_failed`. Выбирать заранее номера заказов
+не требуется. Стюард использует отдельный API-ключ с ограниченным сроком и
+обращается только к GET того же ресурса и
+`POST /api/tasks/{task_id}/roadmap-requests`. GET показывает до 20 ещё
+не обработанных сигналов в `signals` по возрастанию ID. Периодический опрос
+начинается с `after_order_id=0`, чтобы увидеть старый заказ, который
+закрылся позже нового. POST принимает `plan_id`, наблюдавшийся в GET
+`grant_id`, повторяемый `request_id`, `question` и, при наличии источника,
+`source_order_id`. CLI читает вопрос из `--question-file` (либо `-` для stdin).
+Повтор идентичного запроса возвращает тот же `order_id`. Замена мандата
+не выдаёт уже обработанные сигналы повторно в рамках того же плана и одобрения. Не меняйте ключ после сетевого тайм-аута.
+Если для задачи уже идёт консультация, дождитесь её закрытия.
+
+Хост по-прежнему получает тот же lease. Для явного запроса ключ источника
+есть случайный `steward_request:<32 hex>`. Аутентифицированный агент roadmap
+читает вопрос через `GET /api/roadmap/orders/{order_id}` со своим ключом
+источника в заголовке `X-Hub-Roadmap-Source` только по актуальному started-заказу.
+Hub хранит вопрос вне lease и аудита. Итог
+передаётся через обычный отчёт роли от хоста. Существующий
+`needs_decision:<event_id>` и его автоматический маршрут сохраняются.
+Новые операции доступны через REST и CLI. Токен выделенного стюарда
+не допускается к MCP и остальным операциям Hub.

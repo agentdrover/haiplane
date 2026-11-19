@@ -215,6 +215,7 @@ from hub.executor_host_api import (
     router as executor_host_router,
 )
 from hub.agent_outbox_api import router as agent_outbox_router
+from hub.roadmap_api import router as roadmap_router
 from hub.role_host_api import router as role_host_router
 from hub.web import router as web_router
 
@@ -575,6 +576,7 @@ app.include_router(epic_plan_router)
 app.include_router(owner_minutes_router)
 app.include_router(executor_host_router)
 app.include_router(role_host_router)
+app.include_router(roadmap_router)
 app.include_router(agent_outbox_router)
 app.include_router(critic_host_router)
 app.include_router(executor_slot_web_router)

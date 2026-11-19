@@ -935,6 +935,25 @@ def _steward_refused(identity: TokenIdentity, method: str, path: str) -> bool:
     return identity.is_steward and not steward_route_allowed(method, path, identity)
 
 
+_ROADMAP_STEWARD_ALLOWED = (
+    ("GET", _template_to_regex("/api/tasks/{task_id}/roadmap-grant")),
+    ("POST", _template_to_regex("/api/tasks/{task_id}/roadmap-requests")),
+)
+
+
+def _roadmap_steward_gate(method: str, path: str) -> Response | None:
+    if any(
+        method == verb and pattern.match(path)
+        for verb, pattern in _ROADMAP_STEWARD_ALLOWED
+    ):
+        return None
+    return Response(
+        status_code=403,
+        content='{"detail":"roadmap steward route forbidden"}',
+        media_type="application/json",
+    )
+
+
 async def _role_gate(
     request: Request, identity: TokenIdentity, path: str
 ) -> Response | None:
@@ -944,6 +963,8 @@ async def _role_gate(
     a role added to one branch and not the other is the failure that does not
     announce itself.
     """
+    if identity.role == "roadmap_steward":
+        return _roadmap_steward_gate(request.method, path)
     if _steward_refused(identity, request.method, path):
         await _record_steward_refusal(request, request.method, path)
         return _steward_forbidden(request.method, path)
