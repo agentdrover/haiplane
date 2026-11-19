@@ -866,6 +866,7 @@ class GitVerseForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         contract_fingerprint: str = "",
+        exact_head: str = "",
     ) -> CIProbeResult:
         """Исход CI для головы этого PR.
 
@@ -874,6 +875,10 @@ class GitVerseForge:
         Ветка PR берётся у самого PR, потому что ветвь запроса могла
         разойтись с тем, что думает вызывающий.
         """
+        if exact_head:
+            return CIProbeResult(
+                CIProbeOutcome.unavailable, "ci_exact_head_unsupported"
+            )
         head_sha = await self.pr_head_sha(pr_number, repo=repo, gh_repo=gh_repo)
         if not head_sha:
             return CIProbeResult(

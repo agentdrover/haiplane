@@ -728,6 +728,7 @@ class NoopGitOps:
         gh_repo: str | None = None,
         forge: str = "",
         contract_fingerprint: str = "",
+        exact_head: str = "",
     ) -> CIProbeResult:
         return CIProbeResult(CIProbeOutcome.pending, "noop")
 
@@ -1090,6 +1091,7 @@ class NoopForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         contract_fingerprint: str = "",
+        exact_head: str = "",
     ) -> CIProbeResult:
         return CIProbeResult(CIProbeOutcome.unavailable, "forge_not_configured")
 

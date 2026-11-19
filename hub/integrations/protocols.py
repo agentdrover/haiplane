@@ -90,12 +90,26 @@ class SnapshotArchive:
 
 
 @dataclass(frozen=True)
+class CIBaseChange:
+    """Otherwise valid CI evidence was built against a moved PR base."""
+
+    pr_number: int
+    head_ref: str
+    head_sha: str
+    base_ref: str
+    pinned_base_sha: str
+    current_base_sha: str
+
+
+@dataclass(frozen=True)
 class CIProbeResult:
     """A CI probe outcome plus a stable, machine-usable reason (#419)."""
 
     outcome: CIProbeOutcome
     reason: str
     details: str | None = None
+    base_change: CIBaseChange | None = None
+    head_sha: str = ""
 
 
 class CIRunRequestOutcome(str, Enum):
@@ -158,6 +172,8 @@ class BaseFreshness:
     head_sha: str = ""
     behind_by: int | None = None
     reason: str = ""
+    base_ref: str = ""
+    base_sha: str = ""
 
 
 class BranchUpdateOutcome(str, Enum):
@@ -586,6 +602,7 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
         contract_fingerprint: str = "",
+        exact_head: str = "",
     ) -> CIProbeResult: ...
     # #1914: ``on_send`` ОБЯЗАТЕЛЕН для любой реализации с отправкой (POST):
     # вызвать его ровно перед ней. Всё до вызова - отказ, не тратящий попытку.
@@ -1010,6 +1027,7 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         contract_fingerprint: str = "",
+        exact_head: str = "",
     ) -> CIProbeResult: ...
     # #1197: породить прогон на УЖЕ существующем коммите. Форж умеет это
     # по-разному или не умеет вовсе, поэтому ответ типизирован, а не булев:

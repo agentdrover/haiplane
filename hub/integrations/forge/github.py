@@ -516,14 +516,15 @@ class GitHubForge:
             "api",
             f"repos/{slug}/compare/{base}...{head}",
             "--jq",
-            "{status: .status, behind_by: .behind_by}",
+            "{behind_by: .behind_by, base_sha: .base_commit.sha}",
             repo=repo,
             check=False,
         )
         try:
-            behind = json.loads(out).get("behind_by") if rc == 0 else None
-        except (json.JSONDecodeError, AttributeError):
-            behind = None
+            comparison = json.loads(out) if rc == 0 else {}
+        except json.JSONDecodeError:
+            comparison = {}
+        behind = comparison.get("behind_by") if isinstance(comparison, dict) else None
         if not isinstance(behind, int) or isinstance(behind, bool) or behind < 0:
             why = (err or "").strip()[:200] or "behind_by нет в ответе"
             return BaseFreshness(
@@ -532,8 +533,14 @@ class GitHubForge:
                 reason=f"compare {base}...{head[:12]} не ответил: {why}",
             )
         state = BaseFreshnessState.behind if behind else BaseFreshnessState.current
+        base_sha = comparison.get("base_sha")
         return BaseFreshness(
-            state, head_sha=head, behind_by=behind, reason=f"база {base}"
+            state,
+            head_sha=head,
+            behind_by=behind,
+            reason=f"база {base}",
+            base_ref=base,
+            base_sha=base_sha if isinstance(base_sha, str) else "",
         )
 
     async def update_pr_branch(
@@ -1069,6 +1076,7 @@ class GitHubForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         contract_fingerprint: str = "",
+        exact_head: str = "",
     ) -> CIProbeResult:
         if (gh_repo or REPO_NAME).lower() == github_ci_selection.PILOT_REPO:
 
@@ -1076,10 +1084,15 @@ class GitHubForge:
                 return await self._api_json(endpoint, repo=repo)
 
             result = await github_ci_selection.equivalent_probe(
-                fetch_ci_evidence, pr_number, contract_fingerprint
+                fetch_ci_evidence,
+                pr_number,
+                contract_fingerprint,
+                exact_head=exact_head,
             )
             if result is not None:
                 return result
+        if exact_head:
+            return CIProbeResult(CIProbeOutcome.unavailable, "ci_exact_head_unproved")
         return await self._legacy_pr_ci(pr_number, repo=repo, gh_repo=gh_repo)
 
     async def _legacy_pr_ci(
