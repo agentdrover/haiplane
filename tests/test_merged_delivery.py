@@ -264,3 +264,36 @@ async def test_ci_changes_between_reconciliation_and_completion(
     assert live["status"] == "running"
     assert await db.execute_fetchall("SELECT * FROM pipeline_merges")
     git.merge_pr.assert_not_awaited()
+
+
+async def test_project_reassignment_does_not_reuse_old_merge(db, merged):
+    task, _, _, _, _, _ = merged
+    await _report_done(db, task["id"])
+    destination = await repo.create_project(
+        db, slug="another", name="Another", repo_name="other/home-infra"
+    )
+    await repo.update_task(db, task["id"], project_id=destination)
+    await db.commit()
+
+    assert not await repo.merge_sha_for_task(db, task["id"])
+    assert not (await repo.task_as_blocker(db, task["id"]))["delivered"]
+    assert await db.execute_fetchall("SELECT * FROM pipeline_merges")
+
+
+async def test_renewed_approval_reconciles_same_merge_without_second_row(db, merged):
+    task, _, git, _, _, _ = merged
+    old_revision = task["review_verdict_revision"]
+    assert (await orchestration.merge_before_completion(db, task))[0]
+    await repo.update_task(db, task["id"], review_verdict_revision=old_revision + 1)
+    await db.commit()
+
+    await _report_done(db, task["id"])
+
+    live = dict(await repo.get_task(db, task["id"]))
+    assert live["status"] == "completed"
+    rows = await db.execute_fetchall("SELECT reconciliation FROM pipeline_merges")
+    assert len(rows) == 1
+    evidence = json.loads(rows[0]["reconciliation"])
+    assert evidence["pin"]["verdict_revision"] == old_revision + 1
+    assert evidence["first_attestation"]["pin"]["verdict_revision"] == old_revision
+    git.merge_pr.assert_not_awaited()

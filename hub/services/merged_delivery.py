@@ -29,6 +29,17 @@ class _Pin:
     verdict_revision: int
     contract: str
 
+    def merge_identity(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "project_id": self.project_id,
+            "repository": self.repository,
+            "base": self.base,
+            "number": self.number,
+            "branch": self.branch,
+            "head": self.head,
+        }
+
 
 async def _pin(db: aiosqlite.Connection, task: dict[str, Any]) -> _Pin | None:
     from hub.services.orchestration import review_approved_for_current_submission
@@ -169,11 +180,13 @@ async def completion_stands(
 
 
 async def _reconciled_rows(db: aiosqlite.Connection, task_id: int, pr_number: int):
-    return await fetchall(
-        db,
-        "SELECT project_id, merge_sha, reconciliation FROM pipeline_merges "
-        "WHERE task_id=? AND pr_number=? AND reconciliation<>''",
-        (task_id, pr_number),
+    return list(
+        await fetchall(
+            db,
+            "SELECT id, merge_sha, reconciliation FROM pipeline_merges "
+            "WHERE task_id=? AND pr_number=? AND reconciliation<>''",
+            (task_id, pr_number),
+        )
     )
 
 
@@ -184,16 +197,70 @@ async def _insert(
     attempt: str,
 ) -> tuple[bool, str]:
     prior = await _reconciled_rows(db, pin.task_id, pin.number)
-    if prior:
-        existing = prior[0]
-        if (
-            len(prior) == 1
-            and existing["merge_sha"] == facts.merge_sha
-            and json.loads(existing["reconciliation"])["pin"] == asdict(pin)
-        ):
-            return True, f"{RECONCILED}: {facts.merge_sha}"
-        return False, "merged_outside_gate: prior_reconciliation_conflicts"
     evidence = {"pin": asdict(pin), "github": asdict(facts), "ci_attempt": attempt}
+    if prior:
+        changed = await _renew(db, pin, facts, evidence, prior)
+        if changed is None:
+            return False, "merged_outside_gate: prior_reconciliation_conflicts"
+        if not changed:
+            return True, f"{RECONCILED}: {facts.merge_sha}"
+    elif not await _append(db, pin, facts, evidence):
+        return False, "merged_outside_gate: merge_already_attributed"
+    await repo.insert_event(
+        db,
+        kind=RECONCILED,
+        task_id=pin.task_id,
+        project_id=pin.project_id,
+        actor="hub",
+        payload=evidence,
+    )
+    await repo.add_task_update(
+        db,
+        pin.task_id,
+        "hub",
+        "status",
+        ("Мерж вне гейта повторно сверён" if prior else "Подтверждён мерж вне гейта")
+        + f": {pin.repository}#{pin.number}, "
+        f"{facts.merge_sha} в {pin.base}, GitHub {facts.merged_at} ({facts.merged_by}). "
+        f"Сдача {pin.generation}, head {pin.head}, подтверждённый CI {attempt}.",
+    )
+    return True, f"{RECONCILED}: {facts.merge_sha}"
+
+
+async def _renew(
+    db: aiosqlite.Connection,
+    pin: _Pin,
+    facts: github_merged_delivery.MergedPullRequest,
+    evidence: dict[str, Any],
+    prior: list[aiosqlite.Row],
+) -> bool | None:
+    """Re-attest the same immutable merge under current approval and CI."""
+    if len(prior) != 1 or prior[0]["merge_sha"] != facts.merge_sha:
+        return None
+    existing = json.loads(prior[0]["reconciliation"])
+    if any(
+        existing["pin"].get(key) != value for key, value in pin.merge_identity().items()
+    ):
+        return None
+    if (
+        existing["pin"] == evidence["pin"]
+        and existing["ci_attempt"] == evidence["ci_attempt"]
+    ):
+        return False
+    evidence["first_attestation"] = existing.get("first_attestation", existing)
+    await db.execute(
+        "UPDATE pipeline_merges SET reconciliation=? WHERE id=?",
+        (json.dumps(evidence), prior[0]["id"]),
+    )
+    return True
+
+
+async def _append(
+    db: aiosqlite.Connection,
+    pin: _Pin,
+    facts: github_merged_delivery.MergedPullRequest,
+    evidence: dict[str, Any],
+) -> bool:
     cursor = await db.execute(
         "INSERT OR IGNORE INTO pipeline_merges "
         "(project_id, task_id, pr_number, merge_sha, merged_at, reconciliation) "
@@ -209,23 +276,4 @@ async def _insert(
             json.dumps(evidence),
         ),
     )
-    if not cursor.rowcount:
-        return False, "merged_outside_gate: merge_already_attributed"
-    await repo.insert_event(
-        db,
-        kind=RECONCILED,
-        task_id=pin.task_id,
-        project_id=pin.project_id,
-        actor="hub",
-        payload=evidence,
-    )
-    await repo.add_task_update(
-        db,
-        pin.task_id,
-        "hub",
-        "status",
-        f"Подтверждён мерж вне гейта: {pin.repository}#{pin.number}, "
-        f"{facts.merge_sha} в {pin.base}, GitHub {facts.merged_at} ({facts.merged_by}). "
-        f"Сдача {pin.generation}, head {pin.head}, подтверждённый CI {attempt}.",
-    )
-    return True, f"{RECONCILED}: {facts.merge_sha}"
+    return bool(cursor.rowcount)
