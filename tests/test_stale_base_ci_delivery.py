@@ -217,6 +217,9 @@ async def test_ambiguous_or_ineligible_base_recovery_fails_closed(
     assert (await _deliver(rig, "registry")).startswith(expected)
     if block == "conflict":
         rig.git.update_pr_branch.assert_awaited_once()
+        assert (
+            await db.execute_fetchall("SELECT id FROM stale_base_update_intents") == []
+        )
     else:
         rig.git.update_pr_branch.assert_not_awaited()
     assert await rig.retry_rows() == []
@@ -446,10 +449,15 @@ async def test_concurrent_delivery_updates_the_proven_old_head_once(
         # baseline waiting for an event that only the fixed code can signal.
         await asyncio.wait({first, signal}, return_when=asyncio.FIRST_COMPLETED)
         assert entered.is_set()
+        (intent,) = await other.execute_fetchall(
+            "SELECT from_sha, confirmed FROM stale_base_update_intents"
+        )
+        assert (intent["from_sha"], intent["confirmed"]) == (APPROVED, 0)
         ok, reason, _ = await lifecycle.deliver_on_disposition(
             other, rig.task_id, "deliver", via="registry_deliver"
         )
-        assert not ok and reason.startswith("base_update_pending")
+        assert not ok
+        assert reason.endswith("waiting_for_branch_update_confirmation")
         assert await rig.retry_rows() == []
     finally:
         release.set()
@@ -472,7 +480,7 @@ async def test_lost_update_response_never_arms_or_updates_another_head(db, monke
         return BranchUpdateOutcome.unavailable, "connection lost after send"
 
     rig.git.update_pr_branch.side_effect = update
-    assert (await _deliver(rig, "registry")).startswith("base_update_retry")
+    assert (await _deliver(rig, "registry")).startswith("base_update_pending")
     assert await rig.retry_rows() == []
     await _deliver(rig, "registry")
     rig.git.update_pr_branch.assert_awaited_once()
@@ -543,3 +551,35 @@ async def test_head_moved_after_exact_green_never_updates_the_unchecked_head(
     rig.git.merge_pr.assert_not_awaited()
     rig.git.update_pr_branch.assert_awaited_once()
     assert rig.git.update_pr_branch.await_args.args == (77, APPROVED)
+
+
+async def test_lost_ack_is_durable_while_github_still_reports_old_head(
+    db, db_dsn, monkeypatch
+):
+    rig = await _rig(db, monkeypatch)
+    rig.git.update_pr_branch.return_value = (
+        BranchUpdateOutcome.unavailable,
+        "connection lost after send",
+    )
+    assert (await _deliver(rig, "registry")).startswith("base_update_pending")
+    assert await rig.retry_rows() == []
+
+    # Simulate a restart. The old head still appears at the forge, and even
+    # a later CI response claiming green for it cannot open a second update.
+    task = await rig.task()
+    orchestration._gate_branch_updates.pop((rig.task_id, 77), None)
+    other = await connect(db_dsn)
+    try:
+        for probe in (moved_base_probe(task["branch"]), PASSED):
+            rig.ci(probe)
+            ok, reason, _ = await lifecycle.deliver_on_disposition(
+                other, rig.task_id, "deliver", via="registry_deliver"
+            )
+            assert not ok
+            assert reason.endswith("waiting_for_branch_update_confirmation")
+    finally:
+        await other.close()
+    assert await rig.retry_rows() == []
+    rig.git.update_pr_branch.assert_awaited_once()
+    rig.git.merge_pr.assert_not_awaited()
+    rig.git.request_ci_run.assert_not_awaited()

@@ -110,6 +110,13 @@ async def _owner(db: aiosqlite.Connection, username: str) -> int | None:
     return int(row["id"]) if row else None
 
 
+async def _order_owner(db: aiosqlite.Connection, order: aiosqlite.Row) -> int | None:
+    from hub.services.epic_plan_escalation import owner_for_role_order
+
+    pilot, principal = await owner_for_role_order(db, order)
+    return principal if pilot else await _owner(db, order["human_owner"])
+
+
 def _availability(order: aiosqlite.Row, generation: int) -> str:
     if order["task_archived"]:
         return "task_unavailable"
@@ -130,7 +137,7 @@ async def _persist(
 ) -> OutboxAck:
     owner_id = None
     if data.kind == "question":
-        owner_id = await _owner(db, order["human_owner"])
+        owner_id = await _order_owner(db, order)
         if owner_id is None:
             refuse(409, "outbox_owner_unavailable")
     state: Literal["pending", "sent"] = "sent" if data.kind == "silent" else "pending"
@@ -263,7 +270,7 @@ async def continuation_refusal(
     reason = _availability(order, row["generation"])
     if reason:
         return reason
-    owner = await _owner(db, order["human_owner"])
+    owner = await _order_owner(db, order)
     if owner != row["owner_id"]:
         return "owner_changed"
     if not await role_orders.is_fresh(db, order):
@@ -411,11 +418,7 @@ async def answer(
                AND NOT EXISTS (SELECT 1 FROM private_project_security p WHERE p.project_id=o.project_id)""",
             (task_id, message_id, owner_id),
         )
-        if (
-            row is None
-            or row["human_owner"] != username
-            or await _owner(db, username) != owner_id
-        ):
+        if row is None or await _owner(db, username) != owner_id:
             refuse(404, "outbox_not_found")
         order = await live_order(db, row["order_id"], row["host"])
         reason = await continuation_refusal(db, row, order)
@@ -453,7 +456,7 @@ async def answerable_messages(
     rows = await fetchall(
         db,
         """SELECT o.* FROM agent_outbox o JOIN tasks t ON t.id=o.task_id
-           JOIN principals owner ON owner.id=o.owner_id AND owner.username=t.human_owner
+           JOIN principals owner ON owner.id=o.owner_id
            WHERE o.task_id=? AND owner.id=? AND owner.kind='human' AND owner.status='active'
              AND o.kind='question' AND o.message_id IS NOT NULL AND o.answered_at IS NULL
              AND o.invalidated_reason=''

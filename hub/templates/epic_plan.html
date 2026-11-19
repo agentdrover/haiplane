@@ -9,6 +9,13 @@
 <dl>
     <dt>Версия снимка</dt><dd><code style="overflow-wrap:anywhere">{{ plan.version }}</code></dd>
     <dt>Действия</dt><dd>{{ plan.snapshot.allowed_actions | join(", ") }}</dd>
+    {% if plan.snapshot.dispatch_authority %}
+    <dt>Исполнитель</dt><dd>{{ plan.snapshot.dispatch_authority.host }} · {{ plan.snapshot.dispatch_authority.executor_model }}</dd>
+    <dt>Условия запуска</dt><dd>{{ plan.snapshot.dispatch_authority.conditions | join(", ") }}</dd>
+    {% endif %}
+    {% if plan.dispatch_blocker %}
+    <dt>Запуск</dt><dd>{{ plan.dispatch_blocker }}</dd>
+    {% endif %}
     <dt>Исключения</dt><dd>{{ plan.snapshot.exceptions | join(", ") }}</dd>
     {% set terms = plan.snapshot.terms %}
     <dt>Срок и ограничения</dt>

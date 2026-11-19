@@ -4377,6 +4377,57 @@ async def _vstep_has_a_submission(state: VerdictContext) -> None:
         )
 
 
+async def _vstep_pilot_approval(state: VerdictContext) -> None:
+    if state.body.verdict.value != "approved":
+        return
+    from hub.services.epic_plan_gates import approval_refusal, managed
+
+    if not await managed(state.db, state.task_id):
+        return
+    await _require_pilot_verdict_actor(state)
+    fresh = await repo.get_task(state.db, state.task_id)
+    if (
+        fresh is None
+        or fresh["submission_sha"] != state.task.get("submission_sha")
+        or fresh["submission_generation"] != state.task.get("submission_generation")
+    ):
+        raise HTTPException(
+            409, detail={"reason": "pilot_submission_moved", "task_id": state.task_id}
+        )
+    reason = await approval_refusal(state.db, fresh, automatic=not state.human_caller)
+    if reason:
+        raise HTTPException(409, detail={"reason": reason, "task_id": state.task_id})
+    if state.diverged_tip or state.sha_note:
+        raise HTTPException(
+            409,
+            detail={"reason": "pilot_branch_sha_unverified", "task_id": state.task_id},
+        )
+
+
+async def _require_pilot_verdict_actor(state: VerdictContext) -> None:
+    from hub.services import epic_plan
+    from hub.services.auto_verdict import _POLICY_ACTOR
+
+    if state.human_caller:
+        try:
+            decision = await epic_plan.active_decision(state.db)
+        except epic_plan.PlanRefusal:
+            return  # The plan gate returns the more specific blocking cause.
+        if state.principal_id == decision.approved_principal_id:
+            return
+    elif not state.agent_caller and (
+        state.applied_by_steward or state.body.agent == _POLICY_ACTOR
+    ):
+        return
+    raise HTTPException(
+        403,
+        detail={
+            "reason": "pilot_verdict_actor_not_authorized",
+            "task_id": state.task_id,
+        },
+    )
+
+
 async def _vstep_default_approval_is_the_stewards(state: VerdictContext) -> None:
     """На default при verdict=steward approved агента не пишется (#1602).
 
@@ -4720,6 +4771,7 @@ async def _vstep_auto_draft_out_of_scope(state: VerdictContext) -> None:
 # который уже случился, значит платить за него временем.
 VERDICT_STEPS: tuple[Step[VerdictContext], ...] = (
     Step("has_a_submission", _vstep_has_a_submission),
+    Step("pilot_approval", _vstep_pilot_approval),
     Step("default_approval_is_the_stewards", _vstep_default_approval_is_the_stewards),
     Step("changes_requested_has_content", _vstep_changes_requested_has_content),
     Step("verdict_matches_its_text", _vstep_verdict_matches_its_text),
@@ -5066,6 +5118,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
         await ci_trust.recheck_in_transaction(
             db, lambda: _ac_tests_gate(state), lambda: _automation_ci_gate(state)
         )
+        await _vstep_pilot_approval(state)
         findings_json = json.dumps(
             [f.model_dump(exclude_none=True) for f in body.findings],
             ensure_ascii=False,
