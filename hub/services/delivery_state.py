@@ -761,6 +761,13 @@ async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
     if blocker.get("delivered"):
         # Мерж гейта — бесплатный ответ; у задачи-состояния мержей не бывает
         # (pipeline_merges для неё не создаются), так что сюда она не попадает.
+        origin = await repo.last_merge_origin(db, blocker["task_id"])
+        if origin == "outside_gate":
+            return {
+                **blocker,
+                "delivery_path": origin,
+                "reason": "хаб подтвердил мерж вне гейта по GitHub и точному CI",
+            }
         return {**blocker, "delivery_path": "gate"}
     row = await repo.get_task(db, blocker["task_id"])
     task = dict(row) if row is not None else {}
@@ -879,7 +886,15 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
     pr_raw = task.get("pr_number")
     pr_number = int(pr_raw) if pr_raw is not None else None
 
-    if await repo.merge_sha_for_task(db, task_id):
+    origin = await repo.last_merge_origin(db, task_id)
+    if origin == "outside_gate":
+        return _task_answer(
+            DELIVERED,
+            "хаб подтвердил мерж вне гейта по GitHub и точному CI",
+            pr_number=pr_number,
+            delivery_path=origin,
+        )
+    if origin == "gate":
         return _task_answer(
             DELIVERED,
             "хаб смержил эту задачу сам — работа в базовой ветке",
@@ -965,6 +980,20 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
         state = ""
 
     if state == "merged":
+        if await repo.reconciled_merge_recorded(db, task_id, pr_number):
+            return _task_answer(
+                UNKNOWN,
+                f"Сверка мержа PR #{pr_number} не подтверждает текущую сдачу",
+                pr_number=pr_number,
+                delivery_path="unknown",
+            )
+        if await repo.pipeline_merge_recorded(db, task_id, pr_number, gate_only=True):
+            return _task_answer(
+                DELIVERED,
+                "гейт сохранил факт мержа, GitHub не сообщил SHA при записи",
+                pr_number=pr_number,
+                delivery_path="gate",
+            )
         return _task_answer(
             DELIVERED,
             f"PR #{pr_number} смержен, но записи о мерже у хаба нет — "
