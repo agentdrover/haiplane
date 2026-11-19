@@ -238,6 +238,43 @@ async def _require_task_grantor(
     await _require_grantor(db, who, project["id"])
 
 
+async def _store_verified_grant(
+    db: aiosqlite.Connection,
+    snapshot: tuple[int, int, int, int],
+    *,
+    task_id: int,
+    plan_id: int,
+    steward_id: int,
+    roadmap_id: int,
+    signal_task_id: int | None,
+    ttl_days: int,
+) -> int:
+    """Persist a verified mandate inside its caller's write transaction."""
+    project_id, approval_id, generation, task_generation = snapshot
+    checks = await roadmap_decisions.approved_checks(
+        db, plan_id, approval_id, generation
+    )
+    cursor = await db.execute(
+        "INSERT INTO roadmap_grants "
+        "(project_id, plan_id, task_id, approval_id, plan_generation, task_generation, steward_id, roadmap_id, signal_task_id, expires_at, decision_checks_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', ?), ?)",
+        (
+            project_id,
+            plan_id,
+            task_id,
+            approval_id,
+            generation,
+            task_generation,
+            steward_id,
+            roadmap_id,
+            signal_task_id,
+            f"+{ttl_days} days",
+            json.dumps(checks, sort_keys=True),
+        ),
+    )
+    return int(cursor.lastrowid or 0)
+
+
 async def grant(
     db: aiosqlite.Connection,
     who: TokenIdentity,
@@ -267,28 +304,16 @@ async def grant(
         active = await _active_grant(db, task_id)
         if active is not None:
             raise HTTPException(409, "revoke the active grant before granting again")
-        checks = await roadmap_decisions.approved_checks(
-            db, plan_id, approval_id, generation
+        grant_id = await _store_verified_grant(
+            db,
+            snapshot,
+            task_id=task_id,
+            plan_id=plan_id,
+            steward_id=steward_id,
+            roadmap_id=roadmap_id,
+            signal_task_id=signal_task_id,
+            ttl_days=ttl_days,
         )
-        cursor = await db.execute(
-            "INSERT INTO roadmap_grants "
-            "(project_id, plan_id, task_id, approval_id, plan_generation, task_generation, steward_id, roadmap_id, signal_task_id, expires_at, decision_checks_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', ?), ?)",
-            (
-                project_id,
-                plan_id,
-                task_id,
-                approval_id,
-                generation,
-                task_generation,
-                steward_id,
-                roadmap_id,
-                signal_task_id,
-                f"+{ttl_days} days",
-                json.dumps(checks, sort_keys=True),
-            ),
-        )
-        grant_id = int(cursor.lastrowid or 0)
         await _audit(
             db,
             who,
