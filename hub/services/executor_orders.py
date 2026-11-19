@@ -966,11 +966,12 @@ async def _issue(
         channel="slot",
         host=host["name"],
     )
-    source = (
-        "по действующему плану пилота"
-        if pilot_start is not None
-        else "по нажатию человека"
-    )
+    if pilot_start is not None:
+        source = "по действующему плану пилота"
+    elif issuer_principal_id is None:
+        source = "локальной службой по одобренному мандату"
+    else:
+        source = "по нажатию человека"
     await repo.add_task_update(
         db,
         task_id,

@@ -223,6 +223,11 @@ async def test_one_system_slot_order_fences_historical_signals(approved):
         world.db, "SELECT launched_by FROM executor_runs ORDER BY id"
     )
     assert runs[0]["launched_by"] is not None and runs[1]["launched_by"] is None
+    feed = await repo.get_task_updates(world.db, mandate.task_id)
+    messages = [row["content"] for row in feed if f"заказ #{order}," in row["content"]]
+    assert len(messages) == 1
+    assert "локальной службой по одобренному мандату" in messages[0]
+    assert "по нажатию человека" not in messages[0]
 
     leased = await executor_tests._orders(world)
     assert leased.json()["orders"][0]["id"] == order
