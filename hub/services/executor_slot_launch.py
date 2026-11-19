@@ -18,7 +18,7 @@ async def launch_on_slot(
     *,
     host: str,
     task_id: int | None,
-    issuer_principal_id: int,
+    issuer_principal_id: int | None,
     issuer_human: bool = False,
 ) -> Any:
     """Запуск исполнителя на слот хоста по нажатию человека (#1712).

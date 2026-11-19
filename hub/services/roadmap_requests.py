@@ -150,6 +150,15 @@ _SIGNAL_FILTER = (
 )
 
 
+# A one-shot pilot can consult only the executor order recorded in its
+# activation receipt. The ordinary administrative grant has no such receipt.
+_PILOT_ORDER_SCOPE = (
+    "NOT EXISTS (SELECT 1 FROM roadmap_activation_receipts a WHERE a.grant_id=? "
+    "AND (a.executor_order_id IS NULL OR a.executor_order_id<>o.id "
+    "OR o.id<=a.executor_high_water))"
+)
+
+
 async def _signal_is_current(
     db: aiosqlite.Connection,
     grant: aiosqlite.Row,
@@ -162,8 +171,11 @@ async def _signal_is_current(
         await _signal_task_is_current(db, grant["project_id"], source_task)
         and await _one(
             db,
-            "SELECT 1 FROM executor_orders o WHERE o.id = ? AND " + _SIGNAL_FILTER,  # nosec B608
-            (source_order_id, source_task),
+            "SELECT 1 FROM executor_orders o WHERE o.id = ? AND "  # nosec B608
+            + _SIGNAL_FILTER
+            + " AND "
+            + _PILOT_ORDER_SCOPE,
+            (source_order_id, source_task, grant["id"]),
         )
         is not None
     )
@@ -206,10 +218,12 @@ async def _signals(
         "o.report_outcome AS outcome, o.report_reason_code AS reason_code "
         "FROM executor_orders o WHERE "
         + _SIGNAL_FILTER
-        + " AND o.id > ? AND NOT EXISTS ("
+        + " AND o.id > ? AND "
+        + _PILOT_ORDER_SCOPE
+        + " AND NOT EXISTS ("
         + _SOURCE_ALREADY_CONSULTED
         + "o.id) ORDER BY o.id LIMIT 20",
-        (task_id, after_order_id, grant["id"]),
+        (task_id, after_order_id, grant["id"], grant["id"]),
     )
     return [dict(row) for row in rows]
 
@@ -236,6 +250,43 @@ async def _require_task_grantor(
     if project is None:
         raise HTTPException(404, "roadmap project not found")
     await _require_grantor(db, who, project["id"])
+
+
+async def _store_verified_grant(
+    db: aiosqlite.Connection,
+    snapshot: tuple[int, int, int, int],
+    *,
+    task_id: int,
+    plan_id: int,
+    steward_id: int,
+    roadmap_id: int,
+    signal_task_id: int | None,
+    ttl_days: int,
+) -> int:
+    """Persist a verified mandate inside its caller's write transaction."""
+    project_id, approval_id, generation, task_generation = snapshot
+    checks = await roadmap_decisions.approved_checks(
+        db, plan_id, approval_id, generation
+    )
+    cursor = await db.execute(
+        "INSERT INTO roadmap_grants "
+        "(project_id, plan_id, task_id, approval_id, plan_generation, task_generation, steward_id, roadmap_id, signal_task_id, expires_at, decision_checks_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', ?), ?)",
+        (
+            project_id,
+            plan_id,
+            task_id,
+            approval_id,
+            generation,
+            task_generation,
+            steward_id,
+            roadmap_id,
+            signal_task_id,
+            f"+{ttl_days} days",
+            json.dumps(checks, sort_keys=True),
+        ),
+    )
+    return int(cursor.lastrowid or 0)
 
 
 async def grant(
@@ -267,28 +318,16 @@ async def grant(
         active = await _active_grant(db, task_id)
         if active is not None:
             raise HTTPException(409, "revoke the active grant before granting again")
-        checks = await roadmap_decisions.approved_checks(
-            db, plan_id, approval_id, generation
+        grant_id = await _store_verified_grant(
+            db,
+            snapshot,
+            task_id=task_id,
+            plan_id=plan_id,
+            steward_id=steward_id,
+            roadmap_id=roadmap_id,
+            signal_task_id=signal_task_id,
+            ttl_days=ttl_days,
         )
-        cursor = await db.execute(
-            "INSERT INTO roadmap_grants "
-            "(project_id, plan_id, task_id, approval_id, plan_generation, task_generation, steward_id, roadmap_id, signal_task_id, expires_at, decision_checks_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', ?), ?)",
-            (
-                project_id,
-                plan_id,
-                task_id,
-                approval_id,
-                generation,
-                task_generation,
-                steward_id,
-                roadmap_id,
-                signal_task_id,
-                f"+{ttl_days} days",
-                json.dumps(checks, sort_keys=True),
-            ),
-        )
-        grant_id = int(cursor.lastrowid or 0)
         await _audit(
             db,
             who,
