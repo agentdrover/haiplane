@@ -30,6 +30,7 @@ from hub.db import (
     log_activity,
     write_transaction,
 )
+from hub.services import delivery_ci
 from hub.services import spec_archive
 from hub.services.behavior_snapshot import refusal_for_moved_head
 from hub.services.prevention_gate import hold_completion
@@ -4826,9 +4827,7 @@ async def merge_before_completion(
         workspace = ctx.get("repo")
         gh_repo = ctx.get("gh_repo")
 
-        ci = await plugins.git_ops.check_pr_ci(
-            pr_num, repo=workspace, gh_repo=gh_repo, forge=ctx.get("forge", "")
-        )
+        ci = await delivery_ci.check_task(db, task_id, pr_num, ctx)
         if rerun := await delivery_rerun.gate_step(db, task, ctx, ci):  # #1956
             return False, rerun
         ci_refusal = await _ci_gate_refusal(db, task, ctx, ci)

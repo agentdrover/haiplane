@@ -727,6 +727,7 @@ class NoopGitOps:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        contract_fingerprint: str = "",
     ) -> CIProbeResult:
         return CIProbeResult(CIProbeOutcome.pending, "noop")
 
@@ -1083,7 +1084,12 @@ class NoopForge:
         return None
 
     async def check_pr_ci(
-        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        contract_fingerprint: str = "",
     ) -> CIProbeResult:
         return CIProbeResult(CIProbeOutcome.unavailable, "forge_not_configured")
 
