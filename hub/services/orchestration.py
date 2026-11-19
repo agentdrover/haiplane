@@ -4804,21 +4804,6 @@ async def _record_branch_update(
     )
 
 
-async def _existing_delivery(
-    db: aiosqlite.Connection, task: dict[str, Any], pr_num: int
-) -> tuple[bool, str] | None:
-    from hub.services import merged_delivery
-
-    task_id = int(task["id"])
-    if await repo.pipeline_merge_recorded(db, task_id, pr_num, gate_only=True):
-        return True, "already delivered"
-    ctx = await project_git_context(db, task_id)
-    if (task_id, pr_num) in _gate_merges or ctx.get("forge") != "github":
-        return None
-    state, _ = await _recorded_pr_state(db, task, pr_num, ctx=ctx)
-    return await merged_delivery.reconcile(db, task, ctx, state=state)
-
-
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -5008,6 +4993,23 @@ async def _recorded_pr_state(
             f"состояние PR #{pr_number} неизвестно — доставка идёт по нему как раньше",
         )
     return state, ""
+
+
+async def _existing_delivery(
+    db: aiosqlite.Connection, task: dict[str, Any], pr_num: int
+) -> tuple[bool, str] | None:
+    from hub.services import merged_delivery
+
+    task_id = int(task["id"])
+    if await repo.pipeline_merge_recorded(db, task_id, pr_num, gate_only=True):
+        return True, "already delivered"
+    ctx = await project_git_context(db, task_id)
+    if (task_id, pr_num) in _gate_merges or ctx.get("forge") != "github":
+        return None
+    state, _ = await _recorded_pr_state(db, task, pr_num, ctx=ctx)
+    return await merged_delivery.reconcile(
+        db, task, ctx, state=state, gate_busy=lambda: (task_id, pr_num) in _gate_merges
+    )
 
 
 async def _live_pr_for_branch(

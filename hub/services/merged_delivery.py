@@ -1,6 +1,7 @@
 """Reconcile a GitHub merge observed outside the delivery gate."""
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -72,6 +73,7 @@ async def reconcile(
     ctx: dict[str, Any],
     *,
     state: str,
+    gate_busy: Callable[[], bool],
 ) -> tuple[bool, str] | None:
     """None leaves the ordinary gate in charge. A known merge has its own outcome."""
     repository, base = ctx.get("gh_repo"), ctx.get("base_branch")
@@ -88,14 +90,6 @@ async def reconcile(
     pin = await _pin(db, task)
     if pin is None or (pin.repository, pin.base) != (repository, base):
         return False, "merged_outside_gate: current_independent_approval_not_proven"
-    standing = await ci_trust.refresh_quietly(db, pin.task_id, pin.head)
-    if (
-        not standing
-        or not standing.verified
-        or standing.forge_down
-        or standing.version is None
-    ):
-        return False, "ci_unavailable: merged_reconciliation_exact_ci_not_verified"
     try:
         facts = await github_merged_delivery.verify(
             repository=pin.repository,
@@ -107,7 +101,17 @@ async def reconcile(
         )
     except github_merged_delivery.UnprovedMerge as exc:
         return False, f"merged_outside_gate: {exc}"
-    result = await _record(db, pin, facts, standing)
+    standing = await ci_trust.refresh_quietly(db, pin.task_id, pin.head)
+    if (
+        not standing
+        or not standing.verified
+        or standing.forge_down
+        or standing.version is None
+    ):
+        return False, "ci_unavailable: merged_reconciliation_exact_ci_not_verified"
+    # GitHub and SQLite have no shared transaction. Read the latest attempt
+    # immediately before taking the lock and compare the local CI version there.
+    result = await _record(db, pin, facts, standing, gate_busy)
     if result[1].startswith(RECONCILED):
         task["_reconciled_merge"] = (pin, standing)
     return result
@@ -118,6 +122,7 @@ async def _record(
     pin: _Pin,
     facts: github_merged_delivery.MergedPullRequest,
     standing: ci_trust.Standing,
+    gate_busy: Callable[[], bool],
 ) -> tuple[bool, str]:
     async with write_transaction(db):
         task = await repo.get_task(db, pin.task_id)
@@ -132,6 +137,8 @@ async def _record(
             db, pin.task_id, pin.number, gate_only=True
         ):
             return True, "already delivered"
+        if gate_busy():
+            return False, "gate_merge_in_flight: gate provenance not settled"
         return await _insert(db, pin, facts, standing.attempt_key)
 
 

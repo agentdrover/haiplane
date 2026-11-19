@@ -8,7 +8,13 @@ import pytest
 from hub import repository as repo
 from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import CIProbeOutcome
-from hub.services import ci_contract, ci_trust, delivery_state, orchestration
+from hub.services import (
+    ci_contract,
+    ci_trust,
+    delivery_state,
+    merged_delivery,
+    orchestration,
+)
 from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
 
 HEAD = "a" * 40
@@ -192,4 +198,69 @@ async def test_open_pr_still_uses_existing_ci_gate(db, merged):
     assert "ci_unavailable" in detail
     fresh.assert_not_awaited()
     git.check_pr_ci.assert_awaited_once()
+    git.merge_pr.assert_not_awaited()
+
+
+async def test_reconciled_merge_does_not_deliver_new_submission(db, merged):
+    task, _, git, _, _, _ = merged
+    await _report_done(db, task["id"])
+    await repo.update_task(
+        db,
+        task["id"],
+        status="running",
+        pr_number=78,
+        submission_generation=task["submission_generation"] + 1,
+        submission_sha="d" * 40,
+    )
+    await db.commit()
+    git.pr_state.return_value = ""
+    live = dict(await repo.get_task(db, task["id"]))
+    assert (await delivery_state.task_delivery(db, live))["state"] == "unknown"
+    assert not (await repo.task_as_blocker(db, task["id"]))["delivered"]
+    assert not await repo.merge_sha_for_task(db, task["id"])
+    assert await db.execute_fetchall("SELECT * FROM pipeline_merges")
+
+
+async def test_gate_merge_that_starts_during_read_preserves_provenance(
+    db, merged, monkeypatch
+):
+    import asyncio
+
+    task, _, git, _, _, fresh = merged
+    gate_result = asyncio.get_running_loop().create_future()
+    gate_result.set_result(True)
+
+    async def after_gate_merges(*_args):
+        monkeypatch.setitem(orchestration._gate_merges, (task["id"], 77), gate_result)
+        return fresh.return_value
+
+    fresh.side_effect = after_gate_merges
+
+    ok, reason = await orchestration.merge_before_completion(db, task)
+
+    assert not ok
+    assert reason.startswith("gate_merge_in_flight")
+    assert not await db.execute_fetchall("SELECT * FROM pipeline_merges")
+    git.merge_pr.assert_not_awaited()
+
+
+async def test_ci_changes_between_reconciliation_and_completion(
+    db, merged, monkeypatch
+):
+    task, _, git, _, _, _ = merged
+    record = merged_delivery._record
+
+    async def ci_changed(*args):
+        result = await record(*args)
+        assert result[0]
+        await repo.bump_ci_state_version(db, task["id"], HEAD)
+        await db.commit()
+        return result
+
+    monkeypatch.setattr(merged_delivery, "_record", ci_changed)
+    await _report_done(db, task["id"])
+
+    live = dict(await repo.get_task(db, task["id"]))
+    assert live["status"] == "running"
+    assert await db.execute_fetchall("SELECT * FROM pipeline_merges")
     git.merge_pr.assert_not_awaited()
