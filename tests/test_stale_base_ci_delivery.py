@@ -583,3 +583,19 @@ async def test_lost_ack_is_durable_while_github_still_reports_old_head(
     rig.git.update_pr_branch.assert_awaited_once()
     rig.git.merge_pr.assert_not_awaited()
     rig.git.request_ci_run.assert_not_awaited()
+
+
+async def test_stale_ci_preserves_confirmed_normal_base_update_status(db, monkeypatch):
+    rig = await _rig(db, monkeypatch)
+    rig.ci(PASSED)
+    assert (await _deliver(rig, "registry")).startswith("base_updated")
+
+    # Normal #1419 accepted the request. The head still has not moved, while
+    # CI now proves another base move and enters the scoped recovery path.
+    rig.ci(moved_base_probe(rig.delivery_branch))
+    reason = await _deliver(rig, "registry")
+
+    assert reason.startswith("base_update_pending")
+    assert "гейт уже слил базу" in reason
+    rig.git.update_pr_branch.assert_awaited_once()
+    assert len(await rig.retry_rows()) == 1
