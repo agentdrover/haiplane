@@ -23,7 +23,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
 from hub.services import memory_wait
 from hub.services.return_running import work_signs
 
@@ -330,6 +330,38 @@ async def release_run_claim(
         },
     )
     return True
+
+
+async def reopen_after_answer(
+    db: aiosqlite.Connection, answered: dict[str, Any]
+) -> bool:
+    """Return the answered task to the queue without touching a newer claim."""
+    task_id = int(answered["id"])
+    async with write_transaction(db):
+        current = await repo.get_task(db, task_id)
+        if current is None or current["status"] != "needs_info":
+            return False
+        claim_fields = (
+            "claimed_by",
+            "claim_session_id",
+            "claimed_at",
+            "claim_nonce",
+            "executor_run_id",
+        )
+        if any(current[field] != answered[field] for field in claim_fields):
+            return False
+        if (run_id := current["executor_run_id"]) is not None:
+            await release_run_claim(
+                db,
+                task_id,
+                run_id=run_id,
+                statuses=("needs_info",),
+                note="Захват завершённого исполнителя снят при ответе без продолжения.",
+                reason="answer_without_resume",
+            )
+        return await repo.transition_status_if(
+            db, task_id, expected_from="needs_info", new_status="open"
+        )
 
 
 async def release_after_run_closed(

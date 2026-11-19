@@ -5572,6 +5572,7 @@ async def answer_question(
     await db.commit()
 
     from hub.services.executor_dispatch import answer_for_executor
+    from hub.services.run_claim import reopen_after_answer
 
     if await answer_for_executor(db, task, resume=bool(body.resume)):
         # #1458: вопрос облачного исполнителя — продолжение (или решение
@@ -5606,9 +5607,7 @@ async def answer_question(
                 f"Task #{task_id}: answered and re-dispatched",
                 detail=mutation_activity_detail(),
             )
-    else:
-        await repo.update_task(db, task_id, status="open")
-        await db.commit()
+    elif await reopen_after_answer(db, task):
         await log_activity(
             db,
             "task_answered",
