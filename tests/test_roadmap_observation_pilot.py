@@ -5,8 +5,10 @@ from uuid import uuid4
 
 import pytest
 
+from hub import repository as repo
 from hub.services import (
     admin,
+    role_orders,
     roadmap_observation_pilot as pilot,
     roadmap_pilot_activation,
 )
@@ -185,7 +187,7 @@ async def test_ac_3_and_ac_4_real_role_transport_and_one_effect(scenario, mode, 
         await world.client.post(decision, headers=steward, json={"grant_id": grant})
     ).status_code == 409
     if mode == "timeout":
-        await support.age(world, order_id, created_at="-16 minutes")
+        await _move_observation(world, "-16 minutes")
     else:
         await support.admit(world, host="k9")
         assert (await support.poll(world, host="k9")).json()["orders"] == []
@@ -230,7 +232,9 @@ async def test_ac_3_and_ac_4_real_role_transport_and_one_effect(scenario, mode, 
     done = await world.client.post(decision, headers=steward, json={"grant_id": grant})
     assert done.status_code == 200, done.text
     assert done.json()["reason"] == reason
-    assert done.json()["decision_id"] == order_id
+    assert done.json()["decision_id"] == (
+        None if reason in ("consultation_failed", "consultation_invalid") else order_id
+    )
     assert (
         await world.client.post(decision, headers=steward, json={"grant_id": grant})
     ).json()["repeat"] is True
@@ -269,3 +273,69 @@ async def test_ac_3_and_ac_4_real_role_transport_and_one_effect(scenario, mode, 
     ).status_code == 409
     assert len(await support.rows(world.db, "SELECT * FROM role_orders")) == 1
     assert not await support.rows(world.db, "SELECT * FROM executor_orders")
+
+
+async def test_quota_refusal_becomes_terminal_without_a_role_order(
+    scenario, monkeypatch
+):
+    world, mandate, _ = scenario
+    steward = await _auth(world, mandate.steward_id)
+    activation = await roadmap_pilot_activation._run(world.db)
+    grant = activation["grant_id"]
+    assert (await _post_sample(world, grant)).status_code == 200
+    await _move_observation(world, "-61 seconds")
+    assert (await _post_sample(world, grant)).status_code == 200
+    task = f"/api/tasks/{mandate.task_id}"
+    payload = {
+        "plan_id": mandate.task_id,
+        "grant_id": grant,
+        "observation_batch_id": grant,
+        "request_id": "stable",
+        "question": "Which bounded step follows the observations?",
+    }
+    issue = f"{task}/roadmap-requests"
+    monkeypatch.setattr(role_orders, "ROLE_ORDERS_PER_HOUR", 0)
+    refused = await world.client.post(issue, headers=steward, json=payload)
+    assert refused.status_code == 429, refused.text
+    assert await support.order_rows(world) == []
+    await _move_observation(world, "-16 minutes")
+    attempts = await asyncio.gather(
+        *[world.client.post(issue, headers=steward, json=payload) for _ in range(2)]
+    )
+    assert all(r.status_code == 200 for r in attempts)
+    assert sorted(reply.json()["repeat"] for reply in attempts) == [False, True]
+    assert all(reply.json()["reason"] == "consultation_failed" for reply in attempts)
+    current = (await world.client.get(f"{task}/roadmap-grant", headers=steward)).json()
+    assert current["observation_batch_id"] is None
+    assert current["decision_id"] is None
+    assert current["consultation_order_id"] is None
+    assert current["consultation_block_reason"] == "consultation_failed"
+    assert current["consultation_blocked_at"]
+    assert await support.order_rows(world) == []
+    audits = await support.rows(
+        world.db,
+        "SELECT * FROM admin_audit_log WHERE action='roadmap_pilot_consultation_blocked'",
+    )
+    assert len(audits) == 1
+    assert audits[0]["actor_principal_id"] == mandate.steward_id
+
+
+async def test_same_host_with_unrelated_project_scope_is_denied(scenario):
+    world, _, _ = scenario
+    await roadmap_pilot_activation._run(world.db)
+    await repo.create_project(world.db, slug="unrelated-pilot", name="Unrelated pilot")
+    await world.db.commit()
+    host = (
+        await support.rows(
+            world.db, "SELECT principal_id FROM executor_hosts WHERE name='k8'"
+        )
+    )[0]
+    key = await admin.create_api_key(
+        world.db, host["principal_id"], name="unrelated", projects=["unrelated-pilot"]
+    )
+    auth = {"Authorization": f"Bearer {key['plaintext_key']}"}
+    for path in ("observations", "effect"):
+        denied = await world.client.get(f"{_HOST}/{path}", headers=auth)
+        assert denied.status_code == 403
+    permitted = await world.client.get(f"{_HOST}/observations", headers=world.k8_auth)
+    assert permitted.json()["observation_permitted"] is True

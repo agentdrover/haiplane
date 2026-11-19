@@ -57,8 +57,14 @@ recommendations. The roadmap uses its own principal and the order-bound source
 header. It supplies the selected recommendation, risk `unknown` and
 `basis: {"observation_batch_id": <integer>}` through the existing host role
 report. The host and steward can each see only their authorized surfaces.
-An order that does not start within 15 minutes is unavailable. Started work
-uses the normal role-order runtime limit.
+A consultation must start within 15 minutes of the second observation or the
+measurement cutoff, whichever sealed the batch. Once the deadline passes, a
+repeated request records a technical block if order issuance failed. The grant
+then hides the batch offer and exposes `consultation_block_reason` and
+`consultation_blocked_at`. The request response has `order_id: null`,
+`status: "blocked"` and `reason: "consultation_failed"`. A technical block
+has no decision ID or read permit. Started work uses the normal role-order
+runtime limit.
 
 When the grant lists `pending_decision_order_id`, POST the existing decision
 endpoint with `grant_id`. The Hub verifies all batches and recommendations.

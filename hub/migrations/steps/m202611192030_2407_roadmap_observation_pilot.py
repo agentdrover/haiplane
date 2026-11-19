@@ -9,6 +9,8 @@ MIGRATIONS = [
             activated_at TEXT NOT NULL DEFAULT (datetime('now')),
             batch_id INTEGER NOT NULL UNIQUE,
             order_id INTEGER UNIQUE REFERENCES role_orders(id),
+            consultation_block_reason TEXT,
+            consultation_blocked_at TEXT,
             decision_reason TEXT,
             decided_at TEXT,
             effect_id TEXT UNIQUE,

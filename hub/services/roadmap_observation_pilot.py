@@ -73,9 +73,18 @@ async def pilot_for_grant(
 
     return await _one(
         db,
-        "SELECT *, datetime(activated_at, ?) <= datetime('now') AS timed_out "
-        "FROM roadmap_observation_pilots WHERE grant_id=?",
-        (f"+{OBSERVATION_MINUTES} minutes", grant_id),
+        "SELECT *, observation_cutoff <= datetime('now') AS timed_out, "
+        "datetime(sealed_at, ?) <= datetime('now') AS consultation_timed_out FROM ("
+        "SELECT p.*, datetime(p.activated_at, ?) AS observation_cutoff, "
+        "COALESCE(o.observed_at,datetime(p.activated_at, ?)) AS sealed_at "
+        "FROM roadmap_observation_pilots p LEFT JOIN roadmap_pilot_observations o "
+        "ON o.pilot_id=p.approval_id AND o.sequence=2 WHERE p.grant_id=?)",
+        (
+            f"+{CONSULTATION_START_MINUTES} minutes",
+            f"+{OBSERVATION_MINUTES} minutes",
+            f"+{OBSERVATION_MINUTES} minutes",
+            grant_id,
+        ),
     )
 
 
@@ -140,6 +149,8 @@ async def host_scope(
         ):
             yield None
             return
+        if not await roadmap_requests._key_in_project(db, who, grant["project_id"]):
+            raise HTTPException(403, "host credential does not cover the pilot project")
         yield await pilot_for_grant(db, grant["id"])
 
 
@@ -267,14 +278,19 @@ async def grant_signal(
     state = await consultation_state(db, pilot)
     return {
         "activated_at": pilot["activated_at"].replace(" ", "T") + "Z",
-        "observation_batch_id": pilot["batch_id"] if observation_batch else None,
+        "observation_batch_id": pilot["batch_id"]
+        if observation_batch and pilot["consultation_blocked_at"] is None
+        else None,
+        "consultation_block_reason": pilot["consultation_block_reason"],
+        "consultation_blocked_at": pilot["consultation_blocked_at"],
         "consultation_order_id": pilot["order_id"],
         "pending_decision_order_id": pilot["order_id"]
         if state in ("ready", "unavailable")
         else None,
         "decision_id": pilot["order_id"] if pilot["decided_at"] is not None else None,
         "decided_at": pilot["decided_at"],
-        "decision_reason": pilot["decision_reason"],
+        "decision_reason": pilot["decision_reason"]
+        or pilot["consultation_block_reason"],
         "effect_claimed_at": pilot["claimed_at"],
         "effect_reported_at": pilot["reported_at"],
         "effect_id": pilot["effect_id"],
@@ -286,19 +302,22 @@ async def grant_signal(
 async def consultation_state(db: aiosqlite.Connection, pilot: aiosqlite.Row) -> str:
     from hub.services.roadmap_requests import _one
 
+    if pilot["consultation_blocked_at"] is not None:
+        return "blocked"
     if pilot["decision_reason"] is not None:
         return "decided"
     order = await _one(
         db,
-        "SELECT state, started_at IS NULL AND datetime(created_at, ?) <= datetime('now') AS timed_out "
-        "FROM role_orders WHERE id=?",
-        (f"+{CONSULTATION_START_MINUTES} minutes", pilot["order_id"]),
+        "SELECT state, started_at FROM role_orders WHERE id=?",
+        (pilot["order_id"],),
     )
     if order is None:
         return "not_requested"
-    if order["state"] == "done" and not order["timed_out"]:
+    if order["state"] == "done":
         return "ready"
-    if order["state"] in ("failed", "expired") or order["timed_out"]:
+    if order["state"] in ("failed", "expired") or (
+        order["started_at"] is None and pilot["consultation_timed_out"]
+    ):
         return "unavailable"
     return "pending"
 
@@ -324,6 +343,53 @@ async def check_source(
                 "message": "observation batch is outside the grant or not sealed",
             },
         )
+
+
+async def record_block(
+    db: aiosqlite.Connection,
+    who: TokenIdentity,
+    pilot: aiosqlite.Row,
+    reason: str,
+) -> None:
+    from hub.services import roadmap_requests
+
+    await db.execute(
+        "UPDATE roadmap_observation_pilots SET consultation_block_reason=?, "
+        "consultation_blocked_at=datetime('now') WHERE approval_id=?",
+        (reason, pilot["approval_id"]),
+    )
+    await roadmap_requests._audit(
+        db,
+        who,
+        "roadmap_pilot_consultation_blocked",
+        TASK_ID,
+        json.dumps(
+            {
+                "reason": reason,
+                "grant_id": pilot["grant_id"],
+                "batch_id": pilot["batch_id"],
+                "order_id": pilot["order_id"],
+                "sealed_at": pilot["sealed_at"],
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+async def block_if_unissued(
+    db: aiosqlite.Connection,
+    who: TokenIdentity,
+    pilot: aiosqlite.Row,
+) -> dict[str, Any] | None:
+    if pilot["order_id"] is not None:
+        return None
+    repeat = pilot["consultation_blocked_at"] is not None
+    if not repeat and not pilot["consultation_timed_out"]:
+        return None
+    reason = "consultation_failed"
+    if not repeat:
+        await record_block(db, who, pilot, reason)
+    return {"order_id": None, "status": "blocked", "reason": reason, "repeat": repeat}
 
 
 async def bind_order(
@@ -395,12 +461,12 @@ async def evaluate(
     if pilot["order_id"] != order_id:
         raise HTTPException(404, "roadmap consultation not found")
     state = await consultation_state(db, pilot)
-    if state not in ("ready", "unavailable", "decided"):
+    if state not in ("ready", "unavailable", "decided", "blocked"):
         raise HTTPException(409, {"reason": "consultation_pending"})
     context = await decision_context(
         db, pilot, roadmap_decisions.decision_context(request)
     )
-    reason = pilot["decision_reason"]
+    reason = pilot["decision_reason"] or pilot["consultation_block_reason"]
     effect_id = pilot["effect_id"]
     if reason is None:
         row = await roadmap_requests._one(
@@ -416,6 +482,9 @@ async def evaluate(
         ):
             result = RoadmapResult.model_validate_json(row["result_json"])
         reason = _decide(context, result)
+        if reason in ("consultation_failed", "consultation_invalid"):
+            await record_block(db, who, pilot, reason)
+            return _blocked_consultation(order_id, context, reason, repeat=False)
         effect_id = token_hex(16) if reason == "verify_version_read" else None
         await db.execute(
             "UPDATE roadmap_observation_pilots SET decision_reason=?,effect_id=?,"
@@ -438,6 +507,8 @@ async def evaluate(
                 sort_keys=True,
             ),
         )
+    if state == "blocked":
+        return _blocked_consultation(order_id, context, reason, repeat=True)
     return {
         "order_id": order_id,
         "decision_id": order_id,
@@ -447,6 +518,21 @@ async def evaluate(
         if reason in ("hold_pilot", "verify_version_read")
         else "blocked",
         "repeat": state == "decided",
+        "recipient": "steward",
+        "basis": context,
+    }
+
+
+def _blocked_consultation(
+    order_id: int, context: dict[str, Any], reason: str, *, repeat: bool
+) -> dict[str, Any]:
+    return {
+        "order_id": order_id,
+        "decision_id": None,
+        "effect_id": None,
+        "status": "blocked",
+        "reason": reason,
+        "repeat": repeat,
         "recipient": "steward",
         "basis": context,
     }

@@ -535,6 +535,10 @@ async def issue(
                     "request identifier already used for another request",
                 )
             return {"order_id": previous["order_id"], "repeat": True}
+        if receipt is not None:
+            blocked = await pilot.block_if_unissued(db, who, receipt)
+            if blocked is not None:
+                return blocked
         if receipt is not None and receipt["order_id"] is not None:
             _conflict(
                 "roadmap_source_already_requested",
