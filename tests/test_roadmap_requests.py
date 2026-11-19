@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from io import StringIO
 from types import SimpleNamespace
 
@@ -11,9 +12,18 @@ import pytest
 
 from hub import repository as repo
 from hub import roadmap_cli
-from hub.services import admin
+from hub.services import admin, roadmap_decisions, roadmap_requests
 from tests import role_orders_support as support
 from tests import test_executor_orders as executor_tests
+from tests.roadmap_decision_support import (
+    _approve_plan_check,
+    _conclusion,
+    _decision_audits,
+    _evaluate,
+    _put_plan_check,
+    _start_role,
+    _structured_report,
+)
 
 world = support.world
 keys = support.keys
@@ -27,7 +37,12 @@ async def _principal(world, name, role):
     principal = await admin.create_principal(
         world.db, kind="agent", username=name, role_slug=role
     )
-    key = await admin.create_api_key(world.db, principal["id"], name="test")
+    key = await admin.create_api_key(
+        world.db,
+        principal["id"],
+        name="test",
+        projects=None if role == "admin" else [world.slug],
+    )
     return principal["id"], {"Authorization": f"Bearer {key['plaintext_key']}"}
 
 
@@ -156,7 +171,9 @@ async def test_roadmap_read_is_bound_to_started_order(scenario):
     card = await s.world.client.get(f"/api/tasks/{s.task_id}", headers=s.guest)
     assert order["source_key"] not in card.text
     assert QUESTION not in card.text
-    assert read.json() == {
+    payload = read.json()
+    assert payload.pop("decision_context")["missing"] == ["signal", "plan_check"]
+    assert payload == {
         "order_id": order_id,
         "task_id": s.task_id,
         "project": s.world.slug,
@@ -430,3 +447,257 @@ def test_cli_reads_question_from_stdin(monkeypatch):
             },
         )
     ]
+
+
+async def _start_explicit(s, source_order_id=None):
+    reply = await _request(s, source_order_id=source_order_id)
+    assert reply.status_code == 200, reply.text
+    lease = await _start_role(s)
+    assert lease["id"] == reply.json()["order_id"]
+    return lease
+
+
+async def test_roadmap_order_routes_structured_result(scenario):
+    s = scenario
+    await support.admit(s.world)
+    natural_task = await support.task_in_project(s.world, "needs owner decision")
+    await support.enter_needs_decision(s.world, natural_task)
+    assert await support.sweep(s.world) == 1
+    natural = await _start_role(s)
+    assert (await _structured_report(s, natural, _conclusion(None))).status_code == 422
+    assert (
+        await support.report(
+            s.world, "k8", natural["id"], natural["lease_id"], note="Владельцу: сверить"
+        )
+    ).status_code == 200
+    assert (await support.order_row(s.world, natural["id"]))[
+        "note"
+    ] == "Владельцу: сверить"
+    assert (await repo.get_task(s.world.db, natural_task))["status"] == "needs_decision"
+
+    generation = await _approve_plan_check(s)
+    source_task = await support.task_in_project(s.world, "redeem signal")
+    source_order = await _record_redeem_failure(s.world, source_task)
+    granted = await _grant(s, signal_task_id=source_task)
+    assert granted.status_code == 200, granted.text
+    explicit = await _start_explicit(s, source_order)
+    result = _conclusion(source_order)
+    report = await _structured_report(s, explicit, result)
+    assert report.status_code == 200, report.text
+    assert (await _structured_report(s, explicit, result)).json()["repeat"] is True
+    changed = await _structured_report(s, explicit, _conclusion(None, "owner_required"))
+    assert changed.status_code == 409
+    assert (await support.order_row(s.world, explicit["id"]))[
+        "note"
+    ] == "Краткая заметка"
+    got = await s.world.client.get(_grant_path(s.task_id), headers=s.steward)
+    assert got.json()["pending_decision_order_id"] == explicit["id"]
+    replies = await asyncio.gather(
+        _evaluate(s, explicit["id"]), _evaluate(s, explicit["id"])
+    )
+    assert all(response.status_code == 200 for response in replies)
+    first, repeat = sorted((r.json() for r in replies), key=lambda row: row["repeat"])
+    assert first == {**repeat, "repeat": False}
+    assert repeat["repeat"] is True
+    assert first["status"] == "accepted" and first["recipient"] == "steward"
+    assert first["reason"] == "hold_expansion"
+    assert first["plan"] == {
+        "task_id": s.task_id,
+        "approval_id": granted.json()["approval_id"],
+        "statement_generation": generation,
+    }
+    assert first["signal"]["order_id"] == source_order
+    assert first["verification_condition"] == {
+        "id": "AC-1",
+        "metric": "successful_fresh_redeems",
+        "operator": "gte",
+        "target": 2,
+        "observed": None,
+    }
+    got = await s.world.client.get(_grant_path(s.task_id), headers=s.steward)
+    assert got.json()["pending_decision_order_id"] is None
+    assert got.json()["signals"] == []
+    audit = await _decision_audits(s)
+    assert len(audit) == 1
+    assert audit[0]["actor_principal_id"] == s.grant_body["steward_principal_id"]
+    assert json.loads(audit[0]["detail"])["decision"] == first
+    assert result["risk"] in audit[0]["detail"]
+    assert len(await support.order_rows(s.world)) == 2
+    assert len(await support.rows(s.world.db, "SELECT * FROM executor_orders")) == 1
+
+
+@pytest.mark.parametrize("invalidate", ["revision", "revoke", "new_approval"])
+async def test_roadmap_context_stays_within_active_grant(scenario, invalidate):
+    s = scenario
+    generation = await _approve_plan_check(s)
+    source_task = await support.task_in_project(s.world, "assigned signal")
+    source_order = await _record_redeem_failure(s.world, source_task)
+    await support.admit(s.world)
+    granted = await _grant(s, signal_task_id=source_task)
+    assert granted.status_code == 200, granted.text
+    lease = await _start_explicit(s, source_order)
+    key = lease["source_key"]
+    order_id = lease["id"]
+    for bad in (
+        await _question(s, order_id, s.other_guest, key),
+        await _question(s, order_id + 100, s.guest, key),
+        await _question(s, order_id, s.guest, key[:-1]),
+    ):
+        assert bad.status_code == 404
+        assert "decision_context" not in bad.text and QUESTION not in bad.text
+    good = await _question(s, order_id, s.guest, key)
+    assert good.status_code == 200
+    context = good.json()["decision_context"]
+    assert context == {
+        "plan": {
+            "task_id": s.task_id,
+            "approval_id": granted.json()["approval_id"],
+            "statement_generation": generation,
+        },
+        "signal": {
+            "task_id": source_task,
+            "order_id": source_order,
+            "outcome": "failed",
+            "reason": "redeem_failed",
+        },
+        "checks": [
+            {
+                "id": "AC-1",
+                "metric": "successful_fresh_redeems",
+                "operator": "gte",
+                "target": 2,
+            }
+        ],
+        "missing": [],
+    }
+    if invalidate == "revoke":
+        assert (
+            await s.world.client.delete(_grant_path(s.task_id), headers=s.owner)
+        ).status_code == 200
+    elif invalidate == "revision":
+        await _put_plan_check(s, 3)
+    else:
+        await repo.insert_event(
+            s.world.db, kind="task_approved", actor="human", task_id=s.task_id
+        )
+        await s.world.db.commit()
+    refused = await _question(s, order_id, s.guest, key)
+    assert refused.status_code == 404
+    assert "decision_context" not in refused.text
+
+
+@pytest.mark.parametrize(
+    ("recommendation", "expected", "reason"),
+    [
+        ("hold_expansion", "blocked", "missing_plan_check"),
+        ("owner_required", "owner_required", "outside_delegation"),
+        ("insufficient_facts", "blocked", "missing_plan_check"),
+    ],
+)
+async def test_roadmap_recommendation_respects_decision_boundary(
+    scenario, recommendation, expected, reason
+):
+    s = scenario
+    await _approve_plan_check(s)
+    await _put_plan_check(s, 3)  # An edit after approval, before an owner grants.
+    source_task = await support.task_in_project(s.world, "historical redeem failure")
+    source_order = await _record_redeem_failure(s.world, source_task)
+    await support.admit(s.world)
+    granted = await _grant(s, signal_task_id=source_task)
+    assert granted.status_code == 200, granted.text
+    lease = await _start_explicit(s, source_order)
+    context = (await _question(s, lease["id"], source_key=lease["source_key"])).json()[
+        "decision_context"
+    ]
+    assert context["checks"] == [] and context["missing"] == ["plan_check"]
+    report = await _structured_report(
+        s, lease, _conclusion(source_order, recommendation)
+    )
+    assert report.status_code == 200, report.text
+    assert (await _evaluate(s, lease["id"], auth=s.other_steward)).status_code == 404
+    assert (await _evaluate(s, lease["id"], auth=s.owner)).status_code == 403
+    assert (await _evaluate(s, lease["id"], auth=s.guest)).status_code == 403
+    assert (
+        await _evaluate(s, lease["id"], grant_id=granted.json()["grant_id"] + 1)
+    ).status_code == 409
+    assert await _decision_audits(s) == []
+    decision = (await _evaluate(s, lease["id"])).json()
+    assert decision["status"] == expected and decision["reason"] == reason
+    assert decision["verification_condition"] is None
+    assert decision["recipient"] == (
+        "owner" if expected == "owner_required" else "steward"
+    )
+    assert (await repo.get_task(s.world.db, s.task_id))["status"] == "open"
+    assert len(await support.order_rows(s.world)) == 1
+    assert len(await support.rows(s.world.db, "SELECT * FROM executor_orders")) == 1
+
+
+async def test_historical_order_40_is_preserved_without_issuing_again(scenario):
+    s = scenario
+    source_task = await support.task_in_project(s.world, "saved signal")
+    grant = await _grant(s, signal_task_id=source_task)
+    assert grant.status_code == 200, grant.text
+    run_id = await repo.create_executor_run(
+        s.world.db,
+        task_id=source_task,
+        submission_generation=1,
+        agent_id="",
+        run_id="saved-37",
+        model="codex",
+        channel="slot",
+        slot="k8",
+    )
+    await s.world.db.execute(
+        "UPDATE executor_runs SET outcome='aborted' WHERE id=?", (run_id,)
+    )
+    await s.world.db.execute(
+        "INSERT INTO executor_orders "
+        "(id,host,task_id,generation,executor_run_id,state,expires_at,close_reason,report_outcome,report_reason_code) "
+        "VALUES (37,'k8',?,1,?,'closed',datetime('now'),'redeem_failed','failed','redeem_failed')",
+        (source_task, run_id),
+    )
+    historical = (
+        "Рекомендую паузу: сообщён redeem_failed; связь с пилотом и план неизвестны."
+    )
+    for order_id, outcome, note in ((39, "failed", ""), (40, "done", historical)):
+        await s.world.db.execute(
+            "INSERT INTO role_orders "
+            "(id,role,source_key,task_id,project_id,state,outcome,note,host) "
+            "VALUES (?,'roadmap',?,?,?,?,?,?,'k8')",
+            (
+                order_id,
+                f"steward_request:{order_id:032x}",
+                s.task_id,
+                s.world.pid,
+                outcome,
+                outcome,
+                note,
+            ),
+        )
+    cursor = await s.world.db.execute(
+        "INSERT INTO roadmap_requests (grant_id,request_id,question,source_order_id,order_id) "
+        "VALUES (?,'saved-40',?,37,39)",
+        (grant.json()["grant_id"], QUESTION),
+    )
+    await s.world.db.execute(
+        "INSERT INTO roadmap_recoveries "
+        "(request_pk,order_id,operator_id,evidence_update_id,evidence_sha256,runtime_sha256) "
+        "VALUES (?,40,?,22506,?,?)",
+        (cursor.lastrowid, s.world.human_id, "1" * 64, "2" * 64),
+    )
+    await repo.update_task(s.world.db, s.task_id, status="completed")
+    await s.world.db.commit()
+
+    saved = await roadmap_requests._request(s.world.db, 40)
+    assert saved is not None and saved["initial_order_id"] == 39
+    assert await roadmap_requests._signal_is_current(s.world.db, saved, 37)
+    context = roadmap_decisions.decision_context(saved)
+    assert context["signal"]["order_id"] == 37
+    assert context["checks"] == [] and context["missing"] == ["plan_check"]
+    assert (await _evaluate(s, 40)).status_code == 409
+    assert (
+        await _question(s, 40, source_key=f"steward_request:{40:032x}")
+    ).status_code == 404
+    assert (await support.order_row(s.world, 40))["note"] == historical
+    assert [r["id"] for r in await support.order_rows(s.world)] == [39, 40]
+    assert await _decision_audits(s) == []

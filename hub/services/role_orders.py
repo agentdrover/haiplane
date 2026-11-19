@@ -36,7 +36,8 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
-from hub.services import roadmap_requests
+from hub.services import roadmap_decisions, roadmap_requests
+from hub.services.roadmap_contracts import RoadmapResult
 from hub.services.untrusted_quote import sanitize_untrusted_quote
 
 log = logging.getLogger("hub.services.role_orders")
@@ -842,6 +843,7 @@ async def report(
     lease_id: str,
     outcome: str,
     note: str,
+    roadmap_result: RoadmapResult | None = None,
 ) -> dict[str, Any]:
     """Итог работы: started -> done|failed; одинаковый повтор - no-op, иной - 409.
 
@@ -854,7 +856,15 @@ async def report(
         _refuse(422, "role_outcome_invalid", f"outcome: {REPORT_OUTCOMES}")
     if len(note) > NOTE_MAX:
         _refuse(422, "role_note_too_long", f"note не длиннее {NOTE_MAX} символов")
-    digest = _digest(outcome, lease_id, note)
+    digest = (
+        _digest(
+            f"{outcome}:roadmap_result",
+            lease_id,
+            json.dumps([note, roadmap_result.model_dump()], sort_keys=True),
+        )
+        if roadmap_result
+        else _digest(outcome, lease_id, note)
+    )
     late = False
     async with write_transaction(db):
         await check_host(db, host, principal_id)
@@ -863,11 +873,21 @@ async def report(
         )
         if order["state"] in ("done", "failed") and order["report_digest"] == digest:
             return {"id": int(order_id), "outcome": outcome, "repeat": True}
+        if roadmap_result is not None and (
+            outcome != "done" or not _is_explicit(order)
+        ):
+            _refuse(
+                422,
+                "roadmap_result_not_allowed",
+                "structured result requires a successful explicit roadmap order",
+            )
         if outcome == "done":
             await _check_explicit_success(db, host, order, lease_id)
         if await _close_by_report(
             db, order, host, lease_id, outcome, sanitize_note(note), digest
         ):
+            if roadmap_result is not None:
+                await roadmap_decisions.record_result(db, order_id, roadmap_result)
             return {"id": int(order_id), "outcome": outcome, "repeat": False}
         late = order["state"] == "started" and order["lease_id"] == lease_id
     if late:

@@ -2205,7 +2205,7 @@ def _add_agents_create_parser(agents_sub: Any) -> None:
         "--role",
         choices=["agent", "watcher", "roadmap_steward"],
         default="agent",
-        help="Agent, read-only watcher, or grant-bound roadmap steward",
+        help="Agent, read-only watcher, or task-scoped roadmap steward",
     )
     p.set_defaults(func=cmd_admin_agents_create)
 

@@ -1351,6 +1351,8 @@ async def _open_draft_under_lock(
             db, task_id, expected_from="draft", new_status="open"
         )
         if transitioned:
+            from hub.services.statement_generation import approval_statement_evidence
+
             await repo.insert_event(
                 db,
                 kind="task_approved",
@@ -1359,6 +1361,7 @@ async def _open_draft_under_lock(
                 payload={
                     "run": bool(body.run),
                     "force": bool(body.force),
+                    **await approval_statement_evidence(db, fresh, who),
                     # #1874: автор для учёта минут владельца; не из actor и не из тела.
                     **(approve_plan or owner_minutes.stamp(who)),
                 },

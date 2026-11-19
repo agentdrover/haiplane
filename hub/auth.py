@@ -938,6 +938,10 @@ def _steward_refused(identity: TokenIdentity, method: str, path: str) -> bool:
 _ROADMAP_STEWARD_ALLOWED = (
     ("GET", _template_to_regex("/api/tasks/{task_id}/roadmap-grant")),
     ("POST", _template_to_regex("/api/tasks/{task_id}/roadmap-requests")),
+    (
+        "POST",
+        _template_to_regex("/api/tasks/{task_id}/roadmap-orders/{order_id}/decision"),
+    ),
 )
 
 
