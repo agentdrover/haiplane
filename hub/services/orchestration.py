@@ -4864,7 +4864,7 @@ async def base_freshness_step(
         "второго обновления без нового прогона CI не будет"
     )
     if _gate_branch_updates.get(key) == spent:
-        return stale_base_recovery.pending_note(key[1], target) if target else pending
+        return await _branch_update_wait(db, task, target, pending)
     # Бронь — в том же синхронном участке, что и проверка, до первого await
     # (#421, #1398): иначе второй путь гейта проходит проверку, пока первый
     # ждёт базу или форж, и зовёт update второй раз.
@@ -4904,6 +4904,20 @@ async def base_freshness_step(
         f"гейт слил базу в ветку (голова была {fresh.head_sha[:12]}: {detail}). "
         "Мерж — после зелёного CI на новой голове, следующим циклом"
     )
+
+
+async def _branch_update_wait(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    target: CIPrTarget | None,
+    pending: str,
+) -> str:
+    if (
+        target is not None
+        and await gate_branch_update_from(db, task) != target.head_sha
+    ):
+        return stale_base_recovery.pending_note(task["pr_number"], target)
+    return pending
 
 
 def _release_branch_update(key: tuple[int, int], spent: tuple[int, str]) -> None:
