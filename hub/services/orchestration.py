@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import aiosqlite
 
@@ -4208,14 +4208,8 @@ async def approval_stands(db: aiosqlite.Connection, task: dict[str, Any]) -> boo
     у остальных нужен APPROVED на текущей сдаче, не закрытый решением человека
     (#1286). Снимок вызывающего не читается вовсе: его возраст и есть дефект.
     """
-    from hub.services import merged_delivery
-
     row = await repo.get_task(db, int(task["id"]))
-    return (
-        row is not None
-        and _approval_holds(dict(row), task)
-        and await merged_delivery.completion_stands(db, dict(row), task)
-    )
+    return row is not None and _approval_holds(dict(row), task)
 
 
 async def _merge_approval_row(
@@ -4328,14 +4322,19 @@ async def record_delivery_outcome(
     явное объяснение (``_note_approval_gone``), а ``write`` не вызывается.
     Возвращает ``(записано ли, результат write либо fallback)``.
     """
+    from hub.services import merged_delivery
+
     async with write_transaction(db):
         # The read and the first SQL of ``write`` share one write transaction:
         # a verdict writer on another connection cannot land between them.
         stands = await approval_stands(db, task)
-        result = await write() if stands else fallback
+        gap = await merged_delivery.completion_gap(db, task) if stands else ""
+        if gap:
+            await merged_delivery.note_completion_wait(db, task, gap)
+        result = await write() if stands and not gap else fallback
     if not stands:
         await delivery_notes.note_approval_gone(db, task, merged=merged)
-    return stands, result
+    return stands and not gap, result
 
 
 async def _gate_merge_step(
@@ -5630,6 +5629,8 @@ async def _complete_without_review(
     pr_delivered = bool(task.get("pr_number"))
     if (written := await _write_completed(db, task, exit_code, result_text)) is None:
         return "needs_decision"
+    if written == "reconciliation_wait":
+        return "running"
     if not written:
         await delivery_notes.note_approval_gone(db, task, merged=pr_delivered)
         return "running"
@@ -5641,7 +5642,7 @@ async def _write_completed(
     task: dict[str, Any],
     exit_code: int | None,
     result_text: str | None,
-) -> bool | None:
+) -> bool | None | Literal["reconciliation_wait"]:
     """The write of ``completed`` after a done report, with its validation gate.
 
     ``None``: the defect gate holds it, asked again of the row here (#1791).
@@ -5662,10 +5663,15 @@ async def _write_completed(
     gate again, of the database; GitHub was asked before it (the caller),
     and the network delivery (merge) happened before it too.
     """
+    from hub.services import merged_delivery
+
     task_id = task["id"]
     async with write_transaction(db):
         if not await approval_stands(db, task):
             return False
+        if gap := await merged_delivery.completion_gap(db, task):
+            await merged_delivery.note_completion_wait(db, task, gap)
+            return "reconciliation_wait"
         if await hold_completion(db, task_id, via="report_done_write", actor="hub"):
             return None
         row = await repo.get_task(db, task_id)

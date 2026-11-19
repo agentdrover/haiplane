@@ -940,6 +940,18 @@ async def pipeline_merge_recorded(
     return bool(rows)
 
 
+async def reconciled_merge_recorded(
+    db: aiosqlite.Connection, task_id: int, pr_number: int
+) -> bool:
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM pipeline_merges WHERE task_id=? AND pr_number=? "
+        "AND reconciliation<>'' LIMIT 1",
+        (task_id, pr_number),
+    )
+    return bool(rows)
+
+
 async def known_pipeline_shas(
     db: aiosqlite.Connection, project_id: int, *, gate_only: bool = False
 ) -> set[str]:

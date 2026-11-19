@@ -90,7 +90,7 @@ async def reconcile(
     repository, base = ctx.get("gh_repo"), ctx.get("base_branch")
     number = int(task["pr_number"])
     if state != "merged":
-        if await _reconciled_rows(db, int(task["id"]), number):
+        if await repo.reconciled_merge_recorded(db, int(task["id"]), number):
             return False, "ci_unavailable: merged_reconciliation_pr_unconfirmed"
         return None
     if db.in_transaction:
@@ -110,6 +110,8 @@ async def reconcile(
             branch=pin.branch,
             head=pin.head,
         )
+    except github_merged_delivery.MergeEvidenceUnavailable as exc:
+        return False, f"merge_commit_unverified: {exc}"
     except github_merged_delivery.UnprovedMerge as exc:
         return False, f"merged_outside_gate: {exc}"
     standing = await ci_trust.refresh_quietly(db, pin.task_id, pin.head)
@@ -168,15 +170,30 @@ async def _ci_holds(
     )
 
 
-async def completion_stands(
-    db: aiosqlite.Connection, live_task: dict[str, Any], snapshot: dict[str, Any]
-) -> bool:
-    """Keep the proof current until the caller writes completed."""
+async def completion_gap(db: aiosqlite.Connection, snapshot: dict[str, Any]) -> str:
+    """Explain what changed after a proved reconciliation, while holding the lock."""
     proof = snapshot.get("_reconciled_merge")
     if proof is None:
-        return True
+        return ""
     pin, standing = proof
-    return await _pin(db, live_task) == pin and await _ci_holds(db, pin, standing)
+    live = await repo.get_task(db, pin.task_id)
+    if live is None or await _pin(db, dict(live)) != pin:
+        return "условия текущей сдачи изменились"
+    if not await _ci_holds(db, pin, standing):
+        return "результат CI изменился"
+    return ""
+
+
+async def note_completion_wait(
+    db: aiosqlite.Connection, task: dict[str, Any], reason: str
+) -> None:
+    """Record the wait in the same transaction as the failed recheck."""
+    text = (
+        f"PR #{task.get('pr_number')} влит. Завершение ждёт повторной сверки: {reason}."
+    )
+    updates = await repo.get_task_updates(db, int(task["id"]))
+    if not updates or updates[-1]["content"] != text:
+        await repo.add_task_update(db, int(task["id"]), "hub", "status", text)
 
 
 async def _reconciled_rows(db: aiosqlite.Connection, task_id: int, pr_number: int):

@@ -980,12 +980,19 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
         state = ""
 
     if state == "merged":
-        if await repo.pipeline_merge_recorded(db, task_id, pr_number):
+        if await repo.reconciled_merge_recorded(db, task_id, pr_number):
             return _task_answer(
                 UNKNOWN,
-                f"Наблюдение мержа PR #{pr_number} относится к другой сдаче",
+                f"Сверка мержа PR #{pr_number} не подтверждает текущую сдачу",
                 pr_number=pr_number,
                 delivery_path="unknown",
+            )
+        if await repo.pipeline_merge_recorded(db, task_id, pr_number, gate_only=True):
+            return _task_answer(
+                DELIVERED,
+                "гейт сохранил факт мержа, GitHub не сообщил SHA при записи",
+                pr_number=pr_number,
+                delivery_path="gate",
             )
         return _task_answer(
             DELIVERED,

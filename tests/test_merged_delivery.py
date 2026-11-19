@@ -262,6 +262,9 @@ async def test_ci_changes_between_reconciliation_and_completion(
 
     live = dict(await repo.get_task(db, task["id"]))
     assert live["status"] == "running"
+    updates = await repo.get_task_updates(db, task["id"])
+    assert any("результат CI изменился" in row["content"] for row in updates)
+    assert not any("одобрение, с которым" in row["content"] for row in updates)
     assert await db.execute_fetchall("SELECT * FROM pipeline_merges")
     git.merge_pr.assert_not_awaited()
 
@@ -296,4 +299,60 @@ async def test_renewed_approval_reconciles_same_merge_without_second_row(db, mer
     evidence = json.loads(rows[0]["reconciliation"])
     assert evidence["pin"]["verdict_revision"] == old_revision + 1
     assert evidence["first_attestation"]["pin"]["verdict_revision"] == old_revision
+    git.merge_pr.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "resource", ["pulls/77", "branches/main", f"compare/{MERGE}...{BASE_TIP}"]
+)
+async def test_unreadable_merge_evidence_keeps_done_waiting(
+    db, merged, monkeypatch, resource
+):
+    task, _, git, _, _, _ = merged
+    actual = GitHubForge._api_json
+
+    async def unavailable(forge, endpoint, *, repo):
+        if endpoint == f"repos/{NAME}/{resource}":
+            return None, False
+        return await actual(forge, endpoint, repo=repo)
+
+    monkeypatch.setattr(GitHubForge, "_api_json", unavailable)
+    await _report_done(db, task["id"])
+
+    live = dict(await repo.get_task(db, task["id"]))
+    assert live["status"] == "running"
+    updates = await repo.get_task_updates(db, task["id"])
+    assert any("merge_commit_unverified:" in row["content"] for row in updates)
+    git.merge_pr.assert_not_awaited()
+
+
+async def test_gate_merge_without_sha_is_not_stale_reconciliation(db, merged):
+    task, project_id, _, _, _, _ = merged
+    await repo.record_pipeline_merge(
+        db, pr_number=77, project_id=project_id, task_id=task["id"]
+    )
+
+    delivery = await delivery_state.task_delivery(db, task)
+
+    assert delivery["state"] == "delivered"
+    assert delivery["delivery_path"] == "gate"
+    assert (await repo.task_as_blocker(db, task["id"]))["delivered"]
+
+
+async def test_sweep_records_ci_change_without_claiming_approval_lost(db, merged):
+    task, _, git, _, _, _ = merged
+    assert (await orchestration.merge_before_completion(db, task))[0]
+    await repo.bump_ci_state_version(db, task["id"], HEAD)
+    await db.commit()
+
+    write = AsyncMock()
+    completed, _ = await orchestration.record_delivery_outcome(
+        db, task, write, merged=True
+    )
+
+    assert not completed
+    write.assert_not_awaited()
+    updates = await repo.get_task_updates(db, task["id"])
+    assert any("результат CI изменился" in row["content"] for row in updates)
+    assert not any("одобрение, с которым" in row["content"] for row in updates)
     git.merge_pr.assert_not_awaited()
