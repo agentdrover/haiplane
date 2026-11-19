@@ -860,7 +860,12 @@ class GitVerseForge:
         return CIProbeResult(CIProbeOutcome.missing_run, reason, details=sha or None)
 
     async def check_pr_ci(
-        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        contract_fingerprint: str = "",
     ) -> CIProbeResult:
         """Исход CI для головы этого PR.
 

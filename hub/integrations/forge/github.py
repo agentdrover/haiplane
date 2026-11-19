@@ -21,7 +21,7 @@ from typing import Any
 from hub import brand
 from hub.config import GH_BIN, REPO_NAME
 from hub.integrations import proc
-from hub.integrations.forge import github_rerun
+from hub.integrations.forge import github_ci_selection, github_rerun
 from hub.integrations.protocols import (
     BaseFreshness,
     BaseFreshnessState,
@@ -1063,7 +1063,27 @@ class GitHubForge:
         )
 
     async def check_pr_ci(
-        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        contract_fingerprint: str = "",
+    ) -> CIProbeResult:
+        if (gh_repo or REPO_NAME).lower() == github_ci_selection.PILOT_REPO:
+
+            async def fetch_ci_evidence(endpoint: str) -> tuple[Any, bool]:
+                return await self._api_json(endpoint, repo=repo)
+
+            result = await github_ci_selection.equivalent_probe(
+                fetch_ci_evidence, pr_number, contract_fingerprint
+            )
+            if result is not None:
+                return result
+        return await self._legacy_pr_ci(pr_number, repo=repo, gh_repo=gh_repo)
+
+    async def _legacy_pr_ci(
+        self, pr_number: int, *, repo: str | None, gh_repo: str | None
     ) -> CIProbeResult:
         rc, out, err = await _gh(
             "pr",
