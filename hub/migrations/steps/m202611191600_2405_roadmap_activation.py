@@ -9,6 +9,8 @@ MIGRATIONS = [
             approver_id INTEGER NOT NULL,
             task_id INTEGER NOT NULL,
             statement_fingerprint TEXT NOT NULL,
+            executor_high_water INTEGER NOT NULL,
+            executor_order_id INTEGER UNIQUE,
             activated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )""",
     ),

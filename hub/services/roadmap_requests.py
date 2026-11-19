@@ -150,6 +150,15 @@ _SIGNAL_FILTER = (
 )
 
 
+# A one-shot pilot can consult only the executor order recorded in its
+# activation receipt. The ordinary administrative grant has no such receipt.
+_PILOT_ORDER_SCOPE = (
+    "NOT EXISTS (SELECT 1 FROM roadmap_activation_receipts a WHERE a.grant_id=? "
+    "AND (a.executor_order_id IS NULL OR a.executor_order_id<>o.id "
+    "OR o.id<=a.executor_high_water))"
+)
+
+
 async def _signal_is_current(
     db: aiosqlite.Connection,
     grant: aiosqlite.Row,
@@ -162,8 +171,11 @@ async def _signal_is_current(
         await _signal_task_is_current(db, grant["project_id"], source_task)
         and await _one(
             db,
-            "SELECT 1 FROM executor_orders o WHERE o.id = ? AND " + _SIGNAL_FILTER,  # nosec B608
-            (source_order_id, source_task),
+            "SELECT 1 FROM executor_orders o WHERE o.id = ? AND "  # nosec B608
+            + _SIGNAL_FILTER
+            + " AND "
+            + _PILOT_ORDER_SCOPE,
+            (source_order_id, source_task, grant["id"]),
         )
         is not None
     )
@@ -206,10 +218,12 @@ async def _signals(
         "o.report_outcome AS outcome, o.report_reason_code AS reason_code "
         "FROM executor_orders o WHERE "
         + _SIGNAL_FILTER
-        + " AND o.id > ? AND NOT EXISTS ("
+        + " AND o.id > ? AND "
+        + _PILOT_ORDER_SCOPE
+        + " AND NOT EXISTS ("
         + _SOURCE_ALREADY_CONSULTED
         + "o.id) ORDER BY o.id LIMIT 20",
-        (task_id, after_order_id, grant["id"]),
+        (task_id, after_order_id, grant["id"], grant["id"]),
     )
     return [dict(row) for row in rows]
 

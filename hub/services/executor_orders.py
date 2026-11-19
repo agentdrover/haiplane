@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 import aiosqlite
+from fastapi import HTTPException
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
@@ -826,7 +827,7 @@ async def _issue_atomically(
     project: Any,
     booked: _Booking,
     *,
-    issuer_principal_id: int,
+    issuer_principal_id: int | None,
     issuer_human: bool = False,
     pilot_start: tuple[str, str] | None = None,
 ) -> tuple[int, int]:
@@ -843,6 +844,8 @@ async def _issue_atomically(
     await db.execute("SAVEPOINT executor_slot_issue")
     try:
         if booked.returning:
+            if issuer_principal_id is None:
+                raise HTTPException(409, "a system issuer cannot return a running task")
             await _return_for_repair(db, booked, issuer_principal_id)
         result = await _issue(
             db,
@@ -886,7 +889,7 @@ async def _issue(
     project: Any,
     booked: _Booking,
     *,
-    issuer_principal_id: int,
+    issuer_principal_id: int | None,
     issuer_human: bool = False,
     pilot_start: tuple[str, str] | None = None,
 ) -> tuple[int, int]:

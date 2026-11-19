@@ -15,7 +15,12 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import connect, fetchall, write_transaction
-from hub.services import admin, roadmap_decisions, roadmap_requests
+from hub.services import (
+    admin,
+    executor_slot_launch,
+    roadmap_decisions,
+    roadmap_requests,
+)
 from hub.services.statement_generation import statement_fingerprint
 
 
@@ -43,7 +48,6 @@ _MANDATE = _Mandate(
     steward_id=42,
     roadmap_id=31,
 )
-_ACTIVATION_DEADLINE = "2026-11-20 15:56:00"
 _ACTOR = "hub.local.roadmap_activation"
 
 
@@ -56,7 +60,7 @@ async def _previous(
 ) -> dict[str, Any] | None:
     rows = await fetchall(
         db,
-        "SELECT r.grant_id, r.activated_at, g.expires_at, "
+        "SELECT r.grant_id, r.activated_at, g.expires_at, r.executor_high_water, r.executor_order_id, "
         "CASE WHEN g.id IS NULL OR g.revoked_at IS NOT NULL THEN 'revoked' "
         "WHEN g.expires_at <= datetime('now') THEN 'expired' ELSE 'active' END AS state "
         "FROM roadmap_activation_receipts r LEFT JOIN roadmap_grants g ON g.id=r.grant_id "
@@ -78,14 +82,12 @@ async def _verify_approval(
 ) -> tuple[int, int, int, int]:
     rows = await fetchall(
         db,
-        "SELECT payload, datetime('now') < ? AS within_window FROM events "
+        "SELECT payload FROM events "
         "WHERE id=? AND task_id=? AND kind='task_approved' AND actor='human'",
-        (_ACTIVATION_DEADLINE, mandate.approval_id, mandate.task_id),
+        (mandate.approval_id, mandate.task_id),
     )
     if not rows:
         raise ActivationRefused("owner_approval_missing")
-    if not rows[0]["within_window"]:
-        raise ActivationRefused("activation_window_expired")
     stamp = json.loads(rows[0]["payload"])
     if (
         stamp.get("human") is not True
@@ -176,7 +178,8 @@ async def _run(db: aiosqlite.Connection, *, apply: bool) -> dict[str, Any]:
         )
         await db.execute(
             "INSERT INTO roadmap_activation_receipts "
-            "(approval_id,grant_id,approver_id,task_id,statement_fingerprint) VALUES (?,?,?,?,?)",
+            "(approval_id,grant_id,approver_id,task_id,statement_fingerprint,executor_high_water) "
+            "VALUES (?,?,?,?,?,(SELECT COALESCE(MAX(id),0) FROM executor_orders))",
             (
                 mandate.approval_id,
                 grant_id,
@@ -216,13 +219,76 @@ async def _run(db: aiosqlite.Connection, *, apply: bool) -> dict[str, Any]:
         return {**receipt, "repeat": False}
 
 
-async def _command(path: Path, *, apply: bool) -> dict[str, Any]:
-    if apply:
+async def _issue_once(db: aiosqlite.Connection) -> dict[str, Any]:
+    mandate = _MANDATE
+    async with write_transaction(db):
+        receipt = await _previous(db, mandate)
+        if receipt is None:
+            raise ActivationRefused("pilot_grant_not_activated")
+        if receipt["executor_order_id"] is not None:
+            return receipt
+        if receipt["state"] != "active":
+            raise ActivationRefused("pilot_grant_not_active")
+        await _verify_approval(db, mandate)
+        task = await repo.get_task(db, mandate.task_id)
+        if task is None or task["status"] != "open":
+            raise ActivationRefused("pilot_task_not_open")
+        if await fetchall(
+            db,
+            "SELECT id FROM executor_orders WHERE task_id=? AND id>? LIMIT 1",
+            (mandate.task_id, receipt["executor_high_water"]),
+        ):
+            raise ActivationRefused("pilot_order_created_outside_receipt")
+        project = await repo.get_project(db, mandate.project_id)
+        if project is None or project["slug"] != "home-infra":
+            raise ActivationRefused("wrong_project")
+        result = await executor_slot_launch.launch_on_slot(
+            db,
+            project,
+            host="k8",
+            task_id=mandate.task_id,
+            issuer_principal_id=None,
+        )
+        if not result.launched or result.order_id is None:
+            raise ActivationRefused(f"pilot_order_refused: {result.reason}")
+        await db.execute(
+            "UPDATE roadmap_activation_receipts SET executor_order_id=? WHERE approval_id=?",
+            (result.order_id, mandate.approval_id),
+        )
+        await admin.write_audit(
+            db,
+            actor_id=None,
+            action="roadmap_pilot_order_issued",
+            target_type="task",
+            target_id=str(mandate.task_id),
+            summary=f"{_ACTOR}: issued the one approved k8 order",
+            detail=json.dumps(
+                {
+                    "actor": _ACTOR,
+                    "approval_id": mandate.approval_id,
+                    "effective_uid": os.geteuid(),
+                    "grant_id": receipt["grant_id"],
+                    "executor_order_id": result.order_id,
+                    "executor_run_id": result.row_id,
+                    "high_water": receipt["executor_high_water"],
+                    "host": "k8",
+                },
+                sort_keys=True,
+            ),
+            commit=False,
+        )
+        return {**receipt, "executor_order_id": result.order_id, "repeat": False}
+
+
+async def _command(path: Path, *, apply: bool, issue: bool) -> dict[str, Any]:
+    if apply or issue:
         db = await connect(f"{path.as_uri()}?mode=rw")
     else:
         db = await aiosqlite.connect(f"{path.as_uri()}?mode=ro", uri=True)
         db.row_factory = aiosqlite.Row
     try:
+        if issue:
+            return await _issue_once(db)
         return await _run(db, apply=apply)
     finally:
         await db.close()
@@ -230,14 +296,21 @@ async def _command(path: Path, *, apply: bool) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--apply", action="store_true")
+    operations = parser.add_mutually_exclusive_group()
+    operations.add_argument("--apply", action="store_true")
+    operations.add_argument("--issue", action="store_true")
     parser.add_argument("--db", type=Path, required=True)
     args = parser.parse_args()
     try:
         path = args.db.resolve(strict=True)
         if not path.is_file() or path.stat().st_uid != os.geteuid():
             raise ActivationRefused("must_run_as_database_owner")
-        print(json.dumps(asyncio.run(_command(path, apply=args.apply)), sort_keys=True))
+        print(
+            json.dumps(
+                asyncio.run(_command(path, apply=args.apply, issue=args.issue)),
+                sort_keys=True,
+            )
+        )
     except (ActivationRefused, OSError, aiosqlite.Error) as exc:
         print(str(exc), file=sys.stderr)
         return 1

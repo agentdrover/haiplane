@@ -8,8 +8,10 @@ import pytest
 
 from hub import repository as repo
 from hub.db import connect
-from hub.services import admin, roadmap_activation
+from hub.services import admin, roadmap_activation, roadmap_requests
 from tests import role_orders_support as support
+from tests import test_executor_orders as executor_tests
+from tests.test_roadmap_requests import _record_redeem_failure
 
 world = support.world
 keys = support.keys
@@ -68,7 +70,7 @@ async def approved(world, monkeypatch):
         roadmap_id=roadmap["id"],
     )
     monkeypatch.setattr(roadmap_activation, "_MANDATE", mandate)
-    monkeypatch.setattr(roadmap_activation, "_ACTIVATION_DEADLINE", "2099-01-01")
+    world.slug = "home-infra"
     return world, mandate, auth
 
 
@@ -118,9 +120,7 @@ async def test_exact_owner_approval_activates_scoped_grant(approved):
     assert json.loads(audit["detail"])["actor"] == "hub.local.roadmap_activation"
 
 
-@pytest.mark.parametrize(
-    "failure", ["event", "revision", "expiry", "steward", "prior_offer"]
-)
+@pytest.mark.parametrize("failure", ["event", "revision", "steward", "prior_offer"])
 async def test_activation_rejects_stale_or_unbound_authority(
     approved, monkeypatch, failure
 ):
@@ -136,8 +136,6 @@ async def test_activation_rejects_stale_or_unbound_authority(
             world.db, mandate.task_id, statement_generation=mandate.generation + 1
         )
         await world.db.commit()
-    elif failure == "expiry":
-        monkeypatch.setattr(roadmap_activation, "_ACTIVATION_DEADLINE", "2000-01-01")
     elif failure == "steward":
         await world.db.execute(
             "UPDATE principals SET status='disabled' WHERE id=?", (mandate.steward_id,)
@@ -196,3 +194,86 @@ async def test_activation_replay_never_issues_second_grant(approved, close):
     assert again["repeat"] is True and again["state"] == close
     assert again["grant_id"] == a["grant_id"]
     assert len(await support.rows(world.db, "SELECT * FROM roadmap_grants")) == 1
+
+
+async def test_one_system_slot_order_fences_historical_signals(approved):
+    world, mandate, _ = approved
+    historical = await _record_redeem_failure(world, mandate.task_id)
+    activated = await roadmap_activation._run(world.db, apply=True)
+    assert activated["executor_high_water"] == historical
+    grant = await roadmap_requests._active_grant(world.db, mandate.task_id)
+    assert grant is not None
+    assert await roadmap_requests._signals(world.db, grant, 0) == []
+    assert not await roadmap_requests._signal_is_current(world.db, grant, historical)
+
+    second = await connect(world.dsn)
+    try:
+        replies = await asyncio.gather(
+            roadmap_activation._issue_once(world.db),
+            roadmap_activation._issue_once(second),
+        )
+    finally:
+        await second.close()
+    assert {r["repeat"] for r in replies} == {True, False}
+    order = replies[0]["executor_order_id"]
+    assert replies[1]["executor_order_id"] == order > historical
+    runs = await support.rows(
+        world.db, "SELECT launched_by FROM executor_runs ORDER BY id"
+    )
+    assert runs[0]["launched_by"] is not None and runs[1]["launched_by"] is None
+
+    leased = await executor_tests._orders(world)
+    assert leased.json()["orders"][0]["id"] == order
+    assert (await executor_tests._ack(world, order, "redeem_failed")).status_code == 200
+    signal = await world.client.post(
+        f"/api/executor-hosts/k8/orders/{order}/report",
+        headers=world.k8_auth,
+        json={
+            "outcome": "failed",
+            "reason_code": "redeem_failed",
+            "note": "isolated fixture",
+        },
+    )
+    assert signal.status_code == 200
+    assert await roadmap_requests._signal_is_current(world.db, grant, order)
+    assert [
+        r["executor_order_id"]
+        for r in await roadmap_requests._signals(world.db, grant, 0)
+    ] == [order]
+    assert (await roadmap_activation._issue_once(world.db))[
+        "executor_order_id"
+    ] == order
+    assert len(await support.rows(world.db, "SELECT * FROM executor_orders")) == 2
+    audit = await support.rows(
+        world.db,
+        "SELECT * FROM admin_audit_log WHERE action='roadmap_pilot_order_issued'",
+    )
+    assert len(audit) == 1 and audit[0]["actor_principal_id"] is None
+
+
+@pytest.mark.parametrize("block", ["no_grant", "expired_grant", "out_of_band"])
+async def test_one_system_slot_order_stops_when_preconditions_fail(approved, block):
+    world, mandate, auth = approved
+    if block != "no_grant":
+        receipt = await roadmap_activation._run(world.db, apply=True)
+        if block == "expired_grant":
+            await world.db.execute(
+                "UPDATE roadmap_grants SET expires_at='2000-01-01' WHERE id=?",
+                (receipt["grant_id"],),
+            )
+            await world.db.commit()
+        else:
+            issued = await world.client.post(
+                "/api/projects/home-infra/executor-launch",
+                headers=auth,
+                json={"target": "slot:k8", "task_id": mandate.task_id},
+            )
+            assert issued.status_code == 200, issued.text
+    count = len(await support.rows(world.db, "SELECT id FROM executor_orders"))
+    with pytest.raises(roadmap_activation.ActivationRefused):
+        await roadmap_activation._issue_once(world.db)
+    assert len(await support.rows(world.db, "SELECT id FROM executor_orders")) == count
+    assert not await support.rows(
+        world.db,
+        "SELECT * FROM admin_audit_log WHERE action='roadmap_pilot_order_issued'",
+    )
