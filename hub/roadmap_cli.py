@@ -40,6 +40,8 @@ def add_parser(
         if args.roadmap_command == "request":
             path = f"/api/tasks/{args.task_id}/roadmap-requests"
             body["question"] = _read_question(args.question_file)
+        elif args.roadmap_command == "recover":
+            path = f"/api/tasks/{args.task_id}/roadmap-orders/{args.order_id}/recover"
         print_json(api(method, path, body) if body else api(method, path))
         return 0
 
@@ -74,3 +76,23 @@ def add_parser(
                 type=str if field == "request_id" else int,
             )
         parser.set_defaults(func=call, method=method, fields=fields)
+
+    recovery = operations.add_parser("recover", help="Attest and order one recovery")
+    recovery.add_argument("task_id", type=int)
+    recovery.add_argument("order_id", type=int)
+    recovery.add_argument("--evidence-update-id", required=True, type=int)
+    recovery.add_argument("--evidence-sha256", required=True)
+    recovery.add_argument("--runtime-sha256", required=True)
+    recovery.add_argument("--model-did-not-start", required=True, action="store_true")
+    recovery.add_argument("--runtime-smoke-passed", required=True, action="store_true")
+    recovery.set_defaults(
+        func=call,
+        method="POST",
+        fields=(
+            "evidence_update_id",
+            "evidence_sha256",
+            "runtime_sha256",
+            "model_did_not_start",
+            "runtime_smoke_passed",
+        ),
+    )
