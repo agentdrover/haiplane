@@ -36,7 +36,6 @@ from hub import repository_accepted_delivery_retry as journal
 from hub import repository_delivery_rerun as rerun_journal
 from hub.db import write_transaction
 from hub.integrations.protocols import CIProbeOutcome
-from hub.integrations.registry import plugins
 
 log = logging.getLogger("hub")
 
@@ -232,17 +231,12 @@ async def _ci_allows_attempt(db: aiosqlite.Connection, task: dict[str, Any]) -> 
     Непрочитанный CI - "wait", а не "go" и не "stop": неизвестное не равно ни
     зелёному, ни красному.
     """
-    from hub.services import orchestration
+    from hub.services import delivery_ci, orchestration
 
     pr = int(task["pr_number"])
     try:
         ctx = await orchestration.project_git_context(db, int(task["id"]))
-        ci = await plugins.git_ops.check_pr_ci(
-            pr,
-            repo=ctx.get("repo"),
-            gh_repo=ctx.get("gh_repo"),
-            forge=ctx.get("forge", ""),
-        )
+        ci = await delivery_ci.check_task(db, int(task["id"]), pr, ctx)
     except Exception:  # noqa: BLE001 - "не прочитали" - повод ждать
         log.exception("CI probe of PR #%s (#%s) failed", pr, task["id"])
         return "wait"
