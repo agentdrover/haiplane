@@ -36,6 +36,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
+from hub.services import roadmap_requests
 from hub.services.untrusted_quote import sanitize_untrusted_quote
 
 log = logging.getLogger("hub.services.role_orders")
@@ -378,6 +379,10 @@ async def _has_newer_entry(
     return bool(rows)
 
 
+def _is_explicit(order: aiosqlite.Row) -> bool:
+    return str(order["source_key"]).startswith(f"{roadmap_requests.SOURCE}:")
+
+
 async def is_fresh(db: aiosqlite.Connection, order: aiosqlite.Row) -> bool:
     """Задача всё ещё в ТОМ ЖЕ заходе в needs_decision, что породил заказ.
 
@@ -385,6 +390,8 @@ async def is_fresh(db: aiosqlite.Connection, order: aiosqlite.Row) -> bool:
     очистка лент удаляет старое событие, и заказ, чья задача никуда не уходила,
     не должен от этого стать устаревшим.
     """
+    if _is_explicit(order):
+        return await roadmap_requests.order_is_current(db, int(order["id"]))
     rows = await fetchall(
         db,
         "SELECT status, status_entered_at, submission_generation, archived "
@@ -633,6 +640,14 @@ async def _claim_first(db: aiosqlite.Connection, host: str) -> dict[str, Any] | 
     return None
 
 
+async def _can_keep_lease(
+    db: aiosqlite.Connection, host: str, order: aiosqlite.Row
+) -> bool:
+    return await _is_admitted(db, host, order) and (
+        not _is_explicit(order) or await is_fresh(db, order)
+    )
+
+
 async def lease(
     db: aiosqlite.Connection, host: str, principal_id: int | None
 ) -> dict[str, Any] | None:
@@ -658,9 +673,11 @@ async def lease(
             current = active[0]
             if current["state"] != "leased":
                 return None  # работа идёт: второй заказ не выдаётся
-            if await _is_admitted(db, host, current):
+            if await _can_keep_lease(db, host, current):
                 return _lease_view(current)
-            await _release_to_open(db, int(current["id"]))  # допуск отозван
+            await _release_to_open(db, int(current["id"]))
+            if _is_explicit(current) and not await is_fresh(db, current):
+                await _expire_stale(db, current)
         return await _claim_first(db, host)
 
 
@@ -691,6 +708,17 @@ async def _own_or_refuse(
     _refuse(409, "role_order_reassigned", "заказ уже выдан другому хосту или снят")
 
 
+async def _check_explicit_freshness(
+    db: aiosqlite.Connection, order: aiosqlite.Row, lease_id: str
+) -> None:
+    if (
+        order["lease_id"] == lease_id
+        and _is_explicit(order)
+        and not await is_fresh(db, order)
+    ):
+        _refuse(409, "roadmap_grant_stale", "мандат стюарда устарел")
+
+
 async def started(
     db: aiosqlite.Connection,
     host: str,
@@ -707,6 +735,10 @@ async def started(
     revoked = False
     async with write_transaction(db):
         await check_host(db, host, principal_id)
+        current = await _own_or_refuse(
+            db, await _order(db, int(order_id)), host, lease_id
+        )
+        await _check_explicit_freshness(db, current, lease_id)
         cursor = await db.execute(
             "UPDATE role_orders SET state = 'started', started_at = datetime('now') "
             "WHERE id = ? AND host = ? AND lease_id = ? AND state = 'leased' "
@@ -817,6 +849,8 @@ async def report(
         )
         if order["state"] in ("done", "failed") and order["report_digest"] == digest:
             return {"id": int(order_id), "outcome": outcome, "repeat": True}
+        if outcome == "done":
+            await _check_explicit_freshness(db, order, lease_id)
         if await _close_by_report(
             db, order, host, lease_id, outcome, sanitize_note(note), digest
         ):

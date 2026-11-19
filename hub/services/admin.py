@@ -327,6 +327,7 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
         # the principal to BE a registered host, so the role on any other
         # principal confines it to nothing at all.
         "slot_runner",
+        "roadmap_steward",
         "super_admin",
         "admin",
         "security_admin",
@@ -350,6 +351,7 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
                 "ci_reader",
                 "ci_auditor",
                 "slot_runner",
+                "roadmap_steward",
             ):
                 return priority
             if priority in ("operator", "developer", "viewer"):

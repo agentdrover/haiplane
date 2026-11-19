@@ -2203,9 +2203,9 @@ def _add_agents_create_parser(agents_sub: Any) -> None:
     p.add_argument("--display-name", dest="display_name", default="")
     p.add_argument(
         "--role",
-        choices=["agent", "watcher"],
+        choices=["agent", "watcher", "roadmap_steward"],
         default="agent",
-        help="agent (default) or watcher: read-only, every write refused by the hub",
+        help="Agent, read-only watcher, or grant-bound roadmap steward",
     )
     p.set_defaults(func=cmd_admin_agents_create)
 
@@ -2587,6 +2587,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_clocks.add_argument("--since-days", type=int, default=90)
     p_clocks.set_defaults(func=cmd_defect_clocks)
     _add_defect_metric_parsers(sub)
+    from hub import roadmap_cli
+
+    roadmap_cli.add_parser(sub, _api, _print_json)
     _add_worktree_parser(sub)
     cli_agent_outbox.add_parser(sub, _api)
 
