@@ -596,29 +596,36 @@ async def _order(db: aiosqlite.Connection, order_id: int) -> aiosqlite.Row | Non
     return rows[0] if rows else None
 
 
-async def has_work(db: aiosqlite.Connection, host: str) -> bool:
+async def has_work(
+    db: aiosqlite.Connection, host: str, *, pilot_allowed: bool = False
+) -> bool:
     """Дешёвое чтение для long-poll: есть ли у хоста свой lease или допущенный открытый заказ."""
     rows = await fetchall(
         db,
-        "SELECT 1 FROM role_orders o WHERE (o.state = 'leased' AND o.host = ?1) "
+        "SELECT 1 FROM role_orders o WHERE ((o.state = 'leased' AND o.host = ?1) "
         "OR (o.state = 'open' AND EXISTS (SELECT 1 FROM role_host_admissions a "
-        "WHERE a.host = ?1 AND a.role = o.role AND a.project_id = o.project_id) "
-        "AND (?1 = 'k8' OR NOT EXISTS (SELECT 1 FROM roadmap_observation_pilots p "
-        "WHERE p.order_id=o.id))) LIMIT 1",
-        (host,),
+        "WHERE a.host = ?1 AND a.role = o.role AND a.project_id = o.project_id))) "
+        "AND (?2 OR NOT EXISTS (SELECT 1 FROM roadmap_observation_pilots p "
+        "WHERE p.order_id=o.id)) LIMIT 1",
+        (host, host == "k8" and pilot_allowed),
     )
     return bool(rows)
 
 
-async def _claim_first(db: aiosqlite.Connection, host: str) -> dict[str, Any] | None:
+async def _claim_first(
+    db: aiosqlite.Connection,
+    host: str,
+    *,
+    pilot_allowed: bool,
+) -> dict[str, Any] | None:
     candidates = await fetchall(
         db,
         "SELECT o.* FROM role_orders o JOIN role_host_admissions a "
         "ON a.host = ?1 AND a.role = o.role AND a.project_id = o.project_id "
-        "WHERE o.state = 'open' AND (?1 = 'k8' OR NOT EXISTS "
+        "WHERE o.state = 'open' AND (?2 OR NOT EXISTS "
         "(SELECT 1 FROM roadmap_observation_pilots p WHERE p.order_id=o.id)) "
         "ORDER BY o.id LIMIT 50",
-        (host,),
+        (host, host == "k8" and pilot_allowed),
     )
     for order in candidates:
         if not await is_fresh(db, order):
@@ -655,7 +662,11 @@ async def _can_keep_lease(
 
 
 async def lease(
-    db: aiosqlite.Connection, host: str, principal_id: int | None
+    db: aiosqlite.Connection,
+    host: str,
+    principal_id: int | None,
+    *,
+    pilot_allowed: bool = False,
 ) -> dict[str, Any] | None:
     """Выдать хосту заказ: его текущий lease или первый допущенный свежий открытый.
 
@@ -677,6 +688,8 @@ async def lease(
         )
         if len(active) >= ROLE_LEASES_PER_HOST:
             current = active[0]
+            if not await _pilot_access(db, current["id"], host, pilot_allowed):
+                return None
             if current["state"] != "leased":
                 return None  # работа идёт: второй заказ не выдаётся
             if await _can_keep_lease(db, host, current):
@@ -684,7 +697,15 @@ async def lease(
             await _release_to_open(db, int(current["id"]))
             if _is_explicit(current) and not await is_fresh(db, current):
                 await _expire_stale(db, current)
-        return await _claim_first(db, host)
+        return await _claim_first(db, host, pilot_allowed=pilot_allowed)
+
+
+async def _pilot_access(
+    db: aiosqlite.Connection, order_id: int, host: str, allowed: bool
+) -> bool:
+    return (host == "k8" and allowed) or not await fetchall(
+        db, "SELECT 1 FROM roadmap_observation_pilots WHERE order_id=?", (order_id,)
+    )
 
 
 async def _own_or_refuse(
@@ -731,6 +752,8 @@ async def started(
     principal_id: int | None,
     order_id: int,
     lease_id: str,
+    *,
+    pilot_allowed: bool = False,
 ) -> dict[str, Any]:
     """Хост начал работу: leased -> started одним условным UPDATE; повтор - no-op.
 
@@ -744,6 +767,8 @@ async def started(
         current = await _own_or_refuse(
             db, await _order(db, int(order_id)), host, lease_id
         )
+        if not await _pilot_access(db, order_id, host, pilot_allowed):
+            _refuse(404, "role_order_not_found", "такого заказа нет")
         await _check_explicit_freshness(db, current, lease_id)
         cursor = await db.execute(
             "UPDATE role_orders SET state = 'started', started_at = datetime('now') "
@@ -847,6 +872,8 @@ async def report(
     outcome: str,
     note: str,
     roadmap_result: RoadmapResult | None = None,
+    *,
+    pilot_allowed: bool = False,
 ) -> dict[str, Any]:
     """Итог работы: started -> done|failed; одинаковый повтор - no-op, иной - 409.
 
@@ -874,6 +901,8 @@ async def report(
         order = await _own_or_refuse(
             db, await _order(db, int(order_id)), host, lease_id
         )
+        if not await _pilot_access(db, order_id, host, pilot_allowed):
+            _refuse(404, "role_order_not_found", "такого заказа нет")
         if order["state"] in ("done", "failed") and order["report_digest"] == digest:
             return {"id": int(order_id), "outcome": outcome, "repeat": True}
         if roadmap_result is not None and (

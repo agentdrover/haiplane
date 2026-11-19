@@ -320,9 +320,7 @@ async def test_quota_refusal_becomes_terminal_without_a_role_order(
     assert audits[0]["actor_principal_id"] == mandate.steward_id
 
 
-async def test_same_host_with_unrelated_project_scope_is_denied(scenario):
-    world, _, _ = scenario
-    await roadmap_pilot_activation._run(world.db)
+async def _unrelated_host_auth(world):
     await repo.create_project(world.db, slug="unrelated-pilot", name="Unrelated pilot")
     await world.db.commit()
     host = (
@@ -333,9 +331,45 @@ async def test_same_host_with_unrelated_project_scope_is_denied(scenario):
     key = await admin.create_api_key(
         world.db, host["principal_id"], name="unrelated", projects=["unrelated-pilot"]
     )
-    auth = {"Authorization": f"Bearer {key['plaintext_key']}"}
+    return {"Authorization": f"Bearer {key['plaintext_key']}"}
+
+
+async def test_same_host_with_unrelated_project_scope_is_denied(scenario):
+    world, mandate, _ = scenario
+    grant = (await roadmap_pilot_activation._run(world.db))["grant_id"]
+    auth = await _unrelated_host_auth(world)
     for path in ("observations", "effect"):
         denied = await world.client.get(f"{_HOST}/{path}", headers=auth)
         assert denied.status_code == 403
     permitted = await world.client.get(f"{_HOST}/observations", headers=world.k8_auth)
     assert permitted.json()["observation_permitted"] is True
+    assert (await _post_sample(world, grant)).status_code == 200
+    await _move_observation(world, "-61 seconds")
+    assert (await _post_sample(world, grant)).status_code == 200
+    steward = await _auth(world, mandate.steward_id)
+    issued = await world.client.post(
+        f"/api/tasks/{mandate.task_id}/roadmap-requests",
+        headers=steward,
+        json={
+            "grant_id": grant,
+            "plan_id": mandate.task_id,
+            "observation_batch_id": grant,
+            "request_id": "scope",
+            "question": "Which step is allowed?",
+        },
+    )
+    assert issued.status_code == 200
+    order_id = issued.json()["order_id"]
+    await support.admit(world)
+    assert (await support.poll(world, auth=auth)).json()["orders"] == []
+    lease = await support.leased(world)
+    assert (await support.poll(world, auth=auth)).json()["orders"] == []
+    lease_id = lease["lease_id"]
+    assert (
+        await support.started(world, "k8", order_id, lease_id, auth=auth)
+    ).status_code == 404
+    assert (await support.started(world, "k8", order_id, lease_id)).status_code == 200
+    assert (
+        await support.report(world, "k8", order_id, lease_id, auth=auth)
+    ).status_code == 404
+    assert (await support.report(world, "k8", order_id, lease_id)).status_code == 200
