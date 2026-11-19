@@ -222,9 +222,11 @@ def role_order_lines(orders: list[dict[str, Any]]) -> list[str]:
         return []
     lines = [f"Заказы ролей: {len(orders)}"]
     for o in orders[:10]:
+        recovered = o.get("recovery_of")
+        parent = f", восстановление #{recovered}" if recovered is not None else ""
         lines.append(
             f"  заказ #{o['id']}: роль: {o.get('label') or o.get('role')}, "
-            f"{o.get('state')}, задача #{o.get('task_id')}"
+            f"{o.get('state')}, задача #{o.get('task_id')}{parent}"
         )
     if len(orders) > 10:
         lines.append(f"  … и ещё {len(orders) - 10}")

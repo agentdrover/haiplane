@@ -882,12 +882,16 @@ async def report(
 # ---------------------------------------------------------------------------
 
 _VIEW_COLUMNS = (
-    "id, role, state, task_id, host, attempt, outcome, created_at, closed_at"
+    "id, role, state, task_id, host, attempt, outcome, created_at, closed_at, "
+    "(SELECT req.order_id FROM roadmap_recoveries rec JOIN roadmap_requests req "
+    "ON req.id = rec.request_pk WHERE rec.order_id = role_orders.id) AS recovery_of"
 )
 
 
 def _public(row: aiosqlite.Row) -> dict[str, Any]:
     out = {key: row[key] for key in row.keys()}  # noqa: SIM118 - aiosqlite.Row
+    if out["recovery_of"] is None:
+        del out["recovery_of"]
     out["label"] = label_of(str(row["role"]))
     return out
 

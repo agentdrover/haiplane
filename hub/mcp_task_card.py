@@ -114,9 +114,11 @@ def role_order_lines(task: dict[str, Any]) -> list[str]:
         if view.get("unavailable"):
             out.append(f"Role orders: unavailable ({view['unavailable']})")
         else:
+            recovered = view.get("recovery_of")
+            parent = f", восстановление #{recovered}" if recovered is not None else ""
             out.append(
                 f"Role order: вызван {view.get('label') or view.get('role')} "
-                f"(заказ {view.get('id')}, {view.get('state')})"
+                f"(заказ {view.get('id')}, {view.get('state')}{parent})"
             )
     return out
 
