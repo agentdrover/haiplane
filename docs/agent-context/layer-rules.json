@@ -31,6 +31,7 @@
         "hub.cli_worktree_trash",
         "hub.cli_executor_host",
         "hub.cli_agent_outbox",
+        "hub.roadmap_cli",
         "hub.mcp_server",
         "hub.mcp_catalog",
         "hub.mcp_http_compat",
