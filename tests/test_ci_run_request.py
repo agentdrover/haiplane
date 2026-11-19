@@ -2483,21 +2483,25 @@ async def test_a_slow_scan_leaves_time_for_the_requests(
     db: aiosqlite.Connection, cloud: _CloudGit, monkeypatch
 ):
     """Codex P2-3: просмотр кандидатов не съедает бюджет целиком - проход делает работу."""
+    from types import SimpleNamespace
+
     from hub.services import ci_head_run
 
     for i in range(20):
         branch = f"task-35/s{i}"
         cloud.heads[branch] = f"{i + 1:02x}" * 20
         await _cloud_task(db, slug=f"scan{i}", branch=branch)
-    real = repo.resolve_project_for_task
+    resolve = repo.resolve_project_for_task
+    elapsed = 0.0
 
     async def slow(conn, task_id):
-        await asyncio.sleep(0.03)
-        return await real(conn, task_id)
+        nonlocal elapsed
+        elapsed += 3.0  # Полный просмотр 20 кандидатов стоил бы 60 секунд.
+        return await resolve(conn, task_id)
 
+    monkeypatch.setattr(ci_head_run, "time", SimpleNamespace(monotonic=lambda: elapsed))
     monkeypatch.setattr(repo, "resolve_project_for_task", slow)
-    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", 0.5)
-    monkeypatch.setattr(ci_head_run, "MIN_DISPATCH_LEFT_SECONDS", 0.02)
+    monkeypatch.setattr(ci_head_run, "CYCLE_BUDGET_SECONDS", 50.0)
     await _cycle(db)
     assert len(cloud.requests) >= 1, "медленный просмотр не оставил проход без запросов"
 
