@@ -1,13 +1,20 @@
 """REST operations for the explicit roadmap source."""
 
+from typing import Annotated, Literal
+
 from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
-from typing import Annotated, Literal
 
 from hub.auth import current_identity, require_admin
 from hub.config import TokenIdentity
 from hub.executor_host_api import _db
-from hub.services import roadmap_recovery, roadmap_requests, role_orders
+from hub.services import (
+    roadmap_decisions,
+    roadmap_recovery,
+    roadmap_requests,
+    role_orders,
+)
+from hub.services.roadmap_contracts import RoadmapDecisionRequest
 
 router = APIRouter()
 
@@ -138,4 +145,19 @@ async def api_started_question(
     response.headers["Cache-Control"] = "no-store"
     return await roadmap_requests.started_question(
         _db(request), who, order_id, source_key, role_orders.RUN_MAX_MINUTES
+    )
+
+
+@router.post("/api/tasks/{task_id}/roadmap-orders/{order_id}/decision")
+async def api_roadmap_decision(
+    task_id: ResourceId,
+    order_id: ResourceId,
+    body: RoadmapDecisionRequest,
+    request: Request,
+    response: Response,
+    who: TokenIdentity = Depends(current_identity),
+):
+    response.headers["Cache-Control"] = "no-store"
+    return await roadmap_decisions.evaluate(
+        _db(request), who, task_id, body.grant_id, order_id
     )

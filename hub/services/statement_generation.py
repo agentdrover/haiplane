@@ -157,6 +157,23 @@ async def statement_fingerprint(db: aiosqlite.Connection, task_id: int) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+async def approval_statement_evidence(
+    db: aiosqlite.Connection, task: aiosqlite.Row, who: Any
+) -> dict[str, Any]:
+    """Pin exactly what an authenticated owner approved under the write lock."""
+    if (
+        who is None
+        or getattr(who, "auth_source", None) not in ("db_api_key", "db_session")
+        or not who.is_human
+        or who.principal_id is None
+    ):
+        return {}
+    return {
+        "statement_generation": int(task["statement_generation"]),
+        "statement_fingerprint": await statement_fingerprint(db, int(task["id"])),
+    }
+
+
 async def bump_if_the_statement_changed(db: aiosqlite.Connection, task_id: int) -> int:
     """Двинуть поколение постановки, если она действительно изменилась.
 

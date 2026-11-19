@@ -1,4 +1,7 @@
-"""Haiplane Hub MCP server — exposes hub tools for Cursor and remote agents."""
+"""Haiplane Hub MCP server — exposes hub tools for Cursor and remote agents.
+
+Roadmap host reports and grant-bound steward decisions use dedicated REST credentials.
+"""
 
 from __future__ import annotations
 

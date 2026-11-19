@@ -28,6 +28,7 @@ from hub import repository as repo
 from hub.auth import current_identity
 from hub.executor_host_api import _db, _host_caller, _human
 from hub.services import role_orders
+from hub.services.roadmap_contracts import RoadmapResult
 
 router = APIRouter()
 
@@ -46,6 +47,7 @@ class RoleOrderReport(BaseModel):
     lease_id: str = Field(min_length=1, max_length=64)
     outcome: str = Field(max_length=16)
     note: str = Field(default="", max_length=4000)
+    roadmap_result: RoadmapResult | None = None
 
 
 class RoleAdmission(BaseModel):
@@ -133,6 +135,7 @@ async def api_role_order_report(
             body.lease_id,
             body.outcome,
             body.note,
+            body.roadmap_result,
         )
     except role_orders.RoleOrderError as exc:
         raise _as_http(exc) from exc

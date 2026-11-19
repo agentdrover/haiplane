@@ -2589,6 +2589,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_defect_metric_parsers(sub)
     from hub import roadmap_cli
 
+    # Task-scoped roadmap decisions use the dedicated steward credential.
     roadmap_cli.add_parser(sub, _api, _print_json)
     _add_worktree_parser(sub)
     cli_agent_outbox.add_parser(sub, _api)
