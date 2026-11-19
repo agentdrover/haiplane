@@ -4,7 +4,7 @@ import argparse
 import asyncio
 
 from hub import mcp_task_card, repository as repo, roadmap_cli
-from hub.services import role_orders
+from hub.services import prod_state, role_orders
 from tests import test_roadmap_requests as roadmap
 
 scenario = roadmap.scenario
@@ -107,6 +107,36 @@ async def test_concurrent_recovery_preserves_original(scenario):
         ("roadmap_requested", s.grant_body["steward_principal_id"]),
         ("roadmap_recovered", owner["id"]),
     ]
+
+
+async def test_operator_views_identify_the_failed_order(scenario):
+    s = scenario
+    first, _, evidence = await _failed(s)
+    response = await _recover(s, first, evidence)
+    assert response.status_code == 200, response.text
+    recovered = response.json()["order_id"]
+    link = f"восстановление #{first}"
+
+    text = prod_state.format_prod_state(
+        {"role_orders": await role_orders.prod_view(s.world.db)}
+    )
+    recovered_line = next(
+        line for line in text.splitlines() if f"заказ #{recovered}:" in line
+    )
+    failed_line = next(line for line in text.splitlines() if f"заказ #{first}:" in line)
+    assert link in recovered_line
+    assert "failed" in failed_line and link not in failed_line
+
+    page = await s.world.client.get(f"/tasks/{s.task_id}", headers=s.owner)
+    assert page.status_code == 200
+    recovered_row = page.text.split(f'data-role-order="{recovered}">', 1)[1].split(
+        "</dd>", 1
+    )[0]
+    failed_row = page.text.split(f'data-role-order="{first}">', 1)[1].split("</dd>", 1)[
+        0
+    ]
+    assert link in recovered_row
+    assert "failed" in failed_row and link not in failed_row
 
 
 async def test_initial_request_remains_idempotent(scenario):
