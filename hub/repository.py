@@ -923,7 +923,7 @@ async def first_fix_deploy_at(
 
 
 async def pipeline_merge_recorded(
-    db: aiosqlite.Connection, task_id: int, pr_number: int
+    db: aiosqlite.Connection, task_id: int, pr_number: int, *, gate_only: bool = False
 ) -> bool:
     """Was this task's PR already delivered by the pipeline (#605)?
 
@@ -933,13 +933,16 @@ async def pipeline_merge_recorded(
     """
     rows = await fetchall(
         db,
-        "SELECT 1 FROM pipeline_merges WHERE task_id = ? AND pr_number = ? LIMIT 1",
-        (task_id, int(pr_number)),
+        "SELECT 1 FROM pipeline_merges WHERE task_id = ? AND pr_number = ? "
+        "AND (? = 0 OR reconciliation = '') LIMIT 1",
+        (task_id, int(pr_number), gate_only),
     )
     return bool(rows)
 
 
-async def known_pipeline_shas(db: aiosqlite.Connection, project_id: int) -> set[str]:
+async def known_pipeline_shas(
+    db: aiosqlite.Connection, project_id: int, *, gate_only: bool = False
+) -> set[str]:
     """Merge commits this project's pipeline produced.
 
     Scoped to the project on purpose. An earlier version also pulled in rows
@@ -949,8 +952,9 @@ async def known_pipeline_shas(db: aiosqlite.Connection, project_id: int) -> set[
     rows = await fetchall(
         db,
         "SELECT merge_sha FROM pipeline_merges "
-        "WHERE project_id = ? AND COALESCE(merge_sha, '') != ''",
-        (project_id,),
+        "WHERE project_id = ? AND COALESCE(merge_sha, '') != '' "
+        "AND (? = 0 OR reconciliation = '')",
+        (project_id, gate_only),
     )
     return {dict(r)["merge_sha"] for r in rows}
 
@@ -5946,6 +5950,17 @@ async def list_live_checks(
             (task_id, min(limit, 200)),
         )
     )
+
+
+async def last_merge_origin(db: aiosqlite.Connection, task_id: int) -> str:
+    """The provenance of the same recorded merge used by merge_sha_for_task."""
+    rows = await fetchall(
+        db,
+        "SELECT reconciliation FROM pipeline_merges WHERE task_id = ? "
+        "AND COALESCE(merge_sha, '') != '' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    return ("outside_gate" if rows[0]["reconciliation"] else "gate") if rows else ""
 
 
 async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:

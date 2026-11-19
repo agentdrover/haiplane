@@ -4208,8 +4208,14 @@ async def approval_stands(db: aiosqlite.Connection, task: dict[str, Any]) -> boo
     у остальных нужен APPROVED на текущей сдаче, не закрытый решением человека
     (#1286). Снимок вызывающего не читается вовсе: его возраст и есть дефект.
     """
+    from hub.services import merged_delivery
+
     row = await repo.get_task(db, int(task["id"]))
-    return row is not None and _approval_holds(dict(row), task)
+    return (
+        row is not None
+        and _approval_holds(dict(row), task)
+        and await merged_delivery.completion_stands(db, dict(row), task)
+    )
 
 
 async def _merge_approval_row(
@@ -4493,7 +4499,7 @@ async def _merged_by_gate(
 ) -> GateTrace:
     """Влит ли MERGED-PR гейтом — по его собственным следам (#1398)."""
     task_id = task["id"]
-    if await repo.pipeline_merge_recorded(db, task_id, pr_num):
+    if await repo.pipeline_merge_recorded(db, task_id, pr_num, gate_only=True):
         return GateTrace.GATE
     seen = await _gate_merge_outcome((task_id, pr_num))
     if seen is GateMergeSeen.MERGED:
@@ -4518,7 +4524,7 @@ async def _merged_by_gate(
     # пуст по определению (known_pipeline_shas намеренно не берёт строки с
     # NULL project_id, #534). Мерж самой задачи уже поймал
     # pipeline_merge_recorded выше.
-    if proj and sha in await repo.known_pipeline_shas(db, dict(proj)["id"]):
+    if proj and sha in await repo.known_pipeline_shas(db, proj["id"], gate_only=True):
         return GateTrace.GATE
     return GateTrace.NOT_GATE
 
@@ -4798,6 +4804,21 @@ async def _record_branch_update(
     )
 
 
+async def _existing_delivery(
+    db: aiosqlite.Connection, task: dict[str, Any], pr_num: int
+) -> tuple[bool, str] | None:
+    from hub.services import merged_delivery
+
+    task_id = int(task["id"])
+    if await repo.pipeline_merge_recorded(db, task_id, pr_num, gate_only=True):
+        return True, "already delivered"
+    ctx = await project_git_context(db, task_id)
+    if (task_id, pr_num) in _gate_merges or ctx.get("forge") != "github":
+        return None
+    state, _ = await _recorded_pr_state(db, task, pr_num, ctx=ctx)
+    return await merged_delivery.reconcile(db, task, ctx, state=state)
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -4829,8 +4850,9 @@ async def merge_before_completion(
         # safety: GitHub refuses the second merge and the refusal would flip
         # a DELIVERED task into needs_decision (#363's exactly-once guard
         # caught precisely this).
-        if await repo.pipeline_merge_recorded(db, task_id, pr_num):
-            return True, "already delivered"
+        decision = await _existing_delivery(db, task, int(pr_num))
+        if decision is not None:
+            return decision
 
         # #612: does the branch still stand where the reviewer approved it? #572
         # closed "push, then approve"; "approve, THEN push" left the verdict current
@@ -4954,7 +4976,11 @@ class DeliveryPR:
 
 
 async def _recorded_pr_state(
-    db: aiosqlite.Connection, task: dict[str, Any], pr_number: int
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    pr_number: int,
+    *,
+    ctx: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Where the recorded PR stands, and a cause when it cannot be asked (#802).
 
@@ -4963,7 +4989,8 @@ async def _recorded_pr_state(
     verdict is the mistake #725 catalogued.
     """
     try:
-        ctx = await project_git_context(db, task["id"])
+        if ctx is None:
+            ctx = await project_git_context(db, task["id"])
         state = await plugins.git_ops.pr_state(
             pr_number,
             repo=ctx.get("repo"),

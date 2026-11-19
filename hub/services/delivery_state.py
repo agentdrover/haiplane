@@ -761,6 +761,13 @@ async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
     if blocker.get("delivered"):
         # Мерж гейта — бесплатный ответ; у задачи-состояния мержей не бывает
         # (pipeline_merges для неё не создаются), так что сюда она не попадает.
+        origin = await repo.last_merge_origin(db, blocker["task_id"])
+        if origin == "outside_gate":
+            return {
+                **blocker,
+                "delivery_path": origin,
+                "reason": "хаб подтвердил мерж вне гейта по GitHub и точному CI",
+            }
         return {**blocker, "delivery_path": "gate"}
     row = await repo.get_task(db, blocker["task_id"])
     task = dict(row) if row is not None else {}
@@ -879,7 +886,15 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
     pr_raw = task.get("pr_number")
     pr_number = int(pr_raw) if pr_raw is not None else None
 
-    if await repo.merge_sha_for_task(db, task_id):
+    origin = await repo.last_merge_origin(db, task_id)
+    if origin == "outside_gate":
+        return _task_answer(
+            DELIVERED,
+            "хаб подтвердил мерж вне гейта по GitHub и точному CI",
+            pr_number=pr_number,
+            delivery_path=origin,
+        )
+    if origin == "gate":
         return _task_answer(
             DELIVERED,
             "хаб смержил эту задачу сам — работа в базовой ветке",
