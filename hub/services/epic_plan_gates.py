@@ -176,14 +176,12 @@ async def note_review_blocker(
             or live["submission_sha"] != sha
         ):
             return
-        exists = await _one(
-            db,
-            """SELECT 1 FROM events WHERE task_id=? AND kind='epic_plan_review_blocked'
-               AND json_extract(payload,'$.generation')=? AND json_extract(payload,'$.sha')=?
-               AND json_extract(payload,'$.reason')=? LIMIT 1""",
+        marker = await db.execute(
+            """INSERT OR IGNORE INTO epic_plan_review_notice_keys
+               (task_id,generation,sha,reason) VALUES (?,?,?,?)""",
             (task_id, generation, sha, blocker.reason),
         )
-        if exists:
+        if marker.rowcount != 1:
             return
         await repo.insert_event(
             db,
