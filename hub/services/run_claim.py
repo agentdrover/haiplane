@@ -16,14 +16,16 @@ changes_requested и вторым проходом reaper'а. Он работа�
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Literal
 
 import aiosqlite
 
 from hub import repository as repo
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
 from hub.services import memory_wait
 from hub.services.return_running import work_signs
 
@@ -330,6 +332,111 @@ async def release_run_claim(
         },
     )
     return True
+
+
+def _claim_fingerprint(task: Any) -> str:
+    # Do not put the raw nonce or the session ID in the events feed.
+    fields = (
+        "claimed_by",
+        "claim_session_id",
+        "claimed_at",
+        "claim_nonce",
+        "executor_run_id",
+    )
+    return hashlib.sha256(
+        json.dumps([task[field] for field in fields]).encode()
+    ).hexdigest()
+
+
+async def _try_answer_reopen(
+    db: aiosqlite.Connection, task_id: int, *, answer_id: int, claim: str
+) -> Literal["stale", "blocked", "opened"]:
+    """Evaluate and act on one intent under the caller's write transaction."""
+    current = await repo.get_task(db, task_id)
+    if current is None or current["status"] != "needs_info" or current["archived"]:
+        return "stale"
+    if _claim_fingerprint(current) != claim:
+        return "stale"
+    # Only the canonical question/answer routes write Hub-authored Q&A.
+    # A note with a caller-controlled kind does not supersede this answer.
+    latest = await fetchall(
+        db,
+        "SELECT id, kind FROM task_updates WHERE task_id=? AND author_kind='hub' "
+        "AND kind IN ('question','answer') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    if not latest or latest[0]["id"] != answer_id or latest[0]["kind"] != "answer":
+        return "stale"
+    run_id = current["executor_run_id"]
+    if run_id is not None and not await release_run_claim(
+        db,
+        task_id,
+        run_id=run_id,
+        statuses=("needs_info",),
+        note="Захват завершённого исполнителя снят при ответе без продолжения.",
+        reason="answer_without_resume",
+    ):
+        return "blocked"
+    await repo.transition_status_if(
+        db, task_id, expected_from="needs_info", new_status="open"
+    )
+    return "opened"
+
+
+async def reopen_after_answer(
+    db: aiosqlite.Connection, answered: dict[str, Any], *, answer_id: int
+) -> bool:
+    """Keep a blocked answer pending until the reaper can release its claim."""
+    task_id = int(answered["id"])
+    claim = _claim_fingerprint(answered)
+    async with write_transaction(db):
+        outcome = await _try_answer_reopen(
+            db, task_id, answer_id=answer_id, claim=claim
+        )
+        if outcome == "blocked":
+            await db.execute(
+                "INSERT INTO executor_answer_reopens "
+                "(task_id, answer_update_id, claim_fingerprint) VALUES (?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET "
+                "answer_update_id=excluded.answer_update_id, "
+                "claim_fingerprint=excluded.claim_fingerprint",
+                (task_id, answer_id, claim),
+            )
+        return outcome == "opened"
+
+
+async def _retry_answer_reopen(db: aiosqlite.Connection, task_id: int) -> None:
+    async with write_transaction(db):
+        pending = await fetchall(
+            db,
+            "SELECT answer_update_id, claim_fingerprint "
+            "FROM executor_answer_reopens WHERE task_id=?",
+            (task_id,),
+        )
+        if not pending:
+            return
+        intent = pending[0]
+        outcome = await _try_answer_reopen(
+            db,
+            task_id,
+            answer_id=int(intent["answer_update_id"]),
+            claim=str(intent["claim_fingerprint"]),
+        )
+        if outcome != "blocked":
+            await db.execute(
+                "DELETE FROM executor_answer_reopens WHERE task_id=?", (task_id,)
+            )
+
+
+async def retry_answer_reopens(db: aiosqlite.Connection) -> None:
+    """Settle current fallback answers after the run and its sessions end."""
+    rows = await fetchall(db, "SELECT task_id FROM executor_answer_reopens")
+    for row in rows:
+        task_id = int(row["task_id"])
+        try:
+            await _retry_answer_reopen(db, task_id)
+        except Exception:  # noqa: BLE001 - a broken intent must not stall unrelated tasks
+            log.exception("Answer reopen failed for task #%d", task_id)
 
 
 async def release_after_run_closed(

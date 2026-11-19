@@ -1718,12 +1718,15 @@ async def _sweep_executor_orders(db) -> None:
     # #1712: заказ хосту, чей код не выкуплен к сроку, чья сессия умерла или
     # чья задача сдана, закрывается с сожжением непотраченного кода — слот
     # свободен без человека. Гонка с выкупом кода решается условным UPDATE.
+    from hub.services.run_claim import retry_answer_reopens
+
     try:
         from hub.services.executor_orders import sweep_executor_orders
 
         await sweep_executor_orders(db)
     except Exception:  # noqa: BLE001 - the sweep must not kill the loop
         log.exception("executor order sweep failed")
+    await retry_answer_reopens(db)
 
 
 async def _sweep_epic_plan(db) -> None:
