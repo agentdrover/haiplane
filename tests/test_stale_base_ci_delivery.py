@@ -83,13 +83,19 @@ async def _deliver(rig, entry):
     return await rig.feed()
 
 
-def _behind():
-    # The baseline predates the additional compare identity fields.
-    if not hasattr(BaseFreshness, "base_sha"):
-        return BaseFreshness(BaseFreshnessState.behind, APPROVED, 2)
-    return BaseFreshness(
-        BaseFreshnessState.behind, APPROVED, 2, base_ref="develop", base_sha=LIVE_BASE
+def _fresh(rig, sha, *, behind=False):
+    state = BaseFreshnessState.behind if behind else BaseFreshnessState.current
+    identity = (
+        {"base_ref": "develop", "base_sha": LIVE_BASE, "head_ref": rig.delivery_branch}
+        if hasattr(BaseFreshness, "head_ref")
+        else {}
     )
+    return BaseFreshness(state, sha, 2 if behind else 0, **identity)
+
+
+def _move_head(rig, sha):
+    rig.head_moved_to(sha)
+    rig.git.pr_base_freshness.return_value = _fresh(rig, sha)
 
 
 async def _rig(db, monkeypatch):
@@ -98,8 +104,11 @@ async def _rig(db, monkeypatch):
     monkeypatch.setattr(
         delivery_ci, "_project_fingerprint", AsyncMock(return_value="fp")
     )
-    rig.ci(moved_base_probe((await rig.task())["branch"]))
-    rig.git.pr_base_freshness = AsyncMock(return_value=_behind())
+    rig.delivery_branch = (await rig.task())["branch"]
+    rig.ci(moved_base_probe(rig.delivery_branch))
+    rig.git.pr_base_freshness = AsyncMock(
+        return_value=_fresh(rig, APPROVED, behind=True)
+    )
     rig.git.request_ci_run = AsyncMock()
     rig.git.mark_pr_ready = AsyncMock()
     return rig
@@ -152,7 +161,7 @@ async def test_ambiguous_or_ineligible_base_recovery_fails_closed(
     db, monkeypatch, block, expected
 ):
     rig = await _rig(db, monkeypatch)
-    observed = _behind()
+    observed = _fresh(rig, APPROVED, behind=True)
     if block == "no_proof":
         rig.ci(
             CIProbeResult(
@@ -229,7 +238,7 @@ async def test_delivery_requires_fresh_green_after_base_update(
     assert (await rig.retry_row())["attempts"] == 0
     rig.git.merge_pr.assert_not_awaited()
 
-    rig.head_moved_to(TIP)
+    _move_head(rig, TIP)
     rig.ci(PENDING)
     await scan_completed_deliveries(db)
     assert (await rig.retry_row())["attempts"] == 0
@@ -237,7 +246,7 @@ async def test_delivery_requires_fresh_green_after_base_update(
 
     # A green result for the old head, and a legacy green without commit
     # evidence, both leave the retry armed on the new head.
-    for result in (PASSED, _green_on(APPROVED)):
+    for result in (PASSED, _green_on(rig, APPROVED)):
         rig.ci(result)
         await scan_completed_deliveries(db)
         assert (await rig.retry_row())["attempts"] == 0
@@ -249,10 +258,10 @@ async def test_delivery_requires_fresh_green_after_base_update(
             return "@@ -1,0 +2 @@\n+" + sha + "\n"
 
         rig.git.branch_diff.side_effect = changed_diff
-    rig.ci(_green_on(TIP))
+    rig.ci(_green_on(rig, TIP))
     await scan_completed_deliveries(db)
     await scan_completed_deliveries(db)
-    assert rig.git.check_pr_ci.await_args.kwargs["exact_head"] == TIP
+    assert rig.git.check_pr_ci.await_args.kwargs["target"] == _target(rig, TIP)
 
     if author_changed:
         rig.git.merge_pr.assert_not_awaited()
@@ -325,7 +334,13 @@ async def test_equivalence_exposes_base_change_only_after_other_ci_evidence_pass
 async def test_github_freshness_reports_compared_base_not_merge_base(monkeypatch):
     replies = AsyncMock(
         side_effect=[
-            (0, json.dumps({"baseRefName": "main", "headRefOid": HEAD}), ""),
+            (
+                0,
+                json.dumps(
+                    {"baseRefName": "main", "headRefName": HEAD_REF, "headRefOid": HEAD}
+                ),
+                "",
+            ),
             (0, json.dumps({"behind_by": 2, "base_sha": LIVE_BASE}), ""),
         ]
     )
@@ -336,16 +351,25 @@ async def test_github_freshness_reports_compared_base_not_merge_base(monkeypatch
     assert observed.state is BaseFreshnessState.behind
     assert observed.head_sha == HEAD
     assert getattr(observed, "base_ref", None) == "main"
+    assert getattr(observed, "head_ref", None) == HEAD_REF
     assert getattr(observed, "base_sha", None) == LIVE_BASE
     replies.assert_awaited()
     assert replies.await_args.args[1] == f"repos/{REPO}/compare/main...{HEAD}"
     assert ".base_commit.sha" in replies.await_args.args[3]
 
 
-def _green_on(sha):
-    if not hasattr(CIProbeResult, "head_sha"):
+def _target(rig, sha):
+    return protocols.CIPrTarget(sha, rig.delivery_branch, "develop")
+
+
+def _bound(result, target):
+    return replace(result, target=target)
+
+
+def _green_on(rig, sha):
+    if not hasattr(protocols, "CIPrTarget"):
         return PASSED
-    return replace(PASSED, head_sha=sha)
+    return _bound(PASSED, _target(rig, sha))
 
 
 @pytest.mark.parametrize(
@@ -355,6 +379,9 @@ def _green_on(sha):
         (HEAD, "absent", CIProbeOutcome.pending),
         (HEAD, "pending", CIProbeOutcome.pending),
         (HEAD, "failed", CIProbeOutcome.failed),
+        (HEAD, "wrong_red_sha", CIProbeOutcome.unavailable),
+        (HEAD, "late_head", CIProbeOutcome.unavailable),
+        (HEAD, "retargeted", CIProbeOutcome.unavailable),
         ("5" * 40, "green", CIProbeOutcome.unavailable),
     ],
 )
@@ -368,22 +395,31 @@ async def test_scoped_exact_probe_never_uses_unbound_legacy_checks(
     run.update(event="pull_request", pull_requests=[{"number": 229}])
     if state == "pending":
         run.update(status="in_progress", conclusion=None)
-    elif state == "failed":
+    elif state in ("failed", "wrong_red_sha", "late_head"):
         run["conclusion"] = "failure"
+        if state == "wrong_red_sha":
+            run["head_sha"] = "5" * 40
+        elif state == "late_head":
+            e.switch_head = True
+    elif state == "retargeted":
+        e.pr["base"]["ref"] = "release-pilot"
     e.runs = [] if state == "absent" else [run]
     e.checks = [e._as_check(run, job) for job in e.jobs[NEW]]
     forge = GitHubForge()
     monkeypatch.setattr(forge, "_api_json", e.api)
     primary = AsyncMock(return_value=(0, '[{"name":"tests","state":"SUCCESS"}]', ""))
     monkeypatch.setattr("hub.integrations.forge.github._gh", primary)
-    exact = {"exact_head": head} if hasattr(CIProbeResult, "head_sha") else {}
+    target_type = getattr(protocols, "CIPrTarget", None)
+    target = target_type(head, HEAD_REF, "main") if target_type else None
+    exact = {"target": target} if target is not None else {}
     result = await forge.check_pr_ci(
         229, gh_repo=REPO, contract_fingerprint=PILOT_CONTRACT, **exact
     )
 
     assert result.outcome is expected
-    if expected is CIProbeOutcome.passed:
-        assert getattr(result, "head_sha", "") == head
+    if expected in (CIProbeOutcome.passed, CIProbeOutcome.failed):
+        assert target is not None and result.target == target
+        assert e.pr_reads >= 2
     primary.assert_not_awaited()
 
 
@@ -432,7 +468,7 @@ async def test_lost_update_response_never_arms_or_updates_another_head(db, monke
 
     async def update(pr, expected_head, **kwargs):
         assert expected_head == APPROVED
-        rig.head_moved_to(TIP)
+        _move_head(rig, TIP)
         return BranchUpdateOutcome.unavailable, "connection lost after send"
 
     rig.git.update_pr_branch.side_effect = update
@@ -447,9 +483,20 @@ async def test_lost_update_response_never_arms_or_updates_another_head(db, monke
 async def test_genuine_red_on_updated_head_keeps_existing_stop_policy(db, monkeypatch):
     rig = await _rig(db, monkeypatch)
     assert (await _deliver(rig, "registry")).startswith("base_updated")
-    rig.head_moved_to(TIP)
+    _move_head(rig, TIP)
     rig.ci(FAILED)
+    await scan_completed_deliveries(db)
+    assert (await rig.retry_row())["attempts"] == 0, "unbound red cannot stop the retry"
+    assert (await rig.retry_row())["state"] == "armed"
 
+    rig.ci(_bound(FAILED, _target(rig, APPROVED)))
+    await scan_completed_deliveries(db)
+    assert (await rig.retry_row())["attempts"] == 0, (
+        "old head's red cannot stop the retry"
+    )
+    assert (await rig.retry_row())["state"] == "armed"
+
+    rig.ci(_bound(FAILED, _target(rig, TIP)))
     await scan_completed_deliveries(db)
 
     saved = await rig.retry_row()
@@ -457,3 +504,42 @@ async def test_genuine_red_on_updated_head_keeps_existing_stop_policy(db, monkey
     rig.git.merge_pr.assert_not_awaited()
     rig.git.request_ci_run.assert_not_awaited()
     assert rig.posts == 0
+
+
+@pytest.mark.parametrize("phase", ["after_ci", "before_merge"])
+async def test_retarget_at_same_commit_never_merges_recovered_pr(
+    db, monkeypatch, phase
+):
+    rig = await _rig(db, monkeypatch)
+    assert (await _deliver(rig, "registry")).startswith("base_updated")
+    _move_head(rig, TIP)
+    rig.ci(_green_on(rig, TIP))
+    expected = _fresh(rig, TIP)
+    retargeted = replace(expected, base_ref="release-pilot")
+    observations = [expected, retargeted] if phase == "before_merge" else [retargeted]
+    rig.git.pr_base_freshness.side_effect = observations
+
+    await scan_completed_deliveries(db)
+
+    assert (await rig.retry_row())["state"] == "armed"
+    assert rig.git.pr_base_freshness.await_count == len(observations)
+    rig.git.merge_pr.assert_not_awaited()
+    rig.git.update_pr_branch.assert_awaited_once()
+
+
+async def test_head_moved_after_exact_green_never_updates_the_unchecked_head(
+    db, monkeypatch
+):
+    rig = await _rig(db, monkeypatch)
+    assert (await _deliver(rig, "registry")).startswith("base_updated")
+    _move_head(rig, TIP)
+    rig.ci(_green_on(rig, TIP))
+    rig.git.pr_base_freshness.return_value = _fresh(rig, "foreign-push", behind=True)
+
+    await scan_completed_deliveries(db)
+
+    assert (await rig.retry_row())["state"] == "armed"
+    rig.git.pr_base_freshness.assert_awaited_once()
+    rig.git.merge_pr.assert_not_awaited()
+    rig.git.update_pr_branch.assert_awaited_once()
+    assert rig.git.update_pr_branch.await_args.args == (77, APPROVED)

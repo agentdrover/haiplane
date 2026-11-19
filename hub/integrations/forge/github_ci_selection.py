@@ -10,7 +10,12 @@ from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import quote
 
-from hub.integrations.protocols import CIBaseChange, CIProbeOutcome, CIProbeResult
+from hub.integrations.protocols import (
+    CIBaseChange,
+    CIPrTarget,
+    CIProbeOutcome,
+    CIProbeResult,
+)
 
 PILOT_REPO = "agentdrover/home-infra"
 # Public fingerprint of the Hub CI configuration, followed by public Git blob IDs.
@@ -616,7 +621,7 @@ async def _profile_result(
 
 
 async def equivalent_probe(
-    get: Get, pr: int, contract_fingerprint: str, *, exact_head: str = ""
+    get: Get, pr: int, contract_fingerprint: str, *, target: CIPrTarget | None = None
 ) -> CIProbeResult | None:
     """Return None when ordinary PR checks should decide outside #2393 recovery."""
     api = f"repos/{PILOT_REPO}"
@@ -646,7 +651,7 @@ async def equivalent_probe(
                 api,
                 pr,
                 contract_fingerprint,
-                exact_head=exact_head,
+                target=target,
             )
     except TimeoutError:
         endpoints = ", ".join(sorted(interrupted))
@@ -670,17 +675,36 @@ async def equivalent_probe(
 
 
 async def _equivalent(
-    get: Get, api: str, pr: int, contract_fingerprint: str, *, exact_head: str = ""
+    get: Get,
+    api: str,
+    pr: int,
+    contract_fingerprint: str,
+    *,
+    target: CIPrTarget | None = None,
 ) -> CIProbeResult | None:
     pull_path = f"{api}/pulls/{pr}"
     ref, sha, base_ref, base = refs = pr_refs(await read(get, pull_path))
-    if exact_head and sha != exact_head:
-        raise Unverified("CI probe did not observe the delivery head")
+    _validate_target(target, refs, contract_fingerprint)
     run_path = f"{api}/actions/runs?head_sha={sha}"
     runs = await pages(get, run_path, "workflow_runs")
-    selection = _select(runs, ref, sha, pr, require_exact=bool(exact_head))
-    if selection is None or isinstance(selection, CIProbeResult):
-        return selection
+    if target is not None and any(not _belongs_to_head(run, sha) for run in runs):
+        raise Unverified("CI run belongs to a different repository or head")
+
+    async def bind_failure(
+        result: CIProbeResult, snapshot: tuple[list[Facts], list[Facts]] | None = None
+    ) -> CIProbeResult:
+        if target is None or result.outcome is not CIProbeOutcome.failed:
+            return result
+        if snapshot is not None and snapshot != await _commit_ci(get, api, sha):
+            raise Unverified("independent checks or statuses changed during the probe")
+        await _recheck(get, pull_path, run_path, refs, runs)
+        return replace(result, target=target)
+
+    selection = _select(runs, ref, sha, pr, require_exact=target is not None)
+    if selection is None:
+        return None
+    if isinstance(selection, CIProbeResult):
+        return await bind_failure(selection)
     if contract_fingerprint != PILOT_CONTRACT:
         raise Unverified("project CI contract is outside the audited dispatch profile")
     ordinary = isinstance(selection, dict)
@@ -692,11 +716,13 @@ async def _equivalent(
         _read_histories(get, api, audited),
     )
     checks, statuses = snapshot
+    if target is not None:
+        _validate_commit_identity(checks, statuses, sha)
     bound = CheckSnapshot(checks)
     for run in audited:
         optional = ordinary and run.get("event") == "workflow_dispatch"
         if blocked := bound.normalize(run, histories[run["id"]], optional=optional):
-            return blocked
+            return await bind_failure(blocked, snapshot)
     result = await _profile_result(
         get,
         api,
@@ -706,15 +732,12 @@ async def _equivalent(
         collector=WORKFLOW_BLOBS[policy.head_workflow],
     )
     if blocked := _independent(list(bound.by_id.values()), statuses):
-        return blocked
+        return await bind_failure(blocked, snapshot)
     await _recheck(get, pull_path, run_path, refs, runs)
     fresh_policy, fresh_snapshot = await asyncio.gather(
         policy_proof(get, api, sha, base, base_ref), _commit_ci(get, api, sha)
     )
-    if policy != fresh_policy:
-        raise Unverified("workflow version changed during the probe")
-    if snapshot != fresh_snapshot:
-        raise Unverified("independent checks or statuses changed during the probe")
+    _validate_stable_evidence(policy, fresh_policy, snapshot, fresh_snapshot)
     if policy.current_base_sha != base:
         # The old proof cannot authorize delivery. Carry the observation only
         # after the checks and histories otherwise proved the exact PR head.
@@ -726,7 +749,48 @@ async def _equivalent(
                 pr, ref, sha, base_ref, base, policy.current_base_sha
             ),
         )
-    return replace(result, head_sha=sha) if exact_head else result
+    return replace(result, target=target) if target is not None else result
+
+
+def _validate_target(
+    expected: CIPrTarget | None, refs: tuple[str, str, str, str], fingerprint: str
+) -> None:
+    if expected is None:
+        return
+    head_ref, head_sha, base_ref, _ = refs
+    if CIPrTarget(head_sha, head_ref, base_ref) != expected:
+        raise Unverified("CI probe did not observe the delivery refs")
+    if fingerprint != PILOT_CONTRACT:
+        raise Unverified("project CI contract is outside the audited dispatch profile")
+
+
+def _validate_stable_evidence(
+    policy: BranchPolicyProof,
+    fresh_policy: BranchPolicyProof,
+    snapshot: tuple[list[Facts], list[Facts]],
+    fresh_snapshot: tuple[list[Facts], list[Facts]],
+) -> None:
+    if policy != fresh_policy:
+        raise Unverified("workflow version changed during the probe")
+    if snapshot != fresh_snapshot:
+        raise Unverified("independent checks or statuses changed during the probe")
+
+
+def _validate_commit_identity(
+    checks: list[Facts], statuses: list[Facts], sha: str
+) -> None:
+    if any(check.get("head_sha") != sha for check in checks):
+        raise Unverified("check belongs to a different CI head")
+    if any(status.get("sha", sha) != sha for status in statuses):
+        raise Unverified("status belongs to a different CI head")
+
+
+def _belongs_to_head(run: Facts, sha: str) -> bool:
+    return (
+        run.get("head_sha") == sha
+        and _repo_name(run.get("repository")) == PILOT_REPO
+        and _repo_name(run.get("head_repository")) == PILOT_REPO
+    )
 
 
 def _blocking_run(runs: list[Facts]) -> CIProbeResult | None:

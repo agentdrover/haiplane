@@ -102,6 +102,15 @@ class CIBaseChange:
 
 
 @dataclass(frozen=True)
+class CIPrTarget:
+    """The exact comparison checked by the scoped delivery CI probe."""
+
+    head_sha: str
+    head_ref: str
+    base_ref: str
+
+
+@dataclass(frozen=True)
 class CIProbeResult:
     """A CI probe outcome plus a stable, machine-usable reason (#419)."""
 
@@ -109,7 +118,7 @@ class CIProbeResult:
     reason: str
     details: str | None = None
     base_change: CIBaseChange | None = None
-    head_sha: str = ""
+    target: CIPrTarget | None = None
 
 
 class CIRunRequestOutcome(str, Enum):
@@ -174,6 +183,7 @@ class BaseFreshness:
     reason: str = ""
     base_ref: str = ""
     base_sha: str = ""
+    head_ref: str = ""
 
 
 class BranchUpdateOutcome(str, Enum):
@@ -602,7 +612,7 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
         contract_fingerprint: str = "",
-        exact_head: str = "",
+        target: CIPrTarget | None = None,
     ) -> CIProbeResult: ...
     # #1914: ``on_send`` ОБЯЗАТЕЛЕН для любой реализации с отправкой (POST):
     # вызвать его ровно перед ней. Всё до вызова - отказ, не тратящий попытку.
@@ -1027,7 +1037,7 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         contract_fingerprint: str = "",
-        exact_head: str = "",
+        target: CIPrTarget | None = None,
     ) -> CIProbeResult: ...
     # #1197: породить прогон на УЖЕ существующем коммите. Форж умеет это
     # по-разному или не умеет вовсе, поэтому ответ типизирован, а не булев:

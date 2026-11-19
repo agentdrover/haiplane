@@ -34,6 +34,7 @@ from hub.integrations.protocols import (
     BaseFreshness,
     BaseFreshnessState,
     BranchUpdateOutcome,
+    CIPrTarget,
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
@@ -866,7 +867,7 @@ class GitVerseForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         contract_fingerprint: str = "",
-        exact_head: str = "",
+        target: CIPrTarget | None = None,
     ) -> CIProbeResult:
         """Исход CI для головы этого PR.
 
@@ -875,7 +876,7 @@ class GitVerseForge:
         Ветка PR берётся у самого PR, потому что ветвь запроса могла
         разойтись с тем, что думает вызывающий.
         """
-        if exact_head:
+        if target is not None:
             return CIProbeResult(
                 CIProbeOutcome.unavailable, "ci_exact_head_unsupported"
             )

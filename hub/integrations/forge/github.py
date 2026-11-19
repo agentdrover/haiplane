@@ -26,6 +26,7 @@ from hub.integrations.protocols import (
     BaseFreshness,
     BaseFreshnessState,
     BranchUpdateOutcome,
+    CIPrTarget,
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
@@ -497,7 +498,7 @@ class GitHubForge:
             "--repo",
             slug,
             "--json",
-            "baseRefName,headRefOid",
+            "baseRefName,headRefName,headRefOid",
             repo=repo,
             check=False,
         )
@@ -541,6 +542,7 @@ class GitHubForge:
             reason=f"база {base}",
             base_ref=base,
             base_sha=base_sha if isinstance(base_sha, str) else "",
+            head_ref=str(data.get("headRefName") or ""),
         )
 
     async def update_pr_branch(
@@ -1076,7 +1078,7 @@ class GitHubForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         contract_fingerprint: str = "",
-        exact_head: str = "",
+        target: CIPrTarget | None = None,
     ) -> CIProbeResult:
         if (gh_repo or REPO_NAME).lower() == github_ci_selection.PILOT_REPO:
 
@@ -1087,11 +1089,11 @@ class GitHubForge:
                 fetch_ci_evidence,
                 pr_number,
                 contract_fingerprint,
-                exact_head=exact_head,
+                target=target,
             )
             if result is not None:
                 return result
-        if exact_head:
+        if target is not None:
             return CIProbeResult(CIProbeOutcome.unavailable, "ci_exact_head_unproved")
         return await self._legacy_pr_ci(pr_number, repo=repo, gh_repo=gh_repo)
 
