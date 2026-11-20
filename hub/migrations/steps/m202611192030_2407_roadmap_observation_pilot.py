@@ -3,7 +3,7 @@
 MIGRATIONS = [
     (
         "create_roadmap_observation_pilots",
-        """CREATE TABLE roadmap_observation_pilots (
+        """CREATE TABLE IF NOT EXISTS roadmap_observation_pilots (
             approval_id INTEGER PRIMARY KEY,
             grant_id INTEGER NOT NULL UNIQUE REFERENCES roadmap_grants(id),
             activated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -22,7 +22,7 @@ MIGRATIONS = [
     ),
     (
         "create_roadmap_pilot_observations",
-        """CREATE TABLE roadmap_pilot_observations (
+        """CREATE TABLE IF NOT EXISTS roadmap_pilot_observations (
             pilot_id INTEGER NOT NULL REFERENCES roadmap_observation_pilots(approval_id),
             sequence INTEGER NOT NULL CHECK(sequence IN (1, 2)),
             observation_id TEXT NOT NULL,
