@@ -4611,10 +4611,18 @@ async def _launch_metered_review(
         if not await epic_plan_gates.can_prepare_review(db, task):
             return None
         seen = await backend.lookup(request, permit.grant)
-        if not seen.asked:
-            return None
-        if seen.agent_id:
+        if seen.asked and seen.agent_id and seen.run_id:
             return _Started(seen.agent_id, seen.run_id, True, False, 0, None), permit
+        await epic_plan_gates.note_review_blocker(
+            db,
+            task,
+            epic_plan_gates.ReviewBlocker(
+                "pilot_review_order_unreconciled",
+                "operator",
+                "reconcile_existing_provider_order",
+            ),
+        )
+        return None
     if not await epic_plan_gates.ready_to_send(db, permit):
         return None
     return await backend.launch(request, permit.grant), permit

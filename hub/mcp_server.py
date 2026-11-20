@@ -4043,7 +4043,7 @@ async def hub_executor_slots() -> CallToolResult:
 
 @mcp.tool()
 async def hub_epic_plan(epic_id: int) -> CallToolResult:
-    """Read pilot authority, blockers and the caller's decision eligibility."""
+    """Read pilot scope, subscription terms, blockers and decision eligibility."""
     try:
         data = await _api_get(f"/api/tasks/{epic_id}/epic-plan")
     except HubApiError as exc:

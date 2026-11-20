@@ -19,6 +19,7 @@ from hub.services import (
     ci_trust,
     epic_plan,
     epic_plan_authority as authority,
+    epic_plan_quota as quota,
     epic_plan_spend as spend,
     epic_plan_transport as transport,
     project_policy,
@@ -288,8 +289,12 @@ async def reserve_review(
         actor_principal_id=principal_id,
         attempt=attempt,
     )
+    if await quota.waiting(db, binding, before_reset=True):
+        return False, None
     grant = await authority.get_grant(binding)
     if grant is None or not grant.covers(binding):
+        if await quota.waiting(db, binding):
+            return False, None
         await note_review_blocker(
             db,
             task,
@@ -338,6 +343,7 @@ async def _write_review_reservation(
             if previous["attempt"] == binding.attempt:
                 same = (
                     previous["review_dispatch_id"] is None
+                    and not spend.subscription_refusal(decision, grant)
                     and previous["authority_ref"] == grant.reference
                     and previous["ceiling_cents"] == grant.ceiling_cents
                     and spend.binding_of(previous) == binding
@@ -352,12 +358,16 @@ async def _write_review_reservation(
                 or previous["charged_cents"] is None
             ):
                 return False, None
+        if await quota.refusal(db, decision, grant):
+            return False, None
         if refusal := await spend.refusal(db, decision, grant):
             from hub.services import epic_plan_escalation
 
             await epic_plan_escalation.maybe_notify(db, decision, task, refusal)
             return False, None
-        return True, ReviewPermit(await spend.record(db, grant), grant)
+        reservation = await spend.record(db, grant)
+        await quota.resume(db, binding)
+        return True, ReviewPermit(reservation, grant)
 
 
 async def attach_dispatch(

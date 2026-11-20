@@ -10,6 +10,8 @@ PlanState = Literal["draft", "active", "stopped", "expired", "revoked"]
 
 
 class PlanTerms(BaseModel):
+    billing_mode: Literal["included_only"] | None = None
+    quota_action: Literal["wait_for_reset"] | None = None
     duration_days: int = 14
     total_cents: int = 4000
     leaf_cents: int = 1500
@@ -35,16 +37,30 @@ class PlanNode(BaseModel):
     leaf: bool
 
 
+class SubscriptionEvidence(BaseModel):
+    """Stable provider terms. Availability of the current quota is checked per order."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    provider: Literal["OpenAI", "Cursor"]
+    model: str = Field(min_length=1, max_length=128)
+    account_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    terms_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    quota_period: Literal["weekly", "monthly", "rolling", "multiple"]
+    additional_charges_disabled: Literal[True]
+
+
 class PlanDispatchAuthority(BaseModel):
     host: str
     executor_model: str
     issuer_principal_id: int
     budget_source_fingerprint: str
     conditions: list[str]
+    executor_subscription: SubscriptionEvidence | None = None
+    review_subscription: SubscriptionEvidence | None = None
 
 
 class PlanSnapshot(BaseModel):
-    schema_version: Literal["1", "2"] = "1"
+    schema_version: Literal["1", "2", "3"] = "1"
     epic_id: int
     project: str
     owner_principal_id: int | None

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import aiosqlite
 
+from hub.epic_plan_view import SubscriptionEvidence
 from hub.services.epic_plan_authority import SpendingGrant
 
 if TYPE_CHECKING:
@@ -19,7 +20,13 @@ if TYPE_CHECKING:
     from hub.services.review_dispatch import _Started
 
 
-class ExecutorTransport(Protocol):
+class SubscriptionTransport(Protocol):
+    def subscription(self) -> SubscriptionEvidence | None:
+        """Return current provider-confirmed account terms, or None without proof."""
+        ...
+
+
+class ExecutorTransport(SubscriptionTransport, Protocol):
     async def issue(
         self,
         db: aiosqlite.Connection,
@@ -42,7 +49,7 @@ class ReviewRequest:
     hub_url: str
 
 
-class ReviewTransport(Protocol):
+class ReviewTransport(SubscriptionTransport, Protocol):
     async def lookup(
         self, request: ReviewRequest, grant: SpendingGrant
     ) -> Reconciliation:
