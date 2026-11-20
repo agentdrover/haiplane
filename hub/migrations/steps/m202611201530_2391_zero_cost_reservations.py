@@ -3,7 +3,7 @@
 MIGRATIONS = [
     (
         "epic_zero_create_2391",
-        """CREATE TABLE epic_plan_work_2391 (
+        """CREATE TABLE IF NOT EXISTS epic_plan_work_2391 (
             id INTEGER PRIMARY KEY,
             task_id INTEGER NOT NULL,
             plan_version TEXT NOT NULL,

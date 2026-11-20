@@ -34,3 +34,27 @@ def test_zero_cost_migration_keeps_history_and_unique_order():
                 db.execute(add, duplicate)
         with pytest.raises(sqlite3.IntegrityError):
             db.execute(add, (5, 3, "bad", -1, None, 43))
+
+
+def test_resume_if_first_ddl_precedes_migration_marker(tmp_path):
+    path = tmp_path / "migration-restart.sqlite"
+    with closing(sqlite3.connect(path)) as initial:
+        for _, sql in original_steps:
+            initial.execute(sql)
+        initial.commit()
+        initial.execute(zero_cost_steps[0][1])
+        assert not initial.in_transaction
+
+    with closing(sqlite3.connect(path)) as restarted:
+        for _, sql in zero_cost_steps:
+            restarted.execute(sql)
+        definition = restarted.execute(
+            "SELECT sql FROM sqlite_master WHERE name='epic_plan_work'"
+        ).fetchone()[0]
+        assert "CHECK(ceiling_cents >= 0)" in definition
+        assert (
+            restarted.execute(
+                "SELECT name FROM sqlite_master WHERE name='epic_plan_work_2391'"
+            ).fetchone()
+            is None
+        )
