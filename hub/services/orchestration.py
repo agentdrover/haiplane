@@ -30,7 +30,7 @@ from hub.db import (
     log_activity,
     write_transaction,
 )
-from hub.services import delivery_ci
+from hub.services import delivery_ci, stale_base_recovery
 from hub.services import spec_archive
 from hub.services.behavior_snapshot import refusal_for_moved_head
 from hub.services.prevention_gate import hold_completion
@@ -53,6 +53,8 @@ from hub.integrations.protocols import (
     BaseFreshness,
     BaseFreshnessState,
     BranchUpdateOutcome,
+    CIBaseChange,
+    CIPrTarget,
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
@@ -3468,7 +3470,9 @@ async def _missing_run_gate_step(
     return detail
 
 
-async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
+async def stacking_gate_step(
+    db: aiosqlite.Connection, task: dict[str, Any], *, require_known: bool = False
+) -> str:
     """The gate's whole answer to "is this branch standing on another" (#1186).
 
     Returns a refusal detail, or "" to merge. Three answers, three handlings:
@@ -3490,6 +3494,7 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
       but "nothing to look at yet": a neighbour branch that has not reached
       origin, whose tip the hub has never observed there. It merges and the
       alert names that neighbour — see ``_a_branch_origin_never_had``.
+      The stale-CI recovery requires a known stack result before it can update a branch.
 
     A merged base is not a stack, and this does NOT rest on the base having
     left some status: git answers it. A delivered base owns no commits outside
@@ -3565,7 +3570,7 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
         # do not merge, call a human, naming the task and what the hub could not
         # check.
         return f"{UNPROBED_STRANDED_BASE_PREFIX}: {_unprobed_undeliverable(assessment)}"
-    if assessment.outcome == STACK_UNKNOWN and assessment.retryable:
+    if assessment.outcome == STACK_UNKNOWN and (assessment.retryable or require_known):
         return (
             f"{STACK_UNKNOWN_PREFIX}: проверить, не стоит ли ветка на чужой "
             f"несмерженной ветке, не удалось ({assessment.reason}). Это не то "
@@ -4185,6 +4190,7 @@ class MergeStep(enum.Enum):
     UNPINNED = "unpinned"  # коммит одобренной сдачи не закреплён — форж не вызывался
     HEAD_MOVED = "head_moved"  # закрепление ушло с головы, на которой смотрели проверки
     RERUN_HOLD = "rerun_hold"  # бронь перезапуска CI не пускает мерж (#1956)
+    TARGET_UNPROVED = "target_unproved"  # точные refs доставки не подтверждены (#2393)
 
 
 def _approval_holds(fresh: dict[str, Any], snapshot: dict[str, Any]) -> bool:
@@ -4235,6 +4241,7 @@ async def merge_if_approval_stands(
     ctx: dict[str, Any],
     *,
     checked_sha: str | None = None,
+    target: CIPrTarget | None = None,
 ) -> tuple[MergeStep, str]:
     """ЕДИНСТВЕННЫЙ вызов форжа для мержа PR задачи (#1706).
 
@@ -4258,12 +4265,20 @@ async def merge_if_approval_stands(
     while True:
         if hold := await delivery_rerun.merge_hold(db, task, ctx):  # #1956, каждый круг
             return MergeStep.RERUN_HOLD, hold
+        if target is not None and not await _delivery_target_is_current(
+            db, key, ctx, target
+        ):
+            return MergeStep.TARGET_UNPROVED, _DELIVERY_TARGET_UNPROVED
         row, pilot_refusal = await _merge_approval_row(db, key[0])
         if pilot_refusal:
             return MergeStep.RERUN_HOLD, pilot_refusal
         # --- ниже до регистрации Future нет ни одного await ---
         if row is None or not _approval_holds(dict(row), task):
             return MergeStep.APPROVAL_GONE, ""
+        if target is not None and not _delivery_task_matches_target(
+            dict(row), key[1], target
+        ):
+            return MergeStep.TARGET_UNPROVED, _DELIVERY_TARGET_UNPROVED
         pinned = (dict(row).get("submission_sha") or "").strip()
         if checked_sha is not None and pinned != checked_sha.strip():
             return MergeStep.HEAD_MOVED, ""
@@ -4338,7 +4353,11 @@ async def record_delivery_outcome(
 
 
 async def _gate_merge_step(
-    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    *,
+    target: CIPrTarget | None = None,
 ) -> tuple[tuple[bool, str] | None, str]:
     """Сам мерж гейта: ``(исход, деталь)``; исход None — влит, пишите реестр.
 
@@ -4355,9 +4374,10 @@ async def _gate_merge_step(
         task,
         ctx,
         checked_sha=(task.get("_checked_sha") or task.get("submission_sha") or ""),
+        target=target,
     )
     key = (int(task["id"]), int(task["pr_number"]))
-    if step is MergeStep.RERUN_HOLD:  # #1956: деталь - причина брони
+    if step in (MergeStep.RERUN_HOLD, MergeStep.TARGET_UNPROVED):
         return (False, merge_detail), ""
     if step is MergeStep.ALREADY:
         return (True, "already delivered"), ""
@@ -4677,8 +4697,128 @@ async def _red_ci_detail(
     return f"ci_{ci.outcome.value}: {ci.reason}"
 
 
+async def _recover_stale_base(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    ci: CIProbeResult,
+    refusal: str,
+    *,
+    sha_note: str,
+) -> str:
+    """Allow only the existing update-and-wait path on proven stale CI (#2393)."""
+    change = ci.base_change
+    checked_head = task.get("_checked_sha") or (
+        None if sha_note else task.get("submission_sha")
+    )
+    if (
+        ci.outcome is not CIProbeOutcome.unavailable
+        or change is None
+        or not checked_head
+        or not ctx.get("gh_repo")
+        or task.get("status") != "completed"
+        or (change.pr_number, change.head_ref, change.head_sha, change.base_ref)
+        != (
+            task.get("pr_number"),
+            task.get("branch"),
+            checked_head,
+            ctx.get("base_branch"),
+        )
+    ):
+        return refusal
+    if stacked := await stacking_gate_step(db, task, require_known=True):
+        return stacked
+    return await base_freshness_step(db, task, ctx, recovery=change) or refusal
+
+
+async def _branch_update_approval_stands(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    expected_head: str,
+) -> bool:
+    if await project_git_context(db, task["id"]) != ctx:
+        return False
+    row = await repo.get_task(db, task["id"])
+    return bool(
+        row
+        and review_approved_for_current_submission(dict(row))
+        and row["submission_sha"] == expected_head
+        and all(
+            row[key] == task[key]
+            for key in ("status", "branch", "pr_number", "submission_generation")
+        )
+        and (int(row["id"]), int(row["pr_number"])) not in _gate_merges
+    )
+
+
+async def _reserve_stale_base_update(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    target: CIPrTarget,
+    *,
+    stale_proof: bool,
+) -> str | None:
+    reservation = await stale_base_recovery.reserve(
+        db,
+        task,
+        ctx,
+        target,
+        approval_stands=lambda: _branch_update_approval_stands(
+            db, task, ctx, target.head_sha
+        ),
+    )
+    if reservation is stale_base_recovery.Reservation.approval_unproved:
+        return "" if stale_proof else _DELIVERY_TARGET_UNPROVED
+    if reservation is stale_base_recovery.Reservation.already_reserved:
+        return stale_base_recovery.pending_note(task["pr_number"], target)
+    return None
+
+
+_DELIVERY_TARGET_UNPROVED = "ci_unavailable: delivery_pr_refs_changed_or_unreadable"
+
+
+def _delivery_task_matches_target(
+    task: dict[str, Any], pr: int, target: CIPrTarget
+) -> bool:
+    return (task["status"], task["branch"], task["pr_number"]) == (
+        "completed",
+        target.head_ref,
+        pr,
+    ) and review_approved_for_current_submission(task)
+
+
+def _fresh_matches_target(fresh: BaseFreshness, target: CIPrTarget) -> bool:
+    return CIPrTarget(fresh.head_sha, fresh.head_ref, fresh.base_ref) == target
+
+
+async def _delivery_target_is_current(
+    db: aiosqlite.Connection,
+    key: tuple[int, int],
+    ctx: dict[str, Any],
+    target: CIPrTarget,
+) -> bool:
+    if await project_git_context(db, key[0]) != ctx:
+        return False
+    fresh = await plugins.git_ops.pr_base_freshness(
+        key[1],
+        repo=ctx.get("repo"),
+        gh_repo=ctx.get("gh_repo"),
+        forge=ctx.get("forge", ""),
+    )
+    return fresh.state is BaseFreshnessState.current and _fresh_matches_target(
+        fresh, target
+    )
+
+
 async def base_freshness_step(
-    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    *,
+    recovery: CIBaseChange | None = None,
+    target: CIPrTarget | None = None,
 ) -> str:
     """Стоит ли голова PR на актуальной базе; если нет — обновить ветку (#1419).
 
@@ -4699,6 +4839,21 @@ async def base_freshness_step(
     fresh = await plugins.git_ops.pr_base_freshness(
         key[1], repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo"), forge=forge
     )
+    if recovery is not None:
+        target = CIPrTarget(recovery.head_sha, recovery.head_ref, recovery.base_ref)
+        if (
+            fresh.state is not BaseFreshnessState.behind
+            or not fresh.behind_by
+            or fresh.base_sha != recovery.current_base_sha
+            or not _fresh_matches_target(fresh, target)
+        ):
+            # No corroboration; keep the original CI refusal.
+            return ""
+    elif target is not None and (
+        fresh.state not in (BaseFreshnessState.current, BaseFreshnessState.behind)
+        or not _fresh_matches_target(fresh, target)
+    ):
+        return _DELIVERY_TARGET_UNPROVED
     if fresh.state in (BaseFreshnessState.current, BaseFreshnessState.unsupported):
         return ""
     if fresh.state is not BaseFreshnessState.behind or not fresh.head_sha:
@@ -4714,7 +4869,7 @@ async def base_freshness_step(
         "второго обновления без нового прогона CI не будет"
     )
     if _gate_branch_updates.get(key) == spent:
-        return pending
+        return await _branch_update_wait(db, task, target, pending)
     # Бронь — в том же синхронном участке, что и проверка, до первого await
     # (#421, #1398): иначе второй путь гейта проходит проверку, пока первый
     # ждёт базу или форж, и зовёт update второй раз.
@@ -4722,6 +4877,13 @@ async def base_freshness_step(
     try:
         if await gate_branch_update_from(db, task) == fresh.head_sha:
             return pending
+        if target is not None:
+            refused = await _reserve_stale_base_update(
+                db, task, ctx, target, stale_proof=recovery is not None
+            )
+            if refused is not None:
+                _release_branch_update(key, spent)
+                return refused
         outcome, detail = await plugins.git_ops.update_pr_branch(
             key[1],
             fresh.head_sha,
@@ -4735,14 +4897,32 @@ async def base_freshness_step(
         raise
     if outcome is not BranchUpdateOutcome.updated:
         _release_branch_update(key, spent)
+        if target is not None:
+            if outcome is BranchUpdateOutcome.unavailable:
+                return stale_base_recovery.pending_note(key[1], target)
+            await stale_base_recovery.release(db, task, target)
         return _branch_update_refusal(key[1], fresh, outcome, detail)
-    await _record_branch_update(db, task, ctx, fresh)
+    await _record_branch_update(db, task, ctx, fresh, target=target, recovery=recovery)
     behind = f" на {fresh.behind_by} комм." if fresh.behind_by else ""
     return (
         f"{BASE_UPDATED_PREFIX}: ветка PR #{key[1]} отстала от базы{behind} — "
         f"гейт слил базу в ветку (голова была {fresh.head_sha[:12]}: {detail}). "
         "Мерж — после зелёного CI на новой голове, следующим циклом"
     )
+
+
+async def _branch_update_wait(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    target: CIPrTarget | None,
+    pending: str,
+) -> str:
+    if (
+        target is not None
+        and await gate_branch_update_from(db, task) != target.head_sha
+    ):
+        return stale_base_recovery.pending_note(task["pr_number"], target)
+    return pending
 
 
 def _release_branch_update(key: tuple[int, int], spent: tuple[int, str]) -> None:
@@ -4779,6 +4959,9 @@ async def _record_branch_update(
     task: dict[str, Any],
     ctx: dict[str, Any],
     fresh: BaseFreshness,
+    *,
+    target: CIPrTarget | None = None,
+    recovery: CIBaseChange | None = None,
 ) -> None:
     """След обновления гейтом: событие и окно CI заново (#1419).
 
@@ -4789,6 +4972,18 @@ async def _record_branch_update(
     """
     await repo.mark_ci_check_started(db, task["id"])
     await delivery_rerun.record_base_update(db, task, fresh.head_sha)
+    recovery_trace: dict[str, Any] = {}
+    if target is not None:
+        await stale_base_recovery.confirm(db, task, target)
+        recovery_trace.update(
+            ci_stale_base_recovery=True,
+            ci_recovery_repo=ctx.get("gh_repo"),
+            ci_recovery_head_ref=target.head_ref,
+            ci_recovery_base_ref=target.base_ref,
+            ci_observed_base_sha=fresh.base_sha,
+        )
+    if recovery is not None:
+        recovery_trace["ci_pinned_base_sha"] = recovery.pinned_base_sha
     await repo.insert_event(
         db,
         kind=GATE_BRANCH_UPDATE_EVENT,
@@ -4799,7 +4994,18 @@ async def _record_branch_update(
             "from_sha": fresh.head_sha,
             "behind_by": fresh.behind_by,
             "generation": int(task.get("submission_generation") or 0),
+            **recovery_trace,
         },
+    )
+
+
+async def _delivery_ci_result(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+) -> CIProbeResult:
+    pinned = task.get("_checked_sha") or task.get("submission_sha") or ""
+    recovery_ci = await stale_base_recovery.probe_ci(db, task, ctx, checked_head=pinned)
+    return recovery_ci or await delivery_ci.check_task(
+        db, task["id"], task["pr_number"], ctx
     )
 
 
@@ -4852,12 +5058,14 @@ async def merge_before_completion(
         workspace = ctx.get("repo")
         gh_repo = ctx.get("gh_repo")
 
-        ci = await delivery_ci.check_task(db, task_id, pr_num, ctx)
+        ci = await _delivery_ci_result(db, task, ctx)
         if rerun := await delivery_rerun.gate_step(db, task, ctx, ci):  # #1956
             return False, rerun
         ci_refusal = await _ci_gate_refusal(db, task, ctx, ci)
         if ci_refusal:
-            return False, ci_refusal
+            return False, await _recover_stale_base(
+                db, task, ctx, ci, ci_refusal, sha_note=sha_note
+            )
 
         # #1186: mergeable is not deliverable. A green, conflict-free PR whose
         # branch stands on ANOTHER task's unmerged branch carries that task's
@@ -4872,7 +5080,7 @@ async def merge_before_completion(
         # #1419: зелёный CI головы — не зелёный CI на базе, в которую она
         # ляжет. Отставшую ветку гейт обновляет и ждёт CI на новой голове.
         # После стопки: ветку на чужом основании обновлять не за чем.
-        stale_base = await base_freshness_step(db, task, ctx)
+        stale_base = await base_freshness_step(db, task, ctx, target=ci.target)
         if stale_base:
             return False, stale_base
 
@@ -4894,7 +5102,7 @@ async def merge_before_completion(
                     "пометить его ready"
                 )
 
-        decided, merge_detail = await _gate_merge_step(db, task, ctx)
+        decided, merge_detail = await _gate_merge_step(db, task, ctx, target=ci.target)
         key = (int(task_id), int(pr_num))
         if decided is not None and not (
             decided == _ALREADY_DELIVERED and key in _unrecorded_gate_merges

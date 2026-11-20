@@ -231,12 +231,18 @@ async def _ci_allows_attempt(db: aiosqlite.Connection, task: dict[str, Any]) -> 
     Непрочитанный CI - "wait", а не "go" и не "stop": неизвестное не равно ни
     зелёному, ни красному.
     """
-    from hub.services import delivery_ci, orchestration
+    from hub.services import delivery_ci, orchestration, stale_base_recovery
 
     pr = int(task["pr_number"])
     try:
         ctx = await orchestration.project_git_context(db, int(task["id"]))
-        ci = await delivery_ci.check_task(db, int(task["id"]), pr, ctx)
+        ci = await stale_base_recovery.probe_ci(db, task, ctx)
+        if ci is None:
+            ci = await delivery_ci.check_task(db, int(task["id"]), pr, ctx)
+        elif ci.base_change is not None:
+            # The base may move again during the wait. Only the full gate can
+            # confirm another behind observation and update the newly checked head.
+            return "go"
     except Exception:  # noqa: BLE001 - "не прочитали" - повод ждать
         log.exception("CI probe of PR #%s (#%s) failed", pr, task["id"])
         return "wait"

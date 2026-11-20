@@ -30,6 +30,7 @@ from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
     BaseFreshness,
     BranchUpdateOutcome,
+    CIPrTarget,
     CIProbeResult,
     CIRunRequestResult,
     FOREIGN_PR_ONLY,
@@ -3299,16 +3300,18 @@ class GitOpsIntegration(
         gh_repo: str | None = None,
         forge: str = "",
         contract_fingerprint: str = "",
+        target: CIPrTarget | None = None,
     ) -> CIProbeResult:
-        adapter = self._forge_for(forge)
-        if contract_fingerprint:
-            return await adapter.check_pr_ci(
-                pr_number,
-                repo=repo,
-                gh_repo=gh_repo,
-                contract_fingerprint=contract_fingerprint,
-            )
-        return await adapter.check_pr_ci(pr_number, repo=repo, gh_repo=gh_repo)
+        options: dict[str, Any] = (
+            {"contract_fingerprint": contract_fingerprint}
+            if contract_fingerprint
+            else {}
+        )
+        if target is not None:
+            options["target"] = target
+        return await self._forge_for(forge).check_pr_ci(
+            pr_number, repo=repo, gh_repo=gh_repo, **options
+        )
 
     async def request_ci_run(
         self,
