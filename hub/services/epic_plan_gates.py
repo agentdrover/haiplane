@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -228,6 +228,8 @@ class ReviewPermit:
     id: int
     grant: authority.SpendingGrant
     reconcile: bool = False
+    code_id: int | None = None
+    access_code: str = field(default="", repr=False)
 
 
 async def _reviewer_still_independent(
@@ -252,6 +254,7 @@ async def reserve_review(
     model: str,
     principal_id: int | None,
     attempt: int,
+    issue_access: bool = False,
 ) -> tuple[bool, ReviewPermit | None]:
     """Reserve cap for one identifiable provider attempt, even across restart."""
     if not await managed(db, int(task["id"])):
@@ -305,11 +308,11 @@ async def reserve_review(
             ),
         )
         return False, None
-    return await _write_review_reservation(db, grant)
+    return await _write_review_reservation(db, grant, issue_access=issue_access)
 
 
 async def _write_review_reservation(
-    db: aiosqlite.Connection, grant: authority.SpendingGrant
+    db: aiosqlite.Connection, grant: authority.SpendingGrant, *, issue_access: bool
 ) -> tuple[bool, ReviewPermit | None]:
     binding = grant.binding
     async with write_transaction(db):
@@ -349,7 +352,15 @@ async def _write_review_reservation(
                     and spend.binding_of(previous) == binding
                 )
                 return (
-                    (True, ReviewPermit(previous["id"], grant, reconcile=True))
+                    (
+                        True,
+                        ReviewPermit(
+                            previous["id"],
+                            grant,
+                            reconcile=True,
+                            code_id=previous["reviewer_code_id"],
+                        ),
+                    )
                     if same
                     else (False, None)
                 )
@@ -367,7 +378,36 @@ async def _write_review_reservation(
             return False, None
         reservation = await spend.record(db, grant)
         await quota.resume(db, binding)
+        if issue_access:
+            return True, await _issued_review_access(db, reservation, grant)
         return True, ReviewPermit(reservation, grant)
+
+
+async def _issued_review_access(
+    db: aiosqlite.Connection, reservation: int, grant: authority.SpendingGrant
+) -> ReviewPermit:
+    binding = grant.binding
+    code, _ = await chat_pair.issue_code(
+        db,
+        binding.principal_id,
+        kind="reviewer",
+        bound_task_id=binding.task_id,
+        bound_generation=binding.generation,
+        commit=False,
+    )
+    row = await _one(
+        db,
+        "SELECT id FROM chat_pair_codes WHERE code_hash=?",
+        (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(code)),),
+    )
+    if row is None:
+        raise RuntimeError("missing issued pilot review code")
+    code_id = int(row["id"])
+    await db.execute(
+        "UPDATE epic_plan_work SET reviewer_code_id=? WHERE id=?",
+        (code_id, reservation),
+    )
+    return ReviewPermit(reservation, grant, code_id=code_id, access_code=code)
 
 
 async def attach_dispatch(
