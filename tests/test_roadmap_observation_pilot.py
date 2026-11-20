@@ -79,7 +79,14 @@ async def test_ac_1(scenario):
     assert (
         await world.client.get(f"{_HOST}/observations", headers=world.k9_auth)
     ).status_code == 403
+    started_at = (await support.rows(world.db, "SELECT datetime('now') AS utc"))[0][
+        "utc"
+    ]
     created = await roadmap_pilot_activation._run(world.db)
+    finished_at = (await support.rows(world.db, "SELECT datetime('now') AS utc"))[0][
+        "utc"
+    ]
+    assert started_at <= created["activated_at"] <= finished_at
     again = await roadmap_pilot_activation._run(world.db)
     assert again == {"state": "active", "grant_id": created["grant_id"], "repeat": True}
     lifetime = await support.rows(
