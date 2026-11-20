@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from hub import repository as repo
 from hub.auth import current_identity
+from hub.config import TokenIdentity
 from hub.executor_host_api import _db, _host_caller, _human
 from hub.services import role_orders
 from hub.services.roadmap_contracts import RoadmapResult
@@ -59,12 +60,15 @@ def _as_http(exc: role_orders.RoleOrderError) -> HTTPException:
     return HTTPException(exc.status, detail=exc.detail)
 
 
-async def _poll(db: Any, name: str, principal_id: int | None, wait: int) -> list:
+async def _poll(db: Any, name: str, who: TokenIdentity, wait: int) -> list:
+    pilot_allowed = role_orders.pilot_key_scope(who)
     deadline = time.monotonic() + min(wait, WAIT_MAX)
     while True:
-        await role_orders.check_host(db, name, principal_id)
-        if await role_orders.has_work(db, name):
-            order = await role_orders.lease(db, name, principal_id)
+        await role_orders.check_host(db, name, who.principal_id)
+        if await role_orders.has_work(db, name, pilot_allowed=pilot_allowed):
+            order = await role_orders.lease(
+                db, name, who.principal_id, pilot_allowed=pilot_allowed
+            )
             if order:
                 return [order]
         if time.monotonic() >= deadline:
@@ -90,9 +94,7 @@ async def api_role_orders(
         )
     _polling[name] = _polling.get(name, 0) + 1
     try:
-        orders = await _poll(
-            _db(request), name, current_identity(request).principal_id, wait
-        )
+        orders = await _poll(_db(request), name, current_identity(request), wait)
     except role_orders.RoleOrderError as exc:
         raise _as_http(exc) from exc
     finally:
@@ -115,6 +117,7 @@ async def api_role_order_started(
             current_identity(request).principal_id,
             order_id,
             body.lease_id,
+            pilot_allowed=role_orders.pilot_key_scope(current_identity(request)),
         )
     except role_orders.RoleOrderError as exc:
         raise _as_http(exc) from exc
@@ -136,6 +139,7 @@ async def api_role_order_report(
             body.outcome,
             body.note,
             body.roadmap_result,
+            pilot_allowed=role_orders.pilot_key_scope(current_identity(request)),
         )
     except role_orders.RoleOrderError as exc:
         raise _as_http(exc) from exc
