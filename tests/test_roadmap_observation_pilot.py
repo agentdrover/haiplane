@@ -60,7 +60,7 @@ async def _move_observation(world, shift):
     await world.db.commit()
 
 
-async def test_ac_1_approval_scope_expiry_and_no_reissue(scenario):
+async def test_ac_1(scenario):
     world, mandate, owner = scenario
     url = f"/api/tasks/{mandate.task_id}/roadmap-grant"
     denied = await world.client.put(
@@ -102,7 +102,7 @@ async def test_ac_1_approval_scope_expiry_and_no_reissue(scenario):
     )
 
 
-async def test_ac_2_samples_are_fenced_bounded_and_idempotent(scenario):
+async def test_ac_2(scenario):
     world, _, _ = scenario
     grant = (await roadmap_pilot_activation._run(world.db))["grant_id"]
     assert (await _post_sample(world, grant + 1)).status_code == 409
@@ -128,18 +128,7 @@ async def test_ac_2_samples_are_fenced_bounded_and_idempotent(scenario):
     assert rows[0]["seconds"] >= 60
 
 
-@pytest.mark.parametrize(
-    ("mode", "reason"),
-    [
-        ("read", "verify_version_read"),
-        ("hold", "hold_pilot"),
-        ("incomplete", "insufficient_facts"),
-        ("failed", "consultation_failed"),
-        ("invalid", "consultation_invalid"),
-        ("timeout", "consultation_failed"),
-    ],
-)
-async def test_ac_3_and_ac_4_real_role_transport_and_one_effect(scenario, mode, reason):
+async def _process_consultation(scenario, mode, reason):
     world, mandate, _ = scenario
     steward = await _auth(world, mandate.steward_id)
     guest = await _auth(world, mandate.roadmap_id)
@@ -238,13 +227,33 @@ async def test_ac_3_and_ac_4_real_role_transport_and_one_effect(scenario, mode, 
     assert (
         await world.client.post(decision, headers=steward, json={"grant_id": grant})
     ).json()["repeat"] is True
-    if mode != "read":
-        assert done.json()["effect_id"] is None
-        return
+    return world, done.json()["effect_id"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "reason"),
+    [
+        ("read", "verify_version_read"),
+        ("hold", "hold_pilot"),
+        ("incomplete", "insufficient_facts"),
+        ("failed", "consultation_failed"),
+        ("invalid", "consultation_invalid"),
+        ("timeout", "consultation_failed"),
+    ],
+)
+async def test_ac_3(scenario, mode, reason):
+    _, effect_id = await _process_consultation(scenario, mode, reason)
+    assert (effect_id is not None) == (mode == "read")
+
+
+async def test_ac_4(scenario):
+    world, expected_effect = await _process_consultation(
+        scenario, "read", "verify_version_read"
+    )
     effect_id = (
         await world.client.get(f"{_HOST}/effect", headers=world.k8_auth)
     ).json()["effect_id"]
-    assert effect_id == done.json()["effect_id"]
+    assert effect_id == expected_effect
     resource = f"{_HOST}/effects/{effect_id}"
     claims = await asyncio.gather(
         *[
