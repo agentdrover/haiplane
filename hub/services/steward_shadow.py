@@ -86,6 +86,9 @@ REFUSED_NO_IDENTITY_CHANNEL = "no_identity_channel"
 #: а здесь пробовать нечего — список кончился, и следующий тик потратит
 #: окно старта ровно так же. Разница видна только если её назвать.
 REFUSED_NO_LAUNCHABLE_JUDGE = "no_launchable_judge"
+#: Ревью не куплено из-за красного CI на закреплённом коммите (#2209).
+#: Отдельное слово: «ревьюера ещё не позвали» — неправда, его никто не позовёт.
+REFUSED_RED_CI = "red_ci"
 
 EVENT_RUN_STARTED = "steward_run_started"
 EVENT_RUN_REFUSED = "steward_run_refused"
@@ -665,20 +668,28 @@ async def _last_event_payload(
     return payload if isinstance(payload, dict) else {}
 
 
-async def waiting_refusal_code(
-    db: aiosqlite.Connection, task_id: int, run_id: int
-) -> str:
-    """Код последнего ВРЕМЕННОГО отказа этого прогона — или пусто.
+async def waiting_refusal(db: aiosqlite.Connection, task_id: int, run_id: int) -> dict:
+    """Последний ВРЕМЕННЫЙ отказ этого прогона: код и текст — или пусто.
 
     Нужен закрытию слота по дедлайну (#1290 AC-3): «не начался» и «ждал
     ревьюера полчаса и не дождался» читались одинаково, а это разные
     события. Окончательный отказ здесь не считается: он слот уже закрыл.
+    Текст едет вместе с кодом (#2209): закрытие повторяет ПРИЧИНУ, а не
+    пересочиняет её из одного слова.
     """
     payload = await _last_event_payload(
         db, EVENT_RUN_REFUSED, task_id=task_id, run_id=run_id
     )
     if not payload.get("retryable"):
-        return ""
+        return {}
+    return payload
+
+
+async def waiting_refusal_code(
+    db: aiosqlite.Connection, task_id: int, run_id: int
+) -> str:
+    """Код последнего временного отказа этого прогона — или пусто."""
+    payload = await waiting_refusal(db, task_id, run_id)
     return str(payload.get("reason") or "")
 
 
@@ -844,6 +855,39 @@ async def _refused_before_paying(
     return await hold_start_for_review(db, order, task)
 
 
+async def _wait_for_the_reviewer(
+    db: aiosqlite.Connection, order: dict, task: dict[str, Any]
+) -> bool:
+    """Отказ «ждём ревьюера» — или red_ci, если ревью уже не купят (#2209).
+
+    «Пока неизвестно» и «неизвестно никогда» — разные ответы. Пока ревью может
+    быть куплено, заказ ждёт модель ревьюера. Если диспетчер уже отказал
+    окончательно, ждать нечего: причина называет CI, а не отсутствующего
+    ревьюера, и заказ остаётся открытым — зелёный отчёт в окне слота вернёт
+    его на обычный путь.
+    """
+    from hub.services import review_ci_gate
+
+    failed = await review_ci_gate.ci_forbids_review(db, task)
+    if failed:
+        await _refuse_transiently(
+            db,
+            order,
+            REFUSED_RED_CI,
+            review_ci_gate.red_ci_note(failed) + " — судья не стартовал",
+        )
+        return False
+    await _refuse_transiently(
+        db,
+        order,
+        REFUSED_UNDECLARED_MODEL,
+        "кросс-модельного ревьюера ещё не позвали — заказ ждёт его "
+        "появления: «пока неизвестно» не то же самое, что «неизвестно "
+        "никогда»",
+    )
+    return False
+
+
 async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     """Start one run for this order, or refuse it with a named reason.
 
@@ -890,15 +934,7 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     if _only_the_reviewer_is_missing(steward, implementer, reviewer) and (
         await _project_expects_a_reviewer(db, task_id)
     ):
-        await _refuse_transiently(
-            db,
-            order,
-            REFUSED_UNDECLARED_MODEL,
-            "кросс-модельного ревьюера ещё не позвали — заказ ждёт его "
-            "появления: «пока неизвестно» не то же самое, что «неизвестно "
-            "никогда»",
-        )
-        return False
+        return await _wait_for_the_reviewer(db, order, task)
 
     refusal = family_refusal(steward, implementer, reviewer)
     if refusal is not None:

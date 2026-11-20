@@ -1233,15 +1233,25 @@ async def _never_started_reason(db: aiosqlite.Connection, run: dict[str, Any]) -
     правды об одном и том же разъехался бы с первым.
     """
     from hub.services.steward_shadow import (
+        REFUSED_RED_CI,
         REFUSED_UNDECLARED_MODEL,
-        waiting_refusal_code,
+        waiting_refusal,
     )
 
     generic = (
         "заказ не удалось начать за отведённое ожидание — судья не работал, "
         "и таймаут судьи здесь был бы обвинением того, кто не начинал"
     )
-    code = await waiting_refusal_code(db, run["task_id"], run["id"])
+    refusal = await waiting_refusal(db, run["task_id"], run["id"])
+    code = str(refusal.get("reason") or "")
+    if code == REFUSED_RED_CI:
+        # #2209: заказ ждал не ревьюера, а ревью, которого не будет. Причина
+        # отказа уже назвала CI и упавшие проверки — повторяем её как есть.
+        detail = str(refusal.get("detail") or "").strip()
+        return (
+            f"{detail or 'ревью не куплено: CI красный на закреплённом коммите'}; "
+            + generic
+        )
     if code == REFUSED_UNDECLARED_MODEL:
         return (
             "заказ ждал кросс-модельного ревьюера и не дождался его до "
