@@ -35,6 +35,7 @@ from typing import Any, NoReturn
 import aiosqlite
 
 from hub import repository as repo
+from hub.config import TokenIdentity
 from hub.db import fetchall, write_transaction
 from hub.services import roadmap_decisions, roadmap_requests
 from hub.services.roadmap_contracts import RoadmapResult
@@ -688,7 +689,7 @@ async def lease(
         )
         if len(active) >= ROLE_LEASES_PER_HOST:
             current = active[0]
-            if not await _pilot_access(db, current["id"], host, pilot_allowed):
+            if not await pilot_host_access(db, current["id"], host, pilot_allowed):
                 return None
             if current["state"] != "leased":
                 return None  # работа идёт: второй заказ не выдаётся
@@ -700,7 +701,13 @@ async def lease(
         return await _claim_first(db, host, pilot_allowed=pilot_allowed)
 
 
-async def _pilot_access(
+def pilot_key_scope(identity: TokenIdentity) -> bool:
+    return not identity.scopes_damaged and (
+        not identity.scopes or "home-infra" in identity.scopes
+    )
+
+
+async def pilot_host_access(
     db: aiosqlite.Connection, order_id: int, host: str, allowed: bool
 ) -> bool:
     return (host == "k8" and allowed) or not await fetchall(
@@ -767,7 +774,7 @@ async def started(
         current = await _own_or_refuse(
             db, await _order(db, int(order_id)), host, lease_id
         )
-        if not await _pilot_access(db, order_id, host, pilot_allowed):
+        if not await pilot_host_access(db, order_id, host, pilot_allowed):
             _refuse(404, "role_order_not_found", "такого заказа нет")
         await _check_explicit_freshness(db, current, lease_id)
         cursor = await db.execute(
@@ -901,7 +908,7 @@ async def report(
         order = await _own_or_refuse(
             db, await _order(db, int(order_id)), host, lease_id
         )
-        if not await _pilot_access(db, order_id, host, pilot_allowed):
+        if not await pilot_host_access(db, order_id, host, pilot_allowed):
             _refuse(404, "role_order_not_found", "такого заказа нет")
         if order["state"] in ("done", "failed") and order["report_digest"] == digest:
             return {"id": int(order_id), "outcome": outcome, "repeat": True}

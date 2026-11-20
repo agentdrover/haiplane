@@ -17,7 +17,7 @@ from hub.agent_outbox_models import (
 )
 from hub.auth import current_identity
 from hub.executor_host_api import _db, _host_caller, _human
-from hub.services import agent_outbox
+from hub.services import agent_outbox, role_orders
 
 
 class _SafeRoute(APIRoute):
@@ -42,7 +42,7 @@ HOST_OUTBOX = "/api/executor-hosts/{name}/role-orders/{order_id}/outbox"
 
 @router.get(HOST_OUTBOX)
 async def scope(name: str, order_id: ResourceID, request: Request) -> OutboxScope:
-    principal = await _principal(request, name)
+    principal = await _principal(request, name, order_id)
     db = _db(request)
     await agent_outbox.check_host(db, name, principal)
     order = await agent_outbox.live_order(db, order_id, name)
@@ -64,7 +64,7 @@ async def publish(
     body: OutboxPublish,
     request: Request,
 ) -> OutboxAck:
-    principal = await _principal(request, name)
+    principal = await _principal(request, name, order_id)
     return await agent_outbox.publish(_db(request), name, principal, order_id, body)
 
 
@@ -72,7 +72,7 @@ async def publish(
 async def status(
     name: str, order_id: ResourceID, delivery_id: ResourceID, request: Request
 ) -> OutboxStatus:
-    principal = await _principal(request, name)
+    principal = await _principal(request, name, order_id)
     db = getattr(request.state, "db", None)
     if db is None:
         agent_outbox.refuse(503, "outbox_connection_unavailable")
@@ -102,9 +102,13 @@ async def _answer(
     )
 
 
-async def _principal(request: Request, name: str) -> int:
+async def _principal(request: Request, name: str, order_id: int) -> int:
     await _host_caller(request, name)
-    principal = current_identity(request).principal_id
-    if principal is None:
+    who = current_identity(request)
+    if who.principal_id is None:
         agent_outbox.refuse(403, "outbox_host_not_allowed")
-    return principal
+    if not await role_orders.pilot_host_access(
+        _db(request), order_id, name, role_orders.pilot_key_scope(who)
+    ):
+        agent_outbox.refuse(404, "outbox_not_found")
+    return who.principal_id

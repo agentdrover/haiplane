@@ -385,6 +385,26 @@ async def test_same_host_with_unrelated_project_scope_is_denied(scenario):
         await support.started(world, "k8", order_id, lease_id, auth=auth)
     ).status_code == 404
     assert (await support.started(world, "k8", order_id, lease_id)).status_code == 200
+    outbox = f"/api/executor-hosts/k8/role-orders/{order_id}/outbox"
+    denied = await world.client.get(outbox, headers=auth)
+    assert denied.status_code == 404
+    visible = await world.client.get(outbox, headers=world.k8_auth)
+    assert visible.status_code == 200
+    payload = {
+        **visible.json(),
+        "delivery_key": "review-result",
+        "kind": "result",
+        "body": "Bounded recommendation",
+        "lease_id": lease_id,
+    }
+    assert (
+        await world.client.post(outbox, headers=auth, json=payload)
+    ).status_code == 404
+    published = await world.client.post(outbox, headers=world.k8_auth, json=payload)
+    assert published.status_code in (200, 201), published.text
+    delivery = f"{outbox}/{published.json()['id']}"
+    assert (await world.client.get(delivery, headers=auth)).status_code == 404
+    assert (await world.client.get(delivery, headers=world.k8_auth)).status_code == 200
     assert (
         await support.report(world, "k8", order_id, lease_id, auth=auth)
     ).status_code == 404
