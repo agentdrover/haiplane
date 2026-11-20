@@ -31,7 +31,7 @@ import secrets
 import uuid
 from collections.abc import Callable, Mapping
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 from typing import Any, NamedTuple
 
@@ -3668,8 +3668,9 @@ class ReviewOrder:
     rules_note: str
     diff_note: str
     prepass: Any
-    #: Одноразовый код, уже вписанный в ``prompt``. Хранится отдельно не ради
-    #: удобства: срок его жизни отсчитывается от ЧЕКАНКИ, а локальный прогон
+    #: Для пилота здесь временный маркер, который заменяется перед первым
+    #: внешним запуском. Для обычного заказа — код из ``prompt``, чей срок
+    #: жизни отсчитывается от выдачи. Локальный прогон
     #: может простоять в очереди дольше этого срока — тогда исполнителю нужно
     #: отмерить срок заново, а для этого нужен сам код (#1208). Пусто там, где
     #: кода не выдавали: открытый режим, отозванный токен.
@@ -3771,6 +3772,7 @@ async def prepare_review_order(
     force_model: str = "",
     cloud: bool = False,
     inline_diff: bool = False,
+    defer_access_code: bool = False,
 ) -> ReviewOrder:
     """Собрать заказ: профиль по диффу, правила, предмет ревью, доступ.
 
@@ -3866,7 +3868,11 @@ async def prepare_review_order(
     )
     only_tests = await _only_tests_of(ctx, diff)
     hub_base = instance_base_url().rstrip("/")
-    code = await _access_code(db, task_id, generation, principal_id)
+    code = (
+        f"__HAIPLANE_PILOT_REVIEW_CODE_{uuid.uuid4().hex}__"
+        if defer_access_code
+        else await _access_code(db, task_id, generation, principal_id)
+    )
     return ReviewOrder(
         model=model_id,
         profile=profile,
@@ -4489,6 +4495,8 @@ async def _prepare_claimed_order(
     Любой отказ после брони её снимает, в том числе исключение подготовки:
     иначе сдача стояла бы без ревью весь срок брони.
     """
+    from hub.services import epic_plan_gates
+
     task_id = int(task["id"])
     if not await _claim_the_order(
         db, task_id, generation, force_profile, replaces_dispatch_id, force_model
@@ -4517,6 +4525,7 @@ async def _prepare_claimed_order(
             principal_id=principal_id,
             force_model=force_model,
             cloud=True,
+            defer_access_code=await epic_plan_gates.managed(db, task_id),
         )
         # Последнее слово перед тратой: подготовка заказа ходит в сеть, и за это окно
         # сдача могла смениться — ЛЮБОЙ облачный заказ, не только переспрос (фильтр
@@ -4569,7 +4578,14 @@ async def _start_paid_review(
             order.prompt,
             hub_url,
         )
-        return await _launch_metered_review(db, task, request, principal_id, ordinal)
+        return await _launch_metered_review(
+            db,
+            task,
+            request,
+            principal_id,
+            ordinal,
+            access_placeholder=order.access_code,
+        )
     started = await _create_or_adopt(
         marker,
         task_id=task_id,
@@ -4591,6 +4607,8 @@ async def _launch_metered_review(
     request: Any,
     principal_id: int | None,
     ordinal: int,
+    *,
+    access_placeholder: str = "",
 ) -> tuple[_Started, Any] | None:
     from hub.services import epic_plan_gates, epic_plan_transport
 
@@ -4604,6 +4622,7 @@ async def _launch_metered_review(
         model=request.model,
         principal_id=principal_id,
         attempt=ordinal,
+        issue_access=bool(access_placeholder),
     )
     if not ready or permit is None:
         return None
@@ -4611,11 +4630,29 @@ async def _launch_metered_review(
         if not await epic_plan_gates.can_prepare_review(db, task):
             return None
         seen = await backend.lookup(request, permit.grant)
-        if not seen.asked:
-            return None
-        if seen.agent_id:
+        if (
+            seen.asked
+            and seen.agent_id
+            and seen.run_id
+            and (not access_placeholder or permit.code_id is not None)
+        ):
             return _Started(seen.agent_id, seen.run_id, True, False, 0, None), permit
-    if not await epic_plan_gates.ready_to_send(db, permit):
+        await epic_plan_gates.note_review_blocker(
+            db,
+            task,
+            epic_plan_gates.ReviewBlocker(
+                "pilot_review_order_unreconciled",
+                "operator",
+                "reconcile_existing_provider_order",
+            ),
+        )
+        return None
+    if access_placeholder:
+        request = replace(
+            request,
+            prompt=request.prompt.replace(access_placeholder, permit.access_code, 1),
+        )
+    if not await epic_plan_gates.begin_review_send(db, permit):
         return None
     return await backend.launch(request, permit.grant), permit
 
@@ -4794,7 +4831,7 @@ async def maybe_dispatch_review(
             principal_id=expected_principal,
             replaces_dispatch_id=replaces_dispatch_id,
             only_tests=order.only_tests,
-            access_code=order.access_code,
+            access_code=permit.access_code if permit is not None else order.access_code,
         )
         # #1399: бронь снимается только ПОСЛЕ того, как долг второй двери записан
         # и разобран. Раньше триггер, пришедший между алертом и заглушкой, покупал
@@ -4822,9 +4859,8 @@ async def maybe_dispatch_review(
     from hub.services import epic_plan_gates
 
     await epic_plan_gates.attach_dispatch(db, permit, placed_id)
-    # #1946: код выписан до строки заказа - привязать его к заказу.
-    await report_binding.bind_code_to_dispatch(
-        db, order.access_code, placed_id, task_id, generation, expected_principal
+    await _bind_review_access(
+        db, order, permit, placed_id, task_id, generation, expected_principal
     )
     # #1399: строка заказа и снятие брони — одна транзакция (коммит ниже).
     await _release_the_order(
@@ -4879,6 +4915,25 @@ async def maybe_dispatch_review(
         agent_id,
     )
     return True
+
+
+async def _bind_review_access(
+    db: aiosqlite.Connection,
+    order: ReviewOrder,
+    permit: Any,
+    dispatch_id: int,
+    task_id: int,
+    generation: int,
+    principal_id: int | None,
+) -> None:
+    if permit is None:
+        await report_binding.bind_code_to_dispatch(
+            db, order.access_code, dispatch_id, task_id, generation, principal_id
+        )
+    else:
+        await report_binding.bind_code_id_to_dispatch(
+            db, permit.code_id, dispatch_id, task_id, generation, principal_id
+        )
 
 
 def _adoption_note(started: _Started) -> str:

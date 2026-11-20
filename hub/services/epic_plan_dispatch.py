@@ -16,6 +16,7 @@ from hub.services import (
     admin,
     chat_pair,
     epic_plan,
+    epic_plan_quota as quota,
     epic_plan_spend as spend,
     epic_plan_transport as transport,
     executor_orders as orders,
@@ -211,7 +212,9 @@ async def _locked_refusal(
         return reason
     if attempt != binding.attempt:
         return "pilot_attempt_moved"
-    return await spend.refusal(db, decision, grant)
+    return await quota.refusal(db, decision, grant) or await spend.refusal(
+        db, decision, grant
+    )
 
 
 async def _repair_causes(
@@ -299,6 +302,7 @@ async def _write_order(
                 executor_order_id=order_id,
                 repair_causes=causes,
             )
+            await quota.resume(db, binding)
             await repo.insert_event(
                 db,
                 kind="epic_plan_executor_ordered",
@@ -354,13 +358,19 @@ async def _prepare_order(
     if not reason:
         binding, reason = await _binding(db, decision, task, generation, attempt)
         if binding is not None:
+            if await quota.waiting(db, binding, before_reset=True):
+                return None, quota.WAITING
             grant = await get_grant(binding)
             if grant is not None and grant.covers(binding):
                 order, reason = await _write_order(db, grant)
                 if order is not None:
                     return order, ""
+            elif await quota.waiting(db, binding):
+                return None, quota.WAITING
             else:
                 reason = "pilot_spending_authority_unavailable"
+    if reason == quota.WAITING:
+        return None, reason
     await epic_plan_escalation.maybe_notify(db, decision, task, reason)
     return None, reason
 

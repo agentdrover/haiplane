@@ -35,7 +35,15 @@ class SpendingGrant(BaseModel):
 
     binding: WorkBinding
     reference: str = Field(pattern=r"^[A-Za-z0-9_.-]{12,128}$")
-    ceiling_cents: int = Field(gt=0)
+    ceiling_cents: int = Field(ge=0)
+    subscription_account_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    subscription_terms_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    quota_available: bool | None = None
+    reset_at: AwareDatetime | None = None
     expires_at: AwareDatetime
     workspace_ready: bool
     hard_cap_enforced: bool
