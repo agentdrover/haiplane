@@ -317,13 +317,13 @@ async def test_rework_round_is_bound_to_new_sha(db, prepared, monkeypatch):
     )
     await repo.update_task(db, 2377, risk_class="R3")
     await db.commit()
-    assert not await gates.ready_to_send(db, reservation)
+    assert not await gates.begin_review_send(db, reservation)
     await repo.update_task(db, 2377, risk_class="R2")
     await db.execute(
         "UPDATE principals SET status='disabled' WHERE id=?", (reviewer_id,)
     )
     await db.commit()
-    assert not await gates.ready_to_send(db, reservation)
+    assert not await gates.begin_review_send(db, reservation)
     await db.execute("UPDATE principals SET status='active' WHERE id=?", (reviewer_id,))
     await db.commit()
 

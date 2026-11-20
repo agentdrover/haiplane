@@ -4647,13 +4647,13 @@ async def _launch_metered_review(
             ),
         )
         return None
-    if not await epic_plan_gates.ready_to_send(db, permit):
-        return None
     if access_placeholder:
         request = replace(
             request,
             prompt=request.prompt.replace(access_placeholder, permit.access_code, 1),
         )
+    if not await epic_plan_gates.begin_review_send(db, permit):
+        return None
     return await backend.launch(request, permit.grant), permit
 
 

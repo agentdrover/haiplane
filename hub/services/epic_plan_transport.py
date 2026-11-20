@@ -57,7 +57,12 @@ class ReviewTransport(SubscriptionTransport, Protocol):
         ...
 
     async def launch(self, request: ReviewRequest, grant: SpendingGrant) -> _Started:
-        """Enforce the structured grant and exact SHA before provider creation."""
+        """Enforce fresh quota, grant and exact SHA at the provider boundary.
+
+        Hub orders the local send transition against plan termination. A
+        provider call can still return after termination, so the adapter must
+        enforce the supplied grant and never authorize a second send.
+        """
         ...
 
 

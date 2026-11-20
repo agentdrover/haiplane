@@ -482,20 +482,19 @@ async def approval_refusal(
     return ""
 
 
-async def ready_to_send(
-    db: aiosqlite.Connection, reservation: ReviewPermit | None
+async def begin_review_send(
+    db: aiosqlite.Connection, reservation: ReviewPermit
 ) -> bool:
-    if reservation is None:
-        return True
+    """Order the single send against plan revocation inside the Hub database."""
+    # A nested write_transaction would leave the marker uncommitted
+    # when the caller crosses the external provider boundary.
+    if reservation.reconcile or db.in_transaction:
+        return False
     async with write_transaction(db):
         row = await _one(
             db, "SELECT * FROM epic_plan_work WHERE id=?", (reservation.id,)
         )
-        if row is None or row["review_dispatch_id"] is not None:
-            return False
-        if row["charged_cents"] is not None or datetime.fromisoformat(
-            row["grant_expires_at"]
-        ) <= datetime.now(UTC):
+        if row is None or not _matches_unsent_review(row, reservation.grant):
             return False
         task = await repo.get_task(db, row["task_id"])
         if (
@@ -510,6 +509,7 @@ async def ready_to_send(
             decision is None
             or reason
             or decision.version != row["plan_version"]
+            or spend.subscription_refusal(decision, reservation.grant)
             or task["risk_class"] not in {"R0", "R1", "R2"}
             or not await _trusted_ci(db, task)
             or await _steward_stop(db, task)
@@ -518,10 +518,42 @@ async def ready_to_send(
             )
         ):
             return False
-        if reservation.reconcile:
-            attempt = await db.execute(
-                "UPDATE epic_plan_work SET send_count=2 WHERE id=? AND send_count=1",
-                (reservation.id,),
-            )
-            return attempt.rowcount == 1
-        return True
+        return await _mark_review_send_started(db, row)
+
+
+def _matches_unsent_review(row: Any, grant: authority.SpendingGrant) -> bool:
+    return (
+        row["phase"] == "review"
+        and row["review_dispatch_id"] is None
+        and row["review_send_started_at"] is None
+        and row["send_count"] == 1
+        and row["charged_cents"] is None
+        and row["authority_ref"] == grant.reference
+        and row["authority_source"] == authority.configured_source_fingerprint()
+        and row["ceiling_cents"] == grant.ceiling_cents
+        and datetime.fromisoformat(row["grant_expires_at"]) == grant.expires_at
+        and grant.covers(spend.binding_of(row))
+    )
+
+
+async def _mark_review_send_started(db: aiosqlite.Connection, row: Any) -> bool:
+    started_at = datetime.now(UTC).isoformat()
+    marked = await db.execute(
+        "UPDATE epic_plan_work SET review_send_started_at=? "
+        "WHERE id=? AND review_send_started_at IS NULL",
+        (started_at, row["id"]),
+    )
+    if marked.rowcount != 1:
+        return False
+    await repo.insert_event(
+        db,
+        kind="epic_plan_review_send_started",
+        task_id=row["task_id"],
+        actor="hub",
+        payload={
+            **spend.binding_of(row).model_dump(),
+            "reservation_id": row["id"],
+            "started_at": started_at,
+        },
+    )
+    return True
