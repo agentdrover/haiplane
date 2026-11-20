@@ -14,7 +14,7 @@ from fastapi import HTTPException
 from hub import repository as repo
 from hub.config import TokenIdentity
 from hub.db import fetchall, write_transaction
-from hub.services import admin, roadmap_decisions
+from hub.services import admin, roadmap_decisions, roadmap_observation_pilot as pilot
 
 SOURCE = "steward_request"
 _ACTIVE_PLAN_STATES = ("open", "claimed", "running", "needs_info", "needs_decision")
@@ -301,6 +301,11 @@ async def grant(
 ) -> dict[str, int]:
     async with write_transaction(db):
         await _require_task_grantor(db, who, task_id)
+        if task_id == pilot.TASK_ID or plan_id == pilot.TASK_ID:
+            _conflict(
+                "roadmap_activation_required",
+                "pilot requires its approved local activation",
+            )
         snapshot = await _plan_snapshot(db, task_id, plan_id)
         if snapshot is None:
             raise HTTPException(
@@ -374,6 +379,9 @@ async def _current(db: aiosqlite.Connection, row: aiosqlite.Row) -> bool:
         )
         and await _active_principal(db, row["steward_id"], "roadmap_steward")
         and await _active_principal(db, row["roadmap_id"], "agent")
+        and (
+            row["task_id"] != pilot.TASK_ID or await pilot.authority_is_current(db, row)
+        )
     )
 
 
@@ -470,7 +478,7 @@ async def grant_signal(
         project = await repo.get_project(db, row["project_id"])
         if project is None:
             raise HTTPException(404, "roadmap project not found")
-        return {
+        response = {
             "grant_id": row["id"],
             "project": project["slug"],
             "plan_id": row["plan_id"],
@@ -481,6 +489,10 @@ async def grant_signal(
                 db, row["id"]
             ),
         }
+        receipt = await pilot.pilot_for_grant(db, row["id"])
+        if receipt is not None:
+            response.update(await pilot.grant_signal(db, receipt))
+        return response
 
 
 async def issue(
@@ -492,6 +504,7 @@ async def issue(
     request_id: str,
     question: str,
     source_order_id: int | None,
+    observation_batch_id: int | None = None,
 ) -> dict[str, Any]:
     async with write_transaction(db):
         row = await _steward_grant(db, who, task_id)
@@ -499,6 +512,8 @@ async def issue(
             raise HTTPException(404, "roadmap grant not found")
         if row["id"] != grant_id:
             _conflict("roadmap_grant_stale", "roadmap grant was replaced")
+        receipt = await pilot.pilot_for_grant(db, row["id"])
+        await pilot.check_source(db, receipt, observation_batch_id, source_order_id)
         if not await _signal_is_current(db, row, source_order_id):
             _conflict(
                 "roadmap_source_invalid",
@@ -520,6 +535,15 @@ async def issue(
                     "request identifier already used for another request",
                 )
             return {"order_id": previous["order_id"], "repeat": True}
+        if receipt is not None:
+            blocked = await pilot.block_if_unissued(db, who, receipt)
+            if blocked is not None:
+                return blocked
+        if receipt is not None and receipt["order_id"] is not None:
+            _conflict(
+                "roadmap_source_already_requested",
+                "pilot already requested its consultation",
+            )
         if source_order_id is not None and await _source_already_consulted(
             db,
             grant_id,
@@ -530,12 +554,14 @@ async def issue(
                 "source order already has a roadmap request",
             )
         order_id = await _make_order(db, row, request_id, question, source_order_id)
+        if receipt is not None:
+            await pilot.bind_order(db, receipt, order_id)
         await _audit(
             db,
             who,
             "roadmap_requested",
             task_id,
-            f"grant={row['id']} plan={plan_id} order={order_id} source_order={source_order_id}",
+            f"grant={row['id']} plan={plan_id} order={order_id} source_order={source_order_id} batch={observation_batch_id}",
         )
         return {"order_id": order_id, "repeat": False}
 
@@ -562,6 +588,12 @@ async def order_is_current(db: aiosqlite.Connection, order_id: int) -> bool:
 
 
 async def _request_is_current(db: aiosqlite.Connection, row: aiosqlite.Row) -> bool:
+    receipt = await pilot.pilot_for_grant(db, row["id"])
+    if receipt is not None and (
+        receipt["order_id"] != row["initial_order_id"]
+        or await pilot.consultation_state(db, receipt) not in ("pending", "ready")
+    ):
+        return False
     return await _current(db, row) and await _signal_is_current(
         db, row, row["source_order_id"]
     )
@@ -609,11 +641,15 @@ async def started_question(
         project = await repo.get_project(db, row["project_id"])
         if project is None:
             raise HTTPException(404, "roadmap project not found")
+        context = roadmap_decisions.decision_context(row)
+        receipt = await pilot.pilot_for_grant(db, row["id"])
+        if receipt is not None:
+            context = await pilot.decision_context(db, receipt, context)
         return {
             "order_id": order_id,
             "task_id": row["task_id"],
             "project": project["slug"],
             "source_kind": SOURCE,
             "question": row["question"],
-            "decision_context": roadmap_decisions.decision_context(row),
+            "decision_context": context,
         }

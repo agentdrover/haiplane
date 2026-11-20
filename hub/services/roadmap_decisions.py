@@ -12,7 +12,8 @@ from fastapi import HTTPException
 from hub import repository as repo
 from hub.config import TokenIdentity
 from hub.db import fetchall, write_transaction
-from hub.services.roadmap_contracts import RoadmapResult
+from hub.services import roadmap_observation_pilot as pilot
+from hub.services.roadmap_contracts import RoadmapBasis, RoadmapResult
 
 # A plan AC opts in with this exact log_check locator. Never infer a threshold
 # or a technical mandate from natural-language plan text or a role's suggestion.
@@ -94,6 +95,9 @@ async def record_result(
     if request is None:
         raise HTTPException(409, "roadmap request is unavailable")
     context = decision_context(request)
+    receipt = await pilot.pilot_for_grant(db, request["id"])
+    if receipt is not None:
+        context = await pilot.decision_context(db, receipt, context)
     await db.execute(
         "INSERT INTO roadmap_results "
         "(order_id, request_pk, grant_id, context_json, result_json) VALUES (?,?,?,?,?)",
@@ -127,7 +131,7 @@ def _route(context: dict, result: RoadmapResult) -> tuple[str, str]:
         return "blocked", "insufficient_facts"
     basis = result.basis
     if (
-        basis is None
+        not isinstance(basis, RoadmapBasis)
         or basis.source_order_id != context["signal"]["order_id"]
         or all(check["id"] != basis.check_id for check in context["checks"])
         or result.risk != "repeat_redeem_failure"
@@ -146,7 +150,7 @@ def _view(
     repeat: bool,
 ) -> dict[str, Any]:
     condition = None
-    if status == "accepted" and result.basis is not None:
+    if status == "accepted" and isinstance(result.basis, RoadmapBasis):
         check = next(
             check for check in context["checks"] if check["id"] == result.basis.check_id
         )
@@ -181,7 +185,12 @@ async def evaluate(
                 "roadmap_grant_stale", "roadmap grant was replaced"
             )
         request = await roadmap_requests._request(db, order_id)
-        if request is None or request["id"] != grant_id or request["state"] != "done":
+        if request is None or request["id"] != grant_id:
+            raise HTTPException(404, "roadmap result not found")
+        receipt = await pilot.pilot_for_grant(db, grant_id)
+        if receipt is not None:
+            return await pilot.evaluate(db, who, receipt, request, order_id)
+        if request["state"] != "done":
             raise HTTPException(404, "roadmap result not found")
         rows = await fetchall(
             db,
