@@ -3360,6 +3360,10 @@ async def _step_delivery_pr(state: SubmitContext) -> None:
     # create_pr does), so the delivery gate would key on a field nobody fills. A discovery
     # failure records nothing and the submission proceeds: a task with no PR (config work) must
     # submit as before.
+    from hub.services.network_receipt import dedicated_worker_required
+
+    if await dedicated_worker_required(state.db, state.task_id):
+        return
     state.discovered_pr = None
     state.pr_opened_by_hub = False
     state.pr_ensure_note = ""

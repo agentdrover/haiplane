@@ -73,9 +73,11 @@ async def undelivered_advisory(
     Advisory by design: the completion is not blocked, and anything unknown
     stays silent.
     """
-    if body.kind != "done":
-        return ""
     from hub.services.delivery_gate import undelivered_warning
+    from hub.services.network_receipt import dedicated_worker_required
+
+    if body.kind != "done" or await dedicated_worker_required(db, task["id"]):
+        return ""
 
     try:
         return await undelivered_warning(db, task)

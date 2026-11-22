@@ -1,11 +1,15 @@
 """The exact published receipt submits once and awaits an ordinary human verdict."""
 
 import asyncio
+import subprocess
 from unittest.mock import AsyncMock
 
 from hub import repository as repo
+from hub.integrations.git_ops import GitOpsIntegration
+from hub.integrations.registry import plugins
 from hub.services import (
     lifecycle,
+    network_receipt as receipt_service,
     network_receipt_verification as verifier,
     review_dispatch,
 )
@@ -201,12 +205,64 @@ async def test_ordinary_submit_cannot_bypass_independent_proof(pilot, monkeypatc
     ] == 0
 
 
-async def test_dedicated_done_waits_for_human_verdict_and_completes_normally(
-    pilot, monkeypatch
+def _git(directory, *arguments):
+    return subprocess.check_output(
+        ["git", "-C", str(directory), *arguments], text=True
+    ).strip()
+
+
+def _receipt_origin(path, branch):
+    origin = path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "--initial-branch=main")
+    working = path / "working"
+    _git(path, "clone", str(origin), str(working))
+    _git(working, "config", "user.name", "Receipt fixture")
+    _git(working, "config", "user.email", "receipt@example.invalid")
+    _git(working, "commit", "--allow-empty", "-m", "Measured main")
+    head = _git(working, "rev-parse", "HEAD")
+    _git(working, "switch", "-c", branch)
+    receipt = working / "evidence" / "k8-network-receipt-2413.json"
+    receipt.parent.mkdir()
+    receipt.write_text("{}\n")
+    _git(working, "add", "evidence")
+    _git(working, "commit", "-m", "Publish receipt")
+    commit = _git(working, "rev-parse", "HEAD")
+    _git(working, "switch", "main")
+    _git(working, "commit", "--allow-empty", "-m", "Advance main")
+    _git(working, "push", "origin", "main", branch)
+    hub_clone = path / "hub"
+    _git(path, "clone", str(origin), str(hub_clone))
+    assert _git(hub_clone, "rev-parse", "main") != head
+    assert _git(hub_clone, "merge-base", "main", f"origin/{branch}") == head
+    return origin, hub_clone, head, commit
+
+
+async def test_dedicated_done_preserves_verified_receipt_when_main_advances(
+    pilot, monkeypatch, tmp_path
 ):
     world, mandate, owner = pilot
+    branch = receipt_service.BRANCH
+    origin, hub_clone, head, commit = _receipt_origin(tmp_path, branch)
+    monkeypatch.setattr(scenarios, "_HEAD", head)
+    monkeypatch.setattr(scenarios, "_COMMIT", commit)
+    git_ops = GitOpsIntegration()
+
+    async def diff_paths(observed_branch, **_context):
+        return await git_ops.branch_diff_paths(
+            observed_branch, base_branch="main", repo=str(hub_clone)
+        )
+
+    assert await diff_paths(branch) == ["evidence/k8-network-receipt-2413.json"]
+    discover_pr = AsyncMock(return_value=None)
+    monkeypatch.setattr(plugins.git_ops, "branch_diff_paths", diff_paths)
+    monkeypatch.setattr(plugins.git_ops, "pr_for_branch", discover_pr)
+    create_pr = AsyncMock(return_value=99)
+    update_pr = AsyncMock()
+    monkeypatch.setattr(plugins.git_ops, "create_pr", create_pr)
+    monkeypatch.setattr(plugins.git_ops, "update_pr_branch", update_pr)
     order = await _publish(world)
-    verify, recheck, _ = _external(monkeypatch)
+    verify, recheck, _ = _external(monkeypatch, tip=commit)
     response = await world.client.post(
         f"/api/tasks/{mandate.task_id}/updates",
         headers=owner,
@@ -218,6 +274,9 @@ async def test_dedicated_done_waits_for_human_verdict_and_completes_normally(
     assert waiting.status_code == 200 and waiting.json() == order
     row = await repo.get_task(world.db, mandate.task_id)
     assert row["status"] == "review" and not row["review_verdict"]
+    assert row["submission_sha"] == commit and row["pr_number"] is None
+    discover_pr.assert_not_awaited()
+    create_pr.assert_not_awaited()
 
     recheck.return_value = verifier.ReceiptVerification(True, True, True)
     target = f"/api/tasks/{mandate.task_id}/review-verdict"
@@ -237,7 +296,33 @@ async def test_dedicated_done_waits_for_human_verdict_and_completes_normally(
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["status"] == "running"
     final = verifier.ReceiptVerification(True, True, True, True)
-    verify.return_value = recheck.return_value = final
+    recheck.return_value = final
+
+    async def live_verification(_db, **candidate):
+        assert candidate["commit_sha"] == commit
+        observed = _git(
+            origin, "for-each-ref", "--format=%(objectname)", f"refs/heads/{branch}"
+        )
+        return final if observed == commit else verifier.ReceiptVerification()
+
+    verify.side_effect = live_verification
+    ref = f"refs/heads/{branch}"
+    _git(origin, "update-ref", "-d", ref)
+    direct = await world.client.post(
+        f"/api/tasks/{mandate.task_id}/updates",
+        headers=owner,
+        json={"kind": "done", "content": "Attempt direct completion"},
+    )
+    assert direct.status_code == 409, direct.text
+    assert (await scenarios._issue(world)).json() == order
+    assert (await repo.get_task(world.db, mandate.task_id))["status"] == "running"
+    updates = await repo.get_task_updates(world.db, mandate.task_id)
+    assert not any(update["kind"] == "done" for update in updates)
+
+    _git(origin, "update-ref", ref, commit)
+    # Historical PR metadata is retained, but does not own delivery of evidence.
+    await repo.update_task(world.db, mandate.task_id, pr_number=99)
+    await world.db.commit()
     finish = lifecycle._finish_deferred_done
     with monkeypatch.context() as interrupted:
         interrupted.setattr(lifecycle, "_finish_deferred_done", AsyncMock())
@@ -250,6 +335,10 @@ async def test_dedicated_done_waits_for_human_verdict_and_completes_normally(
     row = await repo.get_task(world.db, mandate.task_id)
     assert row["status"] == "completed"
     assert row["review_verdict"] == "approved" and row["submission_generation"] == 1
+    assert row["submission_sha"] == commit and row["pr_number"] == 99
+    discover_pr.assert_not_awaited()
+    create_pr.assert_not_awaited()
+    update_pr.assert_not_awaited()
     again = await scenarios._issue(world)
     assert again.status_code == 200 and again.json() == order
     updates = await repo.get_task_updates(world.db, mandate.task_id)

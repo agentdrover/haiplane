@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
+import aiosqlite
 from fastapi import HTTPException
 
 from hub import repository as repo
@@ -16,8 +19,9 @@ from hub.services import (
 )
 
 
-def is_pilot_task(task_id):
-    return task_id == pilot.TASK_ID
+_VERIFIED_COMPLETION: ContextVar[
+    tuple[aiosqlite.Connection, tuple[int, str, str, str]] | None
+] = ContextVar("network_receipt_verified_completion", default=None)
 
 
 def _candidate(order):
@@ -144,8 +148,8 @@ async def _pending(db, steward, order_id):
             return None
         task = await repo.get_task(db, pilot.TASK_ID)
         if order["submitted_generation"]:
-            if not task or task["status"] != "running" or task["pr_number"]:
-                return None  # Normal pair delivery handles an attached PR.
+            if not task or task["status"] != "running":
+                return None
             if not await receipt_completion_allowed(db, dict(task)):
                 return None
             return _candidate(order), True
@@ -232,7 +236,20 @@ async def receipt_completion_allowed(db, task):
     return await _receipt_proof_ok(db, task, needs_verdict=True)
 
 
+async def done_authorized(db, task_id):
+    """Bind a final write to the live check on this steward tick and connection."""
+    if not await pilot.dedicated_worker_required(db, task_id):
+        return True
+    authorized = _VERIFIED_COMPLETION.get()
+    if authorized is None or authorized[0] is not db:
+        return False
+    order = await pilot._order(db)
+    return bool(order and _candidate(order) == authorized[1])
+
+
 async def require_receipt_done(db, task, body):
+    if not await done_authorized(db, task["id"]):
+        raise HTTPException(409, "finish this network receipt through the steward tick")
     if not await receipt_completion_allowed(db, task):
         raise HTTPException(
             409, "network receipt must be verified and approved before done"
@@ -256,7 +273,7 @@ async def _verify_candidate(db, candidate):
 
 
 async def submit_verified_publication(db, steward, order_id):
-    """Advance a verified publication through submission, then normal completion."""
+    """Submit the verified branch evidence and complete it after owner approval."""
     pending = await _pending(db, steward, order_id)
     if pending is None:
         return
@@ -264,7 +281,11 @@ async def submit_verified_publication(db, steward, order_id):
     proof = await _verify_candidate(db, candidate)
     if submitted:
         if proof.accepted:
-            await _finish_without_pr(db, steward, candidate)
+            token = _VERIFIED_COMPLETION.set((db, candidate))
+            try:
+                await _finish_without_pr(db, steward, candidate)
+            finally:
+                _VERIFIED_COMPLETION.reset(token)
     elif proof.commit_verified and proof.ci_verified:
         await _submit(db, steward, candidate)
 

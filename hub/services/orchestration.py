@@ -4226,17 +4226,10 @@ async def _merge_approval_row(
 ) -> tuple[Any, str]:
     from hub.services import epic_plan, epic_plan_gates
 
-    from hub.services.network_receipt_submission import (
-        is_pilot_task,
-        receipt_completion_allowed,
-    )
+    from hub.services.network_receipt import dedicated_worker_required
 
-    if is_pilot_task(task_id):
-        async with write_transaction(db):
-            row = await repo.get_task(db, task_id)
-            if row is not None and not await receipt_completion_allowed(db, dict(row)):
-                return row, "network receipt approval no longer stands"
-            return row, ""
+    if await dedicated_worker_required(db, task_id):
+        return None, "network receipt is delivered on its verified branch"
     if task_id not in epic_plan.LEAVES:
         return await repo.get_task(db, task_id), ""
     # Serialize the last plan authorization with the owner's revoke/stop write.
@@ -4823,6 +4816,18 @@ async def _record_branch_update(
     )
 
 
+async def _code_pr_refusal(
+    db: aiosqlite.Connection, task_id: int, pr_num: int | None
+) -> str:
+    from hub.services.network_receipt import dedicated_worker_required
+
+    if await dedicated_worker_required(db, task_id):
+        return "network receipt is delivered on its verified branch"
+    if pr_num is None:
+        return "no_pr: у задачи нет номера PR — доставлять нечего"
+    return ""
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -4842,12 +4847,9 @@ async def merge_before_completion(
     """
     task_id = task["id"]
     pr_num = task.get("pr_number")
-    if pr_num is None:
-        # Вызывающий пускает сюда только задачи с номером PR (#605), но внутри
-        # это нигде не было сказано, и проверка типов справедливо считала, что
-        # в GitHub может уехать None. Инвариант записан явно: отказ с причиной
-        # дешевле падения на первом же вызове с None.
-        return False, "no_pr: у задачи нет номера PR — доставлять нечего"
+    refusal = await _code_pr_refusal(db, task_id, pr_num)
+    if pr_num is None or refusal:
+        return False, refusal
     try:
         # Already delivered — by the headless conveyor, or by an earlier done
         # report that failed after the merge. Merging twice is not extra
@@ -5576,6 +5578,13 @@ async def _complete_without_review(
 
     Всегда возвращает исход: ни один путь внутри не проваливается наружу.
     """
+    from hub.services.network_receipt import dedicated_worker_required
+
+    if await dedicated_worker_required(db, task["id"]):
+        # The published receipt is delivered on its verified branch. A code PR
+        # could replace the commit that the trusted CI and owner accepted.
+        return await _finish_done_write(db, task, exit_code, result_text)
+
     task_id = task["id"]
     branch = task.get("branch")
     pr_note = ""
@@ -5641,12 +5650,24 @@ async def _complete_without_review(
         if delivered is not None:
             return delivered
 
+    return await _finish_done_write(
+        db, task, exit_code, result_text, pr_delivered=bool(task.get("pr_number"))
+    )
+
+
+async def _finish_done_write(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    exit_code: int | None,
+    result_text: str | None,
+    *,
+    pr_delivered: bool = False,
+) -> str:
     # Review gate satisfied: either an explicit auto_review opt-out or
     # the current submission already has an APPROVED verdict. Complete
     # WITHOUT bumping the generation — no new work is being submitted,
     # and a bump would invalidate the very approval that authorizes
     # this completion (#306).
-    pr_delivered = bool(task.get("pr_number"))
     if (written := await _write_completed(db, task, exit_code, result_text)) is None:
         return "needs_decision"
     if written == "reconciliation_wait":
@@ -5684,10 +5705,11 @@ async def _write_completed(
     and the network delivery (merge) happened before it too.
     """
     from hub.services import merged_delivery
+    from hub.services.network_receipt_submission import done_authorized
 
     task_id = task["id"]
     async with write_transaction(db):
-        if not await approval_stands(db, task):
+        if not (await done_authorized(db, task_id) and await approval_stands(db, task)):
             return False
         if gap := await merged_delivery.completion_gap(db, task):
             await merged_delivery.note_completion_wait(db, task, gap)
