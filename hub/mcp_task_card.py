@@ -47,6 +47,7 @@ CARD_FIELDS: tuple[str, ...] = (
     "worktree_path",
     "owner_minutes",
     "last_executor_order",
+    "network_receipt_order",
     "delivery_rerun",
     "role_orders",
     "critic_order",

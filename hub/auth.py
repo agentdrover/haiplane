@@ -494,6 +494,17 @@ SLOT_RUNNER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("GET", "/api/executor-hosts/{name}/role-orders/{order_id}/outbox"),
     ("POST", "/api/executor-hosts/{name}/role-orders/{order_id}/outbox"),
     ("GET", "/api/executor-hosts/{name}/role-orders/{order_id}/outbox/{delivery_id}"),
+    ("POST", "/api/executor-hosts/{name}/network-receipt/2413/ready"),
+    ("GET", "/api/executor-hosts/{name}/network-receipt/2413/order"),
+    ("GET", "/api/executor-hosts/{name}/network-receipt/2413/publication"),
+    (
+        "POST",
+        "/api/executor-hosts/{name}/network-receipt/2413/orders/{order_id}/receipt",
+    ),
+    (
+        "POST",
+        "/api/executor-hosts/{name}/network-receipt/2413/orders/{order_id}/publication",
+    ),
     ("GET", "/api/executor-hosts/{name}/roadmap-pilot/2406/observations"),
     ("POST", "/api/executor-hosts/{name}/roadmap-pilot/2406/observations"),
     ("GET", "/api/executor-hosts/{name}/roadmap-pilot/2406/effect"),
@@ -944,6 +955,7 @@ def _steward_refused(identity: TokenIdentity, method: str, path: str) -> bool:
 
 
 _ROADMAP_STEWARD_ALLOWED = (
+    ("POST", _template_to_regex("/api/tasks/2413/network-receipt/issue")),
     ("GET", _template_to_regex("/api/tasks/{task_id}/roadmap-grant")),
     ("POST", _template_to_regex("/api/tasks/{task_id}/roadmap-requests")),
     (
