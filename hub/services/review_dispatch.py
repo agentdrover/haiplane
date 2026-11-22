@@ -4649,6 +4649,12 @@ def _note_unknown_reviewer(task_id: int, expected_principal: int | None) -> None
         )
 
 
+async def _automation_not_applicable_to_review(db, task):
+    from hub.services.network_receipt_submission import verified_human_submission
+
+    return automation_not_applicable(task) or await verified_human_submission(db, task)
+
+
 async def maybe_dispatch_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -4686,7 +4692,7 @@ async def maybe_dispatch_review(
     # #1647: единый предикат первым в том же условии. Все пять входов (сдача,
     # добор лестницы, повторный заказ, вторая ось, вторая дверь) сходятся сюда.
     if (
-        automation_not_applicable(task)
+        await _automation_not_applicable_to_review(db, task)
         or task.get("status") != "review"
         or task.get("review_job_id")
     ):
@@ -5403,7 +5409,7 @@ async def dispatch_local_review(
     Cursor), и не-deep отклоняется молча: lite остаётся в облаке.
     """
     task_id = int(task["id"])
-    if automation_not_applicable(task):
+    if await _automation_not_applicable_to_review(db, task):
         # #1647: свой затвор у второй двери — её зовут и мимо maybe_dispatch_review.
         return False
     from hub.services.epic_plan_gates import managed

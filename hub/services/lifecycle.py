@@ -944,8 +944,9 @@ async def enrich_task_view(
     task_view.owner_minutes = await owner_minutes.task_estimate(db, task_view.id)
 
     # #1941: последний host-заказ и «после неудачного прогона» - чистое чтение одним снимком.
-    from hub.services import executor_triage
+    from hub.services import executor_triage, network_receipt
 
+    task_view.network_receipt_order = await network_receipt.card_view(db, task_view.id)
     task_view.last_executor_order = await executor_triage.last_executor_order_view(
         db, task_view.id
     )
@@ -1950,6 +1951,27 @@ async def _stamp_claim(
     )
 
 
+async def _pair_branch(db, task_id, task, body) -> tuple[PairGitMode, str]:
+    git_mode = body.git_mode
+    slug = (body.branch_slug or "").strip()
+    if is_state(task):
+        # #1647: у задачи-состояния нет ни ветки, ни worktree; git не зовётся ни
+        # в одном режиме. Записанный remote держит и последующие места (сдача,
+        # возврат в работу) подальше от git хоста хаба.
+        git_mode = PairGitMode.remote
+        branch = ""
+    elif git_mode == PairGitMode.remote:
+        # Record the canonical name only. The caller creates this branch in
+        # its own clone; the hub host must not checkout, clean, or worktree.
+        branch = canonical_task_branch(task_id, slug, task.get("title") or "")
+    else:
+        try:
+            branch = await prepare_pair_branch(db, task_id, task, branch_slug=slug)
+        except PairBranchConflictError as exc:
+            raise HTTPException(422, detail=exc.to_detail()) from exc
+    return git_mode, branch
+
+
 async def _pair_start_write(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1962,6 +1984,7 @@ async def _pair_start_write(
     starting_status: str,
     project_guard: SessionProjectGuard,
     session_token: str = "",
+    before_pair_transition: Callable[[], Awaitable[None]] | None = None,
 ) -> PairGitMode:
     """Plan, branch and the transition to running, up to the commit (#1433).
 
@@ -1985,23 +2008,7 @@ async def _pair_start_write(
             "with kind='status' and content starting with 'Plan:'.",
         )
 
-    git_mode = body.git_mode
-    slug = (body.branch_slug or "").strip()
-    if is_state(task):
-        # #1647: у задачи-состояния нет ни ветки, ни worktree; git не зовётся ни
-        # в одном режиме. Записанный remote держит и последующие места (сдача,
-        # возврат в работу) подальше от git хоста хаба.
-        git_mode = PairGitMode.remote
-        branch = ""
-    elif git_mode == PairGitMode.remote:
-        # Record the canonical name only. The caller creates this branch in
-        # its own clone; the hub host must not checkout, clean, or worktree.
-        branch = canonical_task_branch(task_id, slug, task.get("title") or "")
-    else:
-        try:
-            branch = await prepare_pair_branch(db, task_id, task, branch_slug=slug)
-        except PairBranchConflictError as exc:
-            raise HTTPException(422, detail=exc.to_detail()) from exc
+    git_mode, branch = await _pair_branch(db, task_id, task, body)
     if branch:
         task["branch"] = branch
 
@@ -2041,6 +2048,8 @@ async def _pair_start_write(
 
     caller_run = await chat_pair.run_of_session(db, session_token, task_id)
     await run_claim.refuse_over_live_run(db, task_id, caller_run, session_token)
+    if before_pair_transition is not None:
+        await before_pair_transition()
     if body.plan:
         await repo.add_task_update(
             db,
@@ -2123,6 +2132,7 @@ async def _pair_start_core(
     implementer_principal_id: int | None = None,
     caller_is_agent: bool = False,
     session_token: str = "",
+    before_pair_transition: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[TaskView, Any]:
     """Start an open task in pair mode: running without headless dispatch.
 
@@ -2237,6 +2247,7 @@ async def _pair_start_core(
             starting_status=starting_status,
             project_guard=project_guard,
             session_token=session_token if caller_is_agent else "",
+            before_pair_transition=before_pair_transition,
         )
     # #1683: навык, уже лежащий в заказе ВЫЗЫВАЮЩЕЙ сессии, второй раз не
     # выдаётся. Слой собирается здесь, чтобы факт выдачи лёг в то же событие.
@@ -2603,6 +2614,8 @@ class SubmitContext:
     # два списка можно сравнивать по существу, а не по названиям.
     body: TaskSubmitReview = dc_field(default_factory=TaskSubmitReview)
 
+    before_submit_transition: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+
     resubmitted_from_review: bool = False
     #: #1362: сдача пришла из needs_decision после конфликта с базой.
     base_conflict_kind: str = ""  # писатель: merge_failed | base_update_conflict
@@ -2667,6 +2680,20 @@ class SubmitContext:
     #: прочитана из базы (``ci_computed``), гейты читают её.
     dry_run: bool = False
     ci_computed: Any = None
+
+    async def guard_transition(self, live: dict[str, Any]) -> None:
+        await _guard_ordinary_submission(
+            self.db, self.task_id, self.before_submit_transition
+        )
+        if self.before_submit_transition is not None:
+            await self.before_submit_transition(live)
+
+
+async def _guard_ordinary_submission(db, task_id, before_submit_transition) -> None:
+    if before_submit_transition is None:
+        from hub.services.network_receipt_submission import refuse_ordinary_submission
+
+        await refuse_ordinary_submission(db, task_id)
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -3530,6 +3557,7 @@ async def submit_for_review(
     body: TaskSubmitReview | None = None,
     *,
     principal_id: int | None = None,
+    before_submit_transition: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> TaskView:
     """Submit the current work of a pair task for client-driven review (#305).
 
@@ -3560,6 +3588,7 @@ async def submit_for_review(
         raise HTTPException(404, "task not found")
     task = dict(row)
     body = body or TaskSubmitReview()
+    await _guard_ordinary_submission(db, task_id, before_submit_transition)
     if is_state(task):
         # #1647: задача-состояние сдаётся доказательствами, без ветки, CI и
         # ревью; commit-конвейер ниже её не видит. ``principal_id`` — автор
@@ -3570,7 +3599,13 @@ async def submit_for_review(
         await behavior_snapshot.refuse_if_unspecified(db, task)
         return await submit_state(db, task_id, task, body, principal_id=principal_id)
 
-    state = SubmitContext(db=db, task_id=task_id, task=task, body=body)
+    state = SubmitContext(
+        db=db,
+        task_id=task_id,
+        task=task,
+        body=body,
+        before_submit_transition=before_submit_transition,
+    )
     await run_steps(state, SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK)
 
     if state.same_sha_noop:
@@ -3644,6 +3679,7 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await _step_surfaces(state)
 
     async with write_transaction(db):
+        await _guard_ordinary_submission(db, task_id, state.before_submit_transition)
         await critic_orders.accept_in_transaction(
             db, state.task, observed=state.submission_sha, always=True
         )  # #1953
@@ -4055,6 +4091,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
             and live.get("submission_sha") == submission_sha
         ):
             raise _SameShaRaced(live)  # #2057: тот же sha уже сдан под локом
+        await state.guard_transition(live)
         if (
             not body.finding_outcomes
             and resubmission_guard.empty_resubmission_of(live, submission_sha)

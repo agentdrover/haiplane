@@ -47,16 +47,21 @@ async def _plan_snapshot(
     task_id: int,
     plan_id: int,
     pinned_approval: int = 0,
+    *,
+    include_submitted: bool = False,
 ) -> tuple[int, int, int, int] | None:
+    states = _ACTIVE_PLAN_STATES + (
+        ("review", "completed") if include_submitted else ()
+    )
     plan = await repo.get_task(db, plan_id)
     task = await repo.get_task(db, task_id)
     if (
         plan is None
         or plan["archived"]
-        or plan["status"] not in _ACTIVE_PLAN_STATES
+        or plan["status"] not in states
         or task is None
         or task["archived"]
-        or task["status"] not in _ACTIVE_PLAN_STATES
+        or task["status"] not in states
     ):
         return None
     project = await repo.resolve_bound_project(db, task_id)

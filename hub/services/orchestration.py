@@ -4208,8 +4208,14 @@ async def approval_stands(db: aiosqlite.Connection, task: dict[str, Any]) -> boo
     у остальных нужен APPROVED на текущей сдаче, не закрытый решением человека
     (#1286). Снимок вызывающего не читается вовсе: его возраст и есть дефект.
     """
+    from hub.services.network_receipt_submission import receipt_completion_allowed
+
     row = await repo.get_task(db, int(task["id"]))
-    return row is not None and _approval_holds(dict(row), task)
+    return (
+        row is not None
+        and _approval_holds(dict(row), task)
+        and await receipt_completion_allowed(db, dict(row))
+    )
 
 
 async def _merge_approval_row(
@@ -4217,6 +4223,17 @@ async def _merge_approval_row(
 ) -> tuple[Any, str]:
     from hub.services import epic_plan, epic_plan_gates
 
+    from hub.services.network_receipt_submission import (
+        is_pilot_task,
+        receipt_completion_allowed,
+    )
+
+    if is_pilot_task(task_id):
+        async with write_transaction(db):
+            row = await repo.get_task(db, task_id)
+            if row is not None and not await receipt_completion_allowed(db, dict(row)):
+                return row, "network receipt approval no longer stands"
+            return row, ""
     if task_id not in epic_plan.LEAVES:
         return await repo.get_task(db, task_id), ""
     # Serialize the last plan authorization with the owner's revoke/stop write.

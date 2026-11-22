@@ -166,6 +166,9 @@ async def dry_run_submit(
     db, task_id: int, body: TaskSubmitReview | None = None
 ) -> SubmitDryRunView:
     """Пробная сдача pair-задачи: тот же отказ, что у настоящей, и ни одной записи."""
+    from hub.services.network_receipt_submission import refuse_ordinary_submission
+
+    await refuse_ordinary_submission(db, task_id)
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")

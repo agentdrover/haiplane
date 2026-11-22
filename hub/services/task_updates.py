@@ -255,6 +255,10 @@ async def _inside_savepoint(
     principal_id: int | None,
 ) -> int:
     """Everything the savepoint protects; the ONE ``commit`` here is the original one."""
+    if body.kind == "done":
+        from hub.services.network_receipt_submission import require_receipt_done
+
+        await require_receipt_done(db, task, body)
     update_id = await _write_row_and_prevention(db, task, body, principal_id)
     await _record_finding_outcomes(db, task, body)
     await _route_done(db, task, body)
