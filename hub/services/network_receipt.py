@@ -172,6 +172,14 @@ def identity(row):
 async def dedicated_worker_required(db, task_id):
     if task_id != TASK_ID:
         return False
+    reserved = await _one(
+        db,
+        "SELECT 1 FROM network_receipt_orders WHERE task_id=? UNION ALL "
+        "SELECT 1 FROM events WHERE id=? AND task_id=? AND kind='task_approved' AND actor='human' LIMIT 1",
+        (task_id, MANDATE.approval_id, task_id),
+    )
+    if reserved:
+        return True
     project = await repo.resolve_bound_project(db, task_id)
     return bool(
         project

@@ -368,3 +368,28 @@ async def test_issuer_revoked_after_final_check_cannot_record_done(pilot, monkey
         row["kind"] == "done"
         for row in await repo.get_task_updates(world.db, mandate.task_id)
     )
+
+
+async def test_project_drift_keeps_order_reserved_and_prevents_completion(
+    pilot, monkeypatch
+):
+    from hub.services import network_receipt_submission
+
+    world, mandate, owner = pilot
+    await _publish(world)
+    _external(monkeypatch)
+    assert (await scenarios._issue(world)).status_code == 200
+    await repo.update_project(world.db, world.pid, repo="other/repository")
+    await world.db.commit()
+    task = dict(await repo.get_task(world.db, mandate.task_id))
+    assert not await network_receipt_submission.receipt_completion_allowed(
+        world.db, task
+    )
+    assert await review_dispatch._automation_not_applicable_to_review(world.db, task)
+    response = await world.client.post(
+        f"/api/tasks/{mandate.task_id}/force-complete",
+        headers=owner,
+        json={"comment": "override"},
+    )
+    assert response.status_code == 409
+    assert (await scenarios._issue(world)).status_code == 409

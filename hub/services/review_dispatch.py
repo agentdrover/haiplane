@@ -4650,9 +4650,11 @@ def _note_unknown_reviewer(task_id: int, expected_principal: int | None) -> None
 
 
 async def _automation_not_applicable_to_review(db, task):
-    from hub.services.network_receipt_submission import verified_human_submission
+    from hub.services.network_receipt import dedicated_worker_required
 
-    return automation_not_applicable(task) or await verified_human_submission(db, task)
+    return automation_not_applicable(task) or await dedicated_worker_required(
+        db, task["id"]
+    )
 
 
 async def maybe_dispatch_review(
