@@ -96,7 +96,7 @@ async def live_runner_grant(db, grant):
     )
 
 
-async def _authorized(db, who, *, steward=False):
+async def _authorized(db, who, *, steward=False, allow_stamped=False):
     await _require_live_key(db, who, "roadmap_steward" if steward else "slot_runner")
     if steward:
         if who.principal_id != MANDATE.steward_id:
@@ -120,7 +120,7 @@ async def _authorized(db, who, *, steward=False):
     )
     if fresh is None:
         raise HTTPException(409, "network receipt mandate expired")
-    submitted = steward and await _one(
+    submitted = (steward or allow_stamped) and await _one(
         db,
         "SELECT 1 FROM network_receipt_orders o JOIN tasks t ON t.id=o.task_id "
         "WHERE o.approval_id=? AND o.task_id=? AND o.submitted_generation=t.submission_generation "
@@ -219,8 +219,9 @@ async def issue(db: aiosqlite.Connection, who: TokenIdentity):
         ):
             raise HTTPException(409, "pilot conditions changed before issuance")
         await db.execute(
-            "INSERT INTO network_receipt_orders(approval_id,task_id,receipt_id) VALUES(?,?,?)",
-            (MANDATE.approval_id, TASK_ID, secrets.token_hex(16)),
+            "INSERT INTO network_receipt_orders(approval_id,task_id,receipt_id,steward_key_id) "
+            "VALUES(?,?,?,?)",
+            (MANDATE.approval_id, TASK_ID, secrets.token_hex(16), who.api_key_id),
         )
 
     try:
@@ -251,8 +252,20 @@ async def issue(db: aiosqlite.Connection, who: TokenIdentity):
     return identity(await _order(db))
 
 
+def _current_worker_stage(task, order):
+    if order["submitted_generation"] is None:
+        return task["status"] == "running"
+    return (
+        task["status"] in {"running", "review", "completed"}
+        and order["submitted_generation"] == task["submission_generation"]
+        and order["commit_sha"] == task["submission_sha"]
+        and order["head_sha"] is not None
+        and order["commit_sha"] is not None
+    )
+
+
 async def _worker_order(db, who, order_id=None):
-    grant = await _authorized(db, who)
+    grant = await _authorized(db, who, allow_stamped=True)
     row = await _order(db)
     if not row and order_id is None:
         return None
@@ -264,7 +277,7 @@ async def _worker_order(db, who, order_id=None):
         or grant["runner_id"] != who.principal_id
         or grant["ready_key_id"] != who.api_key_id
         or task["implementer_principal_id"] != who.principal_id
-        or task["status"] != "running"
+        or not _current_worker_stage(task, row)
         or task["branch"] != BRANCH
         or task["assigned_agent"] != WORKER
     ):
@@ -275,7 +288,7 @@ async def _worker_order(db, who, order_id=None):
 async def current(db, who, *, publication=False):
     async with roadmap_requests._read_snapshot(db):
         row = await _worker_order(db, who)
-        if not row:
+        if not row or row["submitted_generation"] is not None:
             return None
         if not publication:
             return identity(row)

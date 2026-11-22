@@ -146,6 +146,20 @@ async def test_card_tracks_current_stamp_ci_and_separate_verdict(pilot, monkeypa
     await repo.update_task(
         world.db, task_id, review_verdict_generation=1, review_verdict="approved"
     )
+    withdrawn = await read()
+    assert withdrawn["stage"] == "held" and not withdrawn["accepted"]
+    await repo.insert_event(
+        world.db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="pilot-administrator",
+        payload={
+            "verdict": "approved",
+            "submission_generation": 1,
+            "principal_id": mandate.approver_id,
+            "human": True,
+        },
+    )
     accepted = await read()
     assert accepted["stage"] == "accepted" and accepted["accepted"]
     # Ordinary pair approval without an attached PR returns to running before report_done.

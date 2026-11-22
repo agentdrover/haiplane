@@ -43,9 +43,43 @@ async def _fixed_task(db, task):
 
 
 async def refuse_ordinary_submission(db, task_id):
-    """A dedicated order cannot enter ordinary pair submission without its proof."""
-    if task_id == pilot.TASK_ID and await pilot._order(db):
+    """Reserve the fixed receipt lifecycle before the steward issues a ticket."""
+    if await pilot.dedicated_worker_required(db, task_id):
         raise HTTPException(409, "submit this network receipt through the steward tick")
+
+
+async def require_owner_actor(db, task_id, verdict, *, human_caller, principal_id):
+    if verdict != "approved" or not await pilot.dedicated_worker_required(db, task_id):
+        return False
+    if not human_caller or principal_id != pilot.MANDATE.approver_id:
+        raise HTTPException(403, "network receipt approval is reserved for its owner")
+    return True
+
+
+async def require_owner_verdict(state):
+    """Bind APPROVED to the authenticated DoR owner and the exact pilot generation."""
+    if not await require_owner_actor(
+        state.db,
+        state.task_id,
+        state.body.verdict.value,
+        human_caller=state.human_caller,
+        principal_id=state.principal_id,
+    ):
+        return
+    row = await repo.get_task(state.db, state.task_id)
+    expected = state.task.get("submission_generation")
+    if (
+        row is None
+        or row["submission_generation"] != expected
+        or row["submission_sha"] != state.task.get("submission_sha")
+        or state.body.expected_generation not in (None, expected)
+        or state.expected_generation not in (None, expected)
+        or state.diverged_tip
+        or state.sha_note
+        or not await _receipt_proof_ok(state.db, dict(row), needs_verdict=False)
+    ):
+        raise HTTPException(409, "network receipt approval no longer current")
+    state.expected_generation = expected
 
 
 async def verified_human_submission(db, task):
@@ -104,6 +138,8 @@ async def _pending(db, steward, order_id):
         order = await pilot._order(db)
         if not order or order["id"] != order_id:
             raise HTTPException(409, "network receipt order no longer current")
+        if order["steward_key_id"] != steward.api_key_id:
+            raise HTTPException(403, "network receipt requires its issuing steward key")
         if not order["commit_sha"]:
             return None
         task = await repo.get_task(db, pilot.TASK_ID)
@@ -129,13 +165,30 @@ async def _prior_done(db, order):
     )
 
 
-async def receipt_completion_allowed(db, task):
+async def _current_owner_accepted(db, task):
+    event = await pilot._one(
+        db,
+        "SELECT json_extract(payload, '$.principal_id') AS principal_id, "
+        "json_extract(payload, '$.human') AS human, "
+        "json_extract(payload, '$.verdict') AS verdict FROM events "
+        "WHERE task_id=? AND kind='review_verdict_recorded' "
+        "AND json_extract(payload, '$.submission_generation')=? "
+        "ORDER BY id DESC LIMIT 1",
+        (pilot.TASK_ID, task["submission_generation"]),
+    )
+    return bool(
+        event
+        and event["principal_id"] == pilot.MANDATE.approver_id
+        and event["human"] == 1
+        and event["verdict"] == "approved"
+    )
+
+
+async def _receipt_proof_ok(db, task, *, needs_verdict):
     """Protect normal completion paths with the current stamped receipt and verdict."""
-    if task["id"] != pilot.TASK_ID:
-        return True
     order = await pilot._order(db)
     if not order:
-        return True
+        return False
     if not await verified_human_submission(db, task):
         return False
     grant = await pilot._one(
@@ -144,7 +197,16 @@ async def receipt_completion_allowed(db, task):
         "WHERE m.approval_id=? AND datetime(e.created_at,'+7 days') > datetime('now')",
         (pilot.MANDATE.approval_id,),
     )
-    if not grant or grant["revoked_at"] or not await pilot.live_runner_grant(db, grant):
+    if (
+        not grant
+        or grant["revoked_at"]
+        or grant["runner_id"] != task["implementer_principal_id"]
+        or await executor_orders.host_of_principal(db, grant["runner_id"]) != pilot.HOST
+        or not await pilot.live_runner_grant(db, grant)
+        or not await pilot._key_is_live(
+            db, order["steward_key_id"], pilot.MANDATE.steward_id, "roadmap_steward"
+        )
+    ):
         return False
     try:
         await roadmap_activation._verify_approval(
@@ -156,7 +218,18 @@ async def receipt_completion_allowed(db, task):
     proof = await verifier.recheck_network_receipt(
         db, commit_sha=order["commit_sha"], commit_verified=True
     )
-    return proof.accepted
+    return (
+        proof.accepted and await _current_owner_accepted(db, task)
+        if needs_verdict
+        else (proof.commit_verified and proof.ci_verified and proof.submission_verified)
+    )
+
+
+async def receipt_completion_allowed(db, task):
+    """Leave ordinary tasks alone and require verified owner acceptance for #2413."""
+    if not await pilot.dedicated_worker_required(db, task["id"]):
+        return True
+    return await _receipt_proof_ok(db, task, needs_verdict=True)
 
 
 async def require_receipt_done(db, task, body):
@@ -197,11 +270,25 @@ async def submit_verified_publication(db, steward, order_id):
 
 
 async def _finish_without_pr(db, steward, candidate):
-    from hub.services.lifecycle import add_update
+    from hub.services.lifecycle import _finish_deferred_done, add_update
 
     order_id, _, _, commit_sha = candidate
     order = await pilot._order(db)
     if await _prior_done(db, order):
+        # Its standard done row survived a crash or temporary delivery wait.
+        # Reuse the normal guarded tail with the original submission binding.
+        await _finish_deferred_done(
+            db,
+            pilot.TASK_ID,
+            [
+                {
+                    "task_id": pilot.TASK_ID,
+                    "exit_code": None,
+                    "result_text": None,
+                    "generation": order["submitted_generation"],
+                }
+            ],
+        )
         return
     await add_update(
         db,
@@ -221,7 +308,12 @@ async def _submit(db, steward, candidate):
     async def guard(live):
         grant = await pilot._authorized(db, steward, steward=True)
         order = await pilot._order(db)
-        if not order or _candidate(order) != candidate or order["submitted_generation"]:
+        if (
+            not order
+            or _candidate(order) != candidate
+            or order["submitted_generation"]
+            or order["steward_key_id"] != steward.api_key_id
+        ):
             raise HTTPException(409, "published receipt changed before submission")
         await _require_running_worker(db, grant, live)
         current = await verifier.recheck_network_receipt(

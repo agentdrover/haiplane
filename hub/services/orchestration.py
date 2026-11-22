@@ -1925,6 +1925,9 @@ async def dispatch_task(
     """Dispatch a task via oc-dev-dispatch, creating a branch if needed."""
     from hub.services.epic_plan import refuse_legacy_start
 
+    from hub.services.network_receipt_submission import refuse_ordinary_submission
+
+    await refuse_ordinary_submission(db, task_id)
     await refuse_legacy_start(db, task_id)
     if automation_not_applicable(task):
         # #1647: общий затвор headless-запуска (start, approve(run), создание с

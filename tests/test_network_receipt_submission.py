@@ -219,19 +219,32 @@ async def test_dedicated_done_waits_for_human_verdict_and_completes_normally(
     row = await repo.get_task(world.db, mandate.task_id)
     assert row["status"] == "review" and not row["review_verdict"]
 
-    accepted = await world.client.post(
-        f"/api/tasks/{mandate.task_id}/review-verdict",
-        headers=owner,
-        json={
-            "verdict": "approved",
-            "expected_generation": 1,
-            "comments": "Owner accepted evidence",
-        },
+    recheck.return_value = verifier.ReceiptVerification(True, True, True)
+    target = f"/api/tasks/{mandate.task_id}/review-verdict"
+    approval = {
+        "verdict": "approved",
+        "expected_generation": 1,
+        "comments": "Owner accepted evidence",
+    }
+    for other in (world.agent_auth, world.human_auth):
+        refused = await world.client.post(target, headers=other, json=approval)
+        assert refused.status_code == 403, refused.text
+    stale = await world.client.post(
+        target, headers=owner, json=approval | {"expected_generation": 2}
     )
+    assert stale.status_code == 409, stale.text
+    accepted = await world.client.post(target, headers=owner, json=approval)
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["status"] == "running"
     final = verifier.ReceiptVerification(True, True, True, True)
     verify.return_value = recheck.return_value = final
+    finish = lifecycle._finish_deferred_done
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(lifecycle, "_finish_deferred_done", AsyncMock())
+        first = await scenarios._issue(world)
+        assert first.status_code == 200 and first.json() == order
+        assert (await repo.get_task(world.db, mandate.task_id))["status"] == "running"
+    assert lifecycle._finish_deferred_done is finish
     tick = await scenarios._issue(world)
     assert tick.status_code == 200 and tick.json() == order, tick.text
     row = await repo.get_task(world.db, mandate.task_id)
@@ -241,3 +254,117 @@ async def test_dedicated_done_waits_for_human_verdict_and_completes_normally(
     assert again.status_code == 200 and again.json() == order
     updates = await repo.get_task_updates(world.db, mandate.task_id)
     assert sum(row["kind"] == "done" for row in updates) == 1
+
+
+async def test_lost_worker_ack_after_submission_replays_only_the_recorded_result(
+    pilot, monkeypatch
+):
+    world, mandate, _ = pilot
+    order = await _publish(world)
+    _external(monkeypatch)
+    assert (await scenarios._issue(world)).status_code == 200
+    publication = f"{scenarios._HOST}/orders/{order['order_id']}/publication"
+    for status in ("review", "completed"):
+        await repo.update_task(world.db, mandate.task_id, status=status)
+        await world.db.commit()
+        assert (await scenarios._order(world)).status_code == 204
+        repeated = await scenarios._post_receipt(world, scenarios._receipt(order))
+        assert repeated.status_code == 200 and repeated.json()["repeat"] is True
+        assert (
+            await world.client.post(
+                publication,
+                headers=world.k8_auth,
+                json={"commit_sha": scenarios._COMMIT},
+            )
+        ).status_code == 200
+        assert (
+            await world.client.post(
+                publication, headers=world.k8_auth, json={"commit_sha": "c" * 40}
+            )
+        ).status_code == 409
+        assert (await repo.get_task(world.db, mandate.task_id))[
+            "submission_generation"
+        ] == 1
+
+
+async def test_fixed_pilot_cannot_be_taken_before_steward_issues(pilot):
+    world, mandate, owner = pilot
+    routes = {
+        "claim": {"agent": "other", "session_id": "other"},
+        "start": {"plan": "other"},
+        "pair-start": {"plan": "other", "git_mode": "remote"},
+        "submit-review": {"expected_sha": scenarios._COMMIT},
+        "force-complete": {"comment": "unsafe override"},
+    }
+    for method, body in routes.items():
+        denied = await world.client.post(
+            f"/api/tasks/{mandate.task_id}/{method}", headers=owner, json=body
+        )
+        assert denied.status_code == 409, (method, denied.text)
+    row = await repo.get_task(world.db, mandate.task_id)
+    assert row["status"] == "open" and row["submission_generation"] == 0
+    assert not await support.rows(world.db, "SELECT * FROM network_receipt_orders")
+    assert (await scenarios._ready(world)).status_code == 200
+    assert (await scenarios._issue(world)).status_code == 200
+
+    await repo.update_task(world.db, mandate.task_id, status="needs_decision")
+    for action in ("accept", "rework"):
+        denied = await world.client.post(
+            f"/api/tasks/{mandate.task_id}/decide",
+            headers=owner,
+            json={"action": action, "decision_summary": "other"},
+        )
+        assert denied.status_code == 409, (action, denied.text)
+    assert (await repo.get_task(world.db, mandate.task_id))[
+        "status"
+    ] == "needs_decision"
+
+    ordinary = await support.task_in_project(world, "normal task")
+    allowed = await world.client.post(
+        f"/api/tasks/{ordinary}/pair-start",
+        headers=owner,
+        json={"plan": "normal workflow", "git_mode": "remote"},
+    )
+    assert allowed.status_code == 200 and allowed.json()["status"] == "running", (
+        allowed.text
+    )
+
+
+async def test_issuer_revoked_after_final_check_cannot_record_done(pilot, monkeypatch):
+    world, mandate, owner = pilot
+    await _publish(world)
+    verify, recheck, _ = _external(monkeypatch)
+    result = await scenarios._issue(world)
+    assert result.status_code == 200, result.text
+    recheck.return_value = verifier.ReceiptVerification(True, True, True)
+    verdict = await world.client.post(
+        f"/api/tasks/{mandate.task_id}/review-verdict",
+        headers=owner,
+        json={
+            "verdict": "approved",
+            "expected_generation": 1,
+            "comments": "Owner verified",
+        },
+    )
+    assert verdict.status_code == 200, verdict.text
+    final = verifier.ReceiptVerification(True, True, True, True)
+    recheck.return_value = final
+
+    async def revoke_after_verifying(db, **_kwargs):
+        assert not db.in_transaction
+        await world.db.execute(
+            "UPDATE api_keys SET revoked_at=datetime('now') "
+            "WHERE id=(SELECT steward_key_id FROM network_receipt_orders WHERE task_id=?)",
+            (mandate.task_id,),
+        )
+        await world.db.commit()
+        return final
+
+    verify.side_effect = revoke_after_verifying
+    denied = await scenarios._issue(world)
+    assert denied.status_code == 409, denied.text
+    assert (await repo.get_task(world.db, mandate.task_id))["status"] == "running"
+    assert not any(
+        row["kind"] == "done"
+        for row in await repo.get_task_updates(world.db, mandate.task_id)
+    )

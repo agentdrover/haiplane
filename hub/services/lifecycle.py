@@ -1442,6 +1442,7 @@ async def approve_task(
 
     body = body or TaskApprove()
     if body.run:
+        await _require_ordinary_workflow(db, task_id)
         from hub.services.epic_plan import refuse_legacy_start
 
         await refuse_legacy_start(db, task_id)
@@ -1850,6 +1851,13 @@ async def capture_areas(
             raise
 
 
+async def _require_ordinary_workflow(db, task_id, pilot_hook=None):
+    if pilot_hook is None:
+        from hub.services.network_receipt_submission import refuse_ordinary_submission
+
+        await refuse_ordinary_submission(db, task_id)
+
+
 async def start_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1859,6 +1867,7 @@ async def start_task(
     from hub.services.epic_plan import refuse_legacy_start
 
     await refuse_legacy_start(db, task_id)
+    await _require_ordinary_workflow(db, task_id)
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -2032,6 +2041,7 @@ async def _pair_start_write(
         update_fields["claim_session_id"] = declared_session
 
     await project_guard.lock(db, task_id)
+    await _require_ordinary_workflow(db, task_id, before_pair_transition)
     fresh = _existing_task(await repo.get_task(db, task_id), task_id)
     if fresh["status"] != starting_status or (
         starting_status == "claimed"
@@ -2156,6 +2166,7 @@ async def _pair_start_core(
     from hub.services.epic_plan import refuse_legacy_start
 
     await refuse_legacy_start(db, task_id)
+    await _require_ordinary_workflow(db, task_id, before_pair_transition)
     assigned_agent = (body.assigned_agent or "").strip() if body else ""
     if not assigned_agent:
         assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
@@ -2682,18 +2693,11 @@ class SubmitContext:
     ci_computed: Any = None
 
     async def guard_transition(self, live: dict[str, Any]) -> None:
-        await _guard_ordinary_submission(
+        await _require_ordinary_workflow(
             self.db, self.task_id, self.before_submit_transition
         )
         if self.before_submit_transition is not None:
             await self.before_submit_transition(live)
-
-
-async def _guard_ordinary_submission(db, task_id, before_submit_transition) -> None:
-    if before_submit_transition is None:
-        from hub.services.network_receipt_submission import refuse_ordinary_submission
-
-        await refuse_ordinary_submission(db, task_id)
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -3588,7 +3592,7 @@ async def submit_for_review(
         raise HTTPException(404, "task not found")
     task = dict(row)
     body = body or TaskSubmitReview()
-    await _guard_ordinary_submission(db, task_id, before_submit_transition)
+    await _require_ordinary_workflow(db, task_id, before_submit_transition)
     if is_state(task):
         # #1647: задача-состояние сдаётся доказательствами, без ветки, CI и
         # ревью; commit-конвейер ниже её не видит. ``principal_id`` — автор
@@ -3679,7 +3683,7 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await _step_surfaces(state)
 
     async with write_transaction(db):
-        await _guard_ordinary_submission(db, task_id, state.before_submit_transition)
+        await _require_ordinary_workflow(db, task_id, state.before_submit_transition)
         await critic_orders.accept_in_transaction(
             db, state.task, observed=state.submission_sha, always=True
         )  # #1953
@@ -4420,6 +4424,9 @@ async def _vstep_has_a_submission(state: VerdictContext) -> None:
 async def _vstep_pilot_approval(state: VerdictContext) -> None:
     if state.body.verdict.value != "approved":
         return
+    from hub.services.network_receipt_submission import require_owner_verdict
+
+    await require_owner_verdict(state)
     from hub.services.epic_plan_gates import approval_refusal, managed
 
     if not await managed(state.db, state.task_id):
@@ -4929,6 +4936,15 @@ async def record_review_verdict(
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
+    from hub.services.network_receipt_submission import require_owner_actor
+
+    await require_owner_actor(
+        db,
+        task_id,
+        body.verdict.value,
+        human_caller=human_caller,
+        principal_id=principal_id,
+    )
     # #1872: первым шагом, до state-ветки и до _standing_verdict_gate — отказ
     # не зависит от маршрута, статуса и стоящего вердикта и ничего не пишет.
     verdict_guard.ensure_approval_is_human(
@@ -5144,7 +5160,6 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
     body = state.body
     self_approved = state.self_approved
     principal_id = state.principal_id
-    expected_generation = state.expected_generation
     claim = state.claim
 
     # Контракт между конвейером и записью вердикта.
@@ -5169,7 +5184,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             body.verdict.value,
             findings_json=findings_json,
             self_approved=self_approved,
-            expected_generation=expected_generation,
+            expected_generation=state.expected_generation,
             claim=claim,
             supersedes_revision=body.supersedes_revision,
             digest=state.digest,
@@ -5179,7 +5194,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             # вердикт на неё поставил другой писатель или заменили стоящий.
             # Запись не состоялась ни на какое поколение; транзакция
             # откатывается целиком.
-            raise verdict_guard.not_written_refusal(task, expected_generation)
+            raise verdict_guard.not_written_refusal(task, state.expected_generation)
         written_generation = await _written_verdict_generation(db, task_id)
         ghost_generation: int | None = None
         agent, content = _verdict_update_text(state)
@@ -5296,6 +5311,7 @@ async def _claim_write(
     """
     from hub.services import chat_pair, run_claim
 
+    await _require_ordinary_workflow(db, task_id)
     caller_run = await chat_pair.run_of_session(db, session_token, task_id)
     await run_claim.refuse_over_live_run(db, task_id, caller_run, session_token)
     if not await repo.transition_status_if(
@@ -5373,6 +5389,7 @@ async def claim_task(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
+    await _require_ordinary_workflow(db, task_id)
 
     # #852: a claim without a session leaves a task nobody can be reached
     # about. Refused BEFORE the status transition — a refusal has to happen
@@ -5884,6 +5901,7 @@ async def return_to_work(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
+    await _require_ordinary_workflow(db, task_id)
     from_status = task["status"]
     state_task = is_state(task)
     if body.manual_claim_recovery and (from_status != "running" or state_task):
@@ -6112,6 +6130,7 @@ async def decide_task(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
+    await _require_ordinary_workflow(db, task_id)
     if task["status"] != "needs_decision":
         raise HTTPException(
             400,
@@ -6669,6 +6688,7 @@ async def force_complete_task(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
+    await _require_ordinary_workflow(db, task_id)
     status = task["status"]
     final_values = {s.value for s in FINAL_STATUSES}
     if status in final_values:

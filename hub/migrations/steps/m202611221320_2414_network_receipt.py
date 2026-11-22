@@ -18,7 +18,7 @@ MIGRATIONS = [
             receipt_id TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             head_sha TEXT, measured_at TEXT, commit_sha TEXT, published_at TEXT,
-            submitted_generation INTEGER
+            submitted_generation INTEGER, steward_key_id INTEGER
         )""",
     ),
 ]
