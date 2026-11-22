@@ -1436,6 +1436,10 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
     parts.extend(filter(None, [_cause_suggestion_line(task)]))
     parts.extend(filter(None, [_verdict_route_line(task)]))
     parts.extend(owner_minutes_lines(task))
+    if receipt := task.get("network_receipt_order"):
+        parts.append(
+            f"Network receipt order #{receipt['order_id']} on {receipt['host']} ({receipt.get('stage', 'issued')})"
+        )
     parts.extend(executor_order_lines(task))
     parts.extend(delivery_rerun_lines(task))
     parts.extend(role_order_lines(task))

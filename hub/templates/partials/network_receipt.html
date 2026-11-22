@@ -1,0 +1,16 @@
+
+{% set order = task.network_receipt_order %}
+{% set stages = {
+    'issued': 'Выдан', 'measured': 'Измерение получено',
+    'published': 'Квитанция опубликована', 'awaiting_ci': 'Ожидает CI',
+    'awaiting_verdict': 'Ожидает вердикта', 'accepted': 'Принят',
+    'submission_changed': 'Сдача изменилась', 'revoked': 'Мандат отозван',
+    'changes_requested': 'Требуется доработка', 'verdict_withdrawn': 'Вердикт отозван',
+    'stopped': 'Остановлен'
+} %}
+<section class="task-content-card" aria-label="Контрольный заказ k8">
+    <div class="task-card-header"><h2>Заказ №{{ order.order_id }} на {{ order.host }}</h2></div>
+    <p>{{ stages.get(order.stage, order.stage) }}</p>
+    {% if order.commit_sha %}<p>Коммит квитанции <code>{{ order.commit_sha }}</code></p>{% endif %}
+    {% if order.submitted_generation %}<p>Сдача №{{ order.submitted_generation }}</p>{% endif %}
+</section>
