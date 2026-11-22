@@ -3422,7 +3422,9 @@ class TaskView(PlainSummaryView):
     lifecycle_hint: str | None = None
     # #1874: owner-minutes estimate (accruals by norms); None on list paths.
     owner_minutes: OwnerMinutesView | None = None
-    network_receipt_order: dict[str, Any] | None = None
+    network_receipt_order: dict[str, Any] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     last_executor_order: dict[str, Any] | None = None  # #1941: single read only
     delivery_rerun: dict[str, Any] | None = None  # #1956: история перезапуска CI
     role_orders: list[dict[str, Any]] = Field(default_factory=list)  # #1973: card read
