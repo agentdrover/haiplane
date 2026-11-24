@@ -183,6 +183,8 @@ PROVEN_EMPTY_MAX_CLASS = env_get("PROVEN_EMPTY_MAX_CLASS", "r1")
 # unrecognised value reads as `off`, the same way AUTO_APPROVE_MAX_CLASS
 # treats a typo: a mistyped drop-in must not switch a contour ON.
 STEWARD_MODE = env_get("STEWARD_MODE", "off")
+# An empty or malformed pilot scope closes pilot writes. Unset preserves legacy policy.
+STEWARD_ACT_PILOT = os.environ.get(brand.ENV_PREFIX + "STEWARD_ACT_PILOT")
 # Runs per project per UTC day (#1073, owner's decision 28.08.2026). The cap
 # is about predictability rather than money: hitting it escalates with the
 # code `daily_cap` and the task goes down today's human route — it never

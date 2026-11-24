@@ -21,10 +21,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
 
+from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.models import RiskClass
@@ -160,15 +162,18 @@ async def _candidate(db: aiosqlite.Connection, row: Any) -> dict[str, Any] | Non
     from hub.services.steward_advisor import advisor_state, cap_refusal
     from hub.services.steward_apply import policy_refusal
     from hub.services.steward_double_clean import may_apply_to_class
+    from hub.services.steward_limited_act import refusal_for
 
     task_id, generation = int(row["task_id"]), int(row["generation"])
     if await task_automation_not_applicable(db, task_id):
         return None  # задача-state контуру не отдаётся — кандидатом не является
     blocked: list[dict[str, str]] = []
     unknown: list[dict[str, str]] = []
-    not_delegated = await policy_refusal(db, task_id)
-    if not_delegated:
-        blocked.append(_reason(*not_delegated))
+    scope_refusal = await policy_refusal(db, task_id) or await refusal_for(
+        db, task_id, generation
+    )
+    if scope_refusal:
+        blocked.append(_reason(*scope_refusal))
     project = await repo.resolve_project_for_task(db, task_id)
     policy = project_policy.gate_policy_of(project) if project is not None else {}
     ceiling = ceiling_reason(
@@ -220,9 +225,18 @@ async def candidates(db: aiosqlite.Connection) -> list[dict[str, Any]]:
 
 
 async def delegated_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
-    """Проекты, где вердикт отдан стюарду: act применит approve на каждом."""
+    """Проекты, где делегирован вердикт в пределах настроенного охвата."""
+    from hub.services.steward_limited_act import read_pilot
+
+    pilot = read_pilot()
+    if config.STEWARD_ACT_PILOT is not None and (
+        pilot is None or pilot.active_pin(datetime.now(timezone.utc)) is None
+    ):
+        return []
     out: list[dict[str, Any]] = []
     for project in await repo.list_projects(db):
+        if pilot is not None and project["slug"] != pilot.project:
+            continue
         if not steward_dispatch.verdict_delegated_to_steward(project):
             continue
         policy = project_policy.gate_policy_of(project)
@@ -287,8 +301,14 @@ async def readiness_report(
             state: sum(1 for c in found if c["state"] == state)
             for state in (READY, BLOCKED, UNKNOWN)
         },
-        "note": UNCHECKED_NOTE,
+        "note": UNCHECKED_NOTE + _pilot_note(),
     }
+
+
+def _pilot_note() -> str:
+    if config.STEWARD_ACT_PILOT is None:
+        return ""
+    return "; пилот дополнительно ограничивает эффект одной закреплённой сдачей до R1"
 
 
 def unknown_report(reason: str) -> dict[str, Any]:

@@ -1078,7 +1078,7 @@ async def policy_refusal(
 
 
 async def authority_refusal(
-    db: aiosqlite.Connection, task_id: int
+    db: aiosqlite.Connection, task_id: int, generation: int | None
 ) -> tuple[str, str] | None:
     """Есть ли у стюарда право двигать задачу СЕЙЧАС: ``act`` выдан и вердикт ему отдан.
 
@@ -1098,7 +1098,11 @@ async def authority_refusal(
             "выдана - применять нечего"
             + "".join(f" [{item}]" for item in await act_unmet_now(db)),
         )
-    return await policy_refusal(db, task_id)
+    from hub.services.steward_limited_act import refusal_for
+
+    return await policy_refusal(db, task_id) or await refusal_for(
+        db, task_id, generation
+    )
 
 
 async def write_refusal(
@@ -1118,7 +1122,7 @@ async def write_refusal(
     from hub.services.steward_empty_report import write_refusal as empty_refusal
 
     return (
-        await authority_refusal(db, task_id)
+        await authority_refusal(db, task_id, generation)
         or await cap_refusal(db, task_id, generation)
         or await empty_refusal(db, task_id, generation)  # #2082: без сети
     )

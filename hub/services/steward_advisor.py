@@ -1124,8 +1124,11 @@ async def _apply_one(db: aiosqlite.Connection, item: dict[str, Any]) -> bool:
     """
     from hub.services.steward_applied import ESCALATED_TO_HUMAN, APPLIED
     from hub.services.steward_applied import apply_self_approval
+    from hub.services.steward_limited_act import refusal_for
 
     task_id, generation = int(item["task_id"]), int(item["generation"])
+    if await refusal_for(db, task_id, generation):
+        return False
     if await task_automation_not_applicable(db, task_id):
         return False  # #1647: исход советника к state-задаче не применяется
     state = await advisor_state(db, task_id, generation)

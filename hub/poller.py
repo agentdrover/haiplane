@@ -1727,6 +1727,12 @@ async def _sweep_executor_orders(db) -> None:
     except Exception:  # noqa: BLE001 - the sweep must not kill the loop
         log.exception("executor order sweep failed")
     await retry_answer_reopens(db)
+    try:
+        from hub.services.executor_limited_retry import sweep
+
+        await sweep(db)
+    except Exception:  # noqa: BLE001 - the retry must not kill the loop
+        log.exception("steward executor retry sweep failed")
 
 
 async def _sweep_epic_plan(db) -> None:
