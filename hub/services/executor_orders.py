@@ -900,6 +900,10 @@ async def _issue(
     text, starting_ref = await _order_text(db, project, task, booked.bundle)
     if pilot_start is not None:
         starting_ref, model = pilot_start
+        text += (
+            f"\n\nСтартовый коммит заказа: `{starting_ref}`. "
+            f"Модель по плану: `{model}`."
+        )
     else:
         model = ""
     row_id = await repo.create_executor_run(

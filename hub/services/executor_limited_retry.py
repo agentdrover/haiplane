@@ -89,12 +89,13 @@ async def _intent(db: aiosqlite.Connection) -> RetryIntent | None:
     project = await repo.resolve_project_for_task(db, active.task_id)
     if project is None or project["slug"] != pilot.project:
         return None
-    if not await _source_matches(db, active):
+    source_order_id = await _retry_source_id(db, active, pilot.approval_event_id)
+    if source_order_id is None:
         return None
 
     retry = active.retry
     return RetryIntent(
-        retry.source_order_id,
+        source_order_id,
         active.task_id,
         active.statement_generation,
         active.submission_generation + 1,
@@ -105,17 +106,19 @@ async def _intent(db: aiosqlite.Connection) -> RetryIntent | None:
     )
 
 
-async def _source_matches(db: aiosqlite.Connection, active: scope.TaskPin) -> bool:
+async def _retry_source_id(
+    db: aiosqlite.Connection, active: scope.TaskPin, approval_event_id: int
+) -> int | None:
     source = active.retry
     if source is None:
-        return False
+        return None
     rows = await fetchall(
         db,
-        """SELECT 1
+        """SELECT o.id
            FROM executor_orders o
            JOIN tasks t ON t.id = o.task_id
            JOIN executor_runs r ON r.id = o.executor_run_id
-           WHERE o.id = ? AND t.id = ? AND o.host = 'k8'
+           WHERE (? IS NULL OR o.id = ?) AND t.id = ? AND o.host = 'k8'
              AND o.project_slug = 'default' AND o.state = 'closed'
              AND o.ack_result = 'redeem_failed' AND o.close_reason = o.ack_result
              AND o.closed_at IS NOT NULL AND o.acked_at IS NOT NULL
@@ -127,10 +130,15 @@ async def _source_matches(db: aiosqlite.Connection, active: scope.TaskPin) -> bo
              AND t.status = 'open' AND NOT t.archived AND t.risk_class IN ('R0', 'R1')
              AND t.statement_generation = ? AND o.statement_generation = t.statement_generation
              AND t.submission_generation = ? AND o.generation = t.submission_generation + 1
+             AND (t.submission_generation = 0 OR t.submission_sha = ?)
              AND r.task_id = t.id AND r.submission_generation = o.generation
              AND r.channel = 'slot' AND r.slot = o.host AND r.outcome = 'aborted'
              AND r.starting_ref = ? AND r.model = ?
              AND r.agent_id = '' AND r.run_id = ''
+             AND EXISTS (
+                 SELECT 1 FROM events e WHERE e.task_id = t.id AND e.kind = ?
+                   AND json_extract(e.payload, '$.source_order_id') = o.id
+                   AND json_extract(e.payload, '$.approval_event_id') = ?)
              AND NOT EXISTS (SELECT 1 FROM chat_pair_sessions s WHERE s.executor_run_id = r.id)
              AND NOT EXISTS (SELECT 1 FROM executor_orders newer
                              WHERE newer.task_id = o.task_id AND newer.id > o.id)
@@ -143,14 +151,18 @@ async def _source_matches(db: aiosqlite.Connection, active: scope.TaskPin) -> bo
            """,
         (
             source.source_order_id,
+            source.source_order_id,
             active.task_id,
             active.statement_generation,
             active.submission_generation,
+            active.sha,
             source.starting_sha,
             source.model,
+            scope.RETRY_SOURCE_EVENT,
+            approval_event_id,
         ),
     )
-    return bool(rows)
+    return int(rows[0]["id"]) if rows else None
 
 
 async def _wait_for_quota(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Any, Literal
 
 import aiosqlite
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
@@ -15,14 +15,15 @@ from hub.db import fetchall
 from hub.services.statement_generation import statement_fingerprint
 
 REFUSED = "steward_pilot_scope"
+RETRY_SOURCE_EVENT = "steward_executor_retry_source"
 
 
 class RetryTarget(BaseModel):
-    """An explicitly authorized previously closed k8 order."""
+    """An approved launch pin, optionally restricted to a known source order."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    source_order_id: int = Field(gt=0)
+    source_order_id: int | None = Field(default=None, gt=0)
     starting_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     model: str = Field(min_length=1, max_length=96)
 
@@ -100,6 +101,41 @@ async def approval_matches(db: aiosqlite.Connection, pilot: Pilot) -> bool:
         and stamp.get("statement_fingerprint")
         == await statement_fingerprint(db, pilot.plan_id)
     )
+
+
+async def retry_source_pin(
+    db: aiosqlite.Connection, task: dict[str, Any], project: str, host: str
+) -> tuple[int, RetryTarget] | None:
+    """Bind an ordinary slot launch to a current, approved pilot before it is issued."""
+    if host != "k8" or project != "default" or task["status"] != "open":
+        return None
+
+    pilot = read_pilot()
+    active = pilot.active_pin(datetime.now(timezone.utc)) if pilot else None
+    if pilot is None or active is None or active.retry is None:
+        return None
+    if active.retry.source_order_id is not None:
+        return None
+    if (
+        task["id"] != active.task_id
+        or task["archived"]
+        or task["risk_class"] not in {"R0", "R1"}
+        or task["statement_generation"] != active.statement_generation
+        or task["submission_generation"] != active.submission_generation
+        or (active.submission_generation > 0 and task["submission_sha"] != active.sha)
+    ):
+        return None
+
+    from hub.services.steward_apply import policy_refusal
+    from hub.services.steward_shadow import act_granted_now
+
+    if (
+        await policy_refusal(db, active.task_id)
+        or not await act_granted_now(db)
+        or not await approval_matches(db, pilot)
+    ):
+        return None
+    return pilot.approval_event_id, active.retry
 
 
 async def refusal_for(

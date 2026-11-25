@@ -6,10 +6,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from hub import brand, config, repository as repo
-from hub.db import connect, fetchall, write_transaction
+from hub.db import connect, fetchall
 from hub.services import executor_limited_retry as retry
 from hub.services import executor_orders as orders
-from hub.services import executor_skill_bundle as skills
 from hub.services import steward_limited_act as scope
 from tests.executor_slot_support import seed_slot_skills
 from tests.test_executor_orders import _make_key
@@ -78,20 +77,21 @@ async def candidate(db, monkeypatch, public_key):
     pilot = await _pilot(db, monkeypatch, project_id, task_id)
     await repo.update_task(db, task_id, status="open")
     await db.commit()
-    project = await repo.resolve_project_for_task(db, task_id)
-    async with write_transaction(db):
-        bundle = await skills.read_active_bundle(db)
-        booking = await orders._book(db, project, "k8", task_id, bundle)
-        assert not isinstance(booking, str), booking
-        order_id, run_id = await orders._issue_atomically(
-            db, project, booking, issuer_principal_id=None, pilot_start=(SHA, MODEL)
-        )
-    await orders.deliver_orders(db, "k8")
-    await orders.ack_order(db, "k8", order_id, orders.ACK_REDEEM_FAILED)
-    pilot.tasks[0].retry = scope.RetryTarget(
-        source_order_id=order_id, starting_sha=SHA, model=MODEL
-    )
+    pilot.tasks[0].retry = scope.RetryTarget(starting_sha=SHA, model=MODEL)
     monkeypatch.setattr(config, "STEWARD_ACT_PILOT", pilot.model_dump_json())
+    project = await repo.resolve_project_for_task(db, task_id)
+    launched = await orders.launch_on_slot(
+        db, project, host="k8", task_id=task_id, issuer_principal_id=None
+    )
+    assert launched.launched, launched.reason
+    order_id, run_id = launched.order_id, launched.row_id
+    assert order_id is not None and run_id is not None
+    original_run = await repo.get_executor_run(db, run_id)
+    assert (original_run["starting_ref"], original_run["model"]) == (SHA, MODEL)
+    delivered = await orders.deliver_orders(db, "k8")
+    assert [order["id"] for order in delivered] == [order_id]
+    assert SHA in delivered[0]["order_text"] and MODEL in delivered[0]["order_text"]
+    await orders.ack_order(db, "k8", order_id, orders.ACK_REDEEM_FAILED)
     transport = Transport()
     monkeypatch.setattr(retry, "retry_transport", lambda: transport)
     return task_id, order_id, run_id, transport
@@ -142,9 +142,21 @@ async def test_confirmed_prestart_failure_allows_only_one_retry(db, db_dsn, cand
 
 
 @pytest.mark.parametrize(
-    "change", ["redeemed", "ambiguous_ack", "changed_task", "unknown_cost", "offline"]
+    "change",
+    [
+        "redeemed",
+        "ambiguous_ack",
+        "changed_task",
+        "changed_sha",
+        "unbound_source",
+        "different_source_id",
+        "unknown_cost",
+        "offline",
+    ],
 )
-async def test_does_not_launch_uncertain_or_stale_work(db, candidate, change):
+async def test_does_not_launch_uncertain_or_stale_work(
+    db, monkeypatch, candidate, change
+):
     task_id, order_id, _, transport = candidate
     if change == "redeemed":
         await db.execute(
@@ -158,6 +170,18 @@ async def test_does_not_launch_uncertain_or_stale_work(db, candidate, change):
         )
     elif change == "changed_task":
         await repo.update_task(db, task_id, statement_generation=55)
+    elif change == "changed_sha":
+        await repo.update_task(db, task_id, submission_sha="c" * 40)
+    elif change == "unbound_source":
+        await db.execute(
+            "DELETE FROM events WHERE kind=? AND task_id=?",
+            (scope.RETRY_SOURCE_EVENT, task_id),
+        )
+    elif change == "different_source_id":
+        pilot = scope.read_pilot()
+        assert pilot is not None and pilot.tasks[0].retry is not None
+        pilot.tasks[0].retry.source_order_id = order_id + 1
+        monkeypatch.setattr(config, "STEWARD_ACT_PILOT", pilot.model_dump_json())
     elif change == "unknown_cost":
         transport.additional_spend_prevented = False
     elif change == "offline":
