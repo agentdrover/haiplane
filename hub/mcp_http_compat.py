@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass
+from ipaddress import IPv4Address, IPv6Address, ip_address
 
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -25,6 +26,32 @@ mounted_mcp_request: ContextVar[MountedMcpRequest | None] = ContextVar(
 )
 
 
+def _ip_or_none(host: str) -> IPv4Address | IPv6Address | None:
+    try:
+        return ip_address(host)
+    except ValueError:
+        return None
+
+
+def _listener_host(bind_host: str, socket_host: str) -> str:
+    bound = _ip_or_none(bind_host)
+    actual = _ip_or_none(socket_host)
+    # An accepted connection on a wildcard listener can report an interface
+    # address. Keep loopback when the configured wildcard fits that family.
+    if (
+        bound is not None
+        and bound.is_unspecified
+        and (actual is None or actual.version == bound.version)
+    ):
+        actual = bound
+    address = actual or bound
+    if address is None:
+        return bind_host
+    if address.is_unspecified:
+        return "127.0.0.1" if address.version == 4 else "::1"
+    return str(address)
+
+
 class McpRestRoutingMiddleware:
     """Route mounted MCP's REST calls to the listener serving the same Hub."""
 
@@ -37,12 +64,10 @@ class McpRestRoutingMiddleware:
             return
 
         request = Request(scope)
-        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(
-            config.HUB_HOST, config.HUB_HOST
-        )
+        server = scope.get("server")
+        host = _listener_host(config.HUB_HOST, server[0] if server else "")
         if ":" in host:
             host = f"[{host}]"
-        server = scope.get("server")
         port = (server[1] if server else None) or config.HUB_PORT
         token = mounted_mcp_request.set(
             MountedMcpRequest(

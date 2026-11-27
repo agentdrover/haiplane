@@ -16,16 +16,19 @@ from tests.test_mcp_server import (
 
 
 @pytest.mark.parametrize(
-    ("bind_host", "server_port", "rest_authority"),
+    ("bind_host", "socket_host", "socket_port", "rest_authority"),
     [
-        ("127.0.0.1", None, "127.0.0.1:9071"),
-        ("0.0.0.0", 9102, "127.0.0.1:9102"),
-        ("::", 9102, "[::1]:9102"),
-        ("192.0.2.8", 9102, "192.0.2.8:9102"),
+        ("127.0.0.1", "test", None, "127.0.0.1:9071"),
+        ("0.0.0.0", "192.0.2.8", 9102, "127.0.0.1:9102"),
+        ("::", "[2001:db8::8]", 9102, "[::1]:9102"),
+        ("0:0:0:0:0:0:0:0", "[2001:db8::8]", 9102, "[::1]:9102"),
+        ("192.0.2.8", "test", 9102, "192.0.2.8:9102"),
+        ("127.0.0.1", "[::1]", 9102, "[::1]:9102"),
+        ("127.0.0.1", "192.0.2.8", 9102, "192.0.2.8:9102"),
     ],
 )
 async def test_mounted_mcp_uses_local_listener(
-    client, monkeypatch, bind_host, server_port, rest_authority
+    client, monkeypatch, bind_host, socket_host, socket_port, rest_authority
 ):
     caller = "agent-test-token"
     monkeypatch.setenv("HAIPLANE_HUB_TOKEN", "service-test-token")
@@ -36,7 +39,8 @@ async def test_mounted_mcp_uses_local_listener(
     monkeypatch.setattr(
         config, "HUB_TOKENS", {caller: config.TokenIdentity("test-agent", "agent")}
     )
-    client.base_url = f"https://test:{server_port}" if server_port else "https://test"
+    authority = f"{socket_host}:{socket_port}" if socket_port else socket_host
+    client.base_url = f"https://{authority}"
     client.headers["Host"] = "mcp-alias.example:8443"
     attempts = []
     trusts_env = []
