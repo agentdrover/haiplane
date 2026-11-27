@@ -46,7 +46,7 @@ FAILURES = {
 # 13925c7b before changing the production code.
 BASE_RESPONSES = {
     "empty": {
-        "sha256": "d756d7c55a0d508fa0bf9f5d1fd9f6d5324d3af9d16bad8f34e763bb2b413bac",
+        "sha256": "d756d7c55a0d508fa0bf9f5d1fd9f6d5324d3af9d16bad8f34e763bb2b413bac",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -56,7 +56,7 @@ BASE_RESPONSES = {
         ],
     },
     "paged": {
-        "sha256": "f2726d8bf0e271bec076bd7b184b70c10472e218427a3b9ca820832fb2d6416b",
+        "sha256": "f2726d8bf0e271bec076bd7b184b70c10472e218427a3b9ca820832fb2d6416b",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -71,7 +71,7 @@ BASE_RESPONSES = {
         ],
     },
     "capped": {
-        "sha256": "c924ff1d10b4a263d376c0d59b4d9878d7258d1b27479c717f6ca299110d2471",
+        "sha256": "c924ff1d10b4a263d376c0d59b4d9878d7258d1b27479c717f6ca299110d2471",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -89,7 +89,7 @@ BASE_RESPONSES = {
         ],
     },
     "diagnostics": {
-        "sha256": "f2726d8bf0e271bec076bd7b184b70c10472e218427a3b9ca820832fb2d6416b",
+        "sha256": "f2726d8bf0e271bec076bd7b184b70c10472e218427a3b9ca820832fb2d6416b",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/whoami",
@@ -105,7 +105,7 @@ BASE_RESPONSES = {
         ],
     },
     "page": {
-        "sha256": "099fe8b3d00887630499abff4e83da7385a3370884b19d0d2870aa1f981d9cb1",
+        "sha256": "099fe8b3d00887630499abff4e83da7385a3370884b19d0d2870aa1f981d9cb1",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -119,7 +119,7 @@ BASE_RESPONSES = {
         ],
     },
     "headless": {
-        "sha256": "29330fed197de319c35b735108cbc0081b08bcecda7993651ff71b9b7a495b2b",
+        "sha256": "29330fed197de319c35b735108cbc0081b08bcecda7993651ff71b9b7a495b2b",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -134,7 +134,7 @@ BASE_RESPONSES = {
         ],
     },
     "worktree": {
-        "sha256": "02248b2e0326b29d6370be0f6eac1928fe4c11cac3d85fa434e6bc34b4cbbc6e",
+        "sha256": "02248b2e0326b29d6370be0f6eac1928fe4c11cac3d85fa434e6bc34b4cbbc6e",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -149,7 +149,7 @@ BASE_RESPONSES = {
         ],
     },
     "release-http": {
-        "sha256": "fa5c19dcfd2403430b8996da7c21d226d89a4959d508bedebc567c318e8abcad",
+        "sha256": "fa5c19dcfd2403430b8996da7c21d226d89a4959d508bedebc567c318e8abcad",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -164,7 +164,7 @@ BASE_RESPONSES = {
         ],
     },
     "release-other": {
-        "sha256": "9540c0dbdf4c7b1f9f3ca6976cc437b48cd7408e25ee7233831eaa9630edf47a",
+        "sha256": "9540c0dbdf4c7b1f9f3ca6976cc437b48cd7408e25ee7233831eaa9630edf47a",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -179,7 +179,7 @@ BASE_RESPONSES = {
         ],
     },
     "health-timeout": {
-        "sha256": "e0eed7eefc33006851a4fa246aadb038c32dc252a8a45549b6fc82d5ae10c757",
+        "sha256": "e0eed7eefc33006851a4fa246aadb038c32dc252a8a45549b6fc82d5ae10c757",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -194,7 +194,7 @@ BASE_RESPONSES = {
         ],
     },
     "policy": {
-        "sha256": "12537ed6fc6bc6d1b7cf935233ae98c5e4c8d8f032c14ffb75d0c7fae10edb30",
+        "sha256": "12537ed6fc6bc6d1b7cf935233ae98c5e4c8d8f032c14ffb75d0c7fae10edb30",  # pragma: allowlist secret
         "routes": [
             "/api/diagnostics/identity",
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
@@ -318,7 +318,16 @@ class _Wire:
                 "worktree_path": "/fixture/worktree",
             }
         if path == HEALTH:
-            return {"status": "ok"}
+            return {
+                "status": "ok",
+                "app_version": "fixture",
+                "bind_host": "127.0.0.1",
+                "bind_port": 8080,
+                "auth_required": True,
+                "auth_disabled": False,
+                "env_tokens_configured": True,
+                "vast_enabled": False,
+            }
         if path == RELEASE:
             return {"release_blocks": []}
         if path.endswith("/effective-policy"):
@@ -470,10 +479,36 @@ def _interrupt_health(monkeypatch, wire):
     monkeypatch.setattr(mcp, "asyncio", SimpleNamespace(wait_for=wait_for_health))
 
 
-@pytest.mark.parametrize("failure", tuple(FAILURES))
+async def _check_external_cancel(wire):
+    cancelled = False
+    with anyio.CancelScope() as scope:
+
+        async def cancel_during_get(request):
+            assert request.url.path == IDENTITY
+            scope.cancel()
+            await anyio.lowlevel.checkpoint()
+
+        wire.before_request = cancel_during_get
+        try:
+            await mcp.hub_my_context()
+        except anyio.get_cancelled_exc_class():
+            cancelled = True
+            raise
+
+    assert cancelled and scope.cancelled_caught
+    assert wire.closed == [0]
+    wire.before_request = None
+    await mcp.hub_my_context()
+    assert wire.closed == [0, 1]
+
+
+@pytest.mark.parametrize("failure", (*FAILURES, "cancel"))
 async def test_general_context_preserves_fallbacks_and_closes_on_cancel(
     wire, monkeypatch, failure
 ):
+    if failure == "cancel":
+        await _check_external_cancel(wire)
+        return
     wire.scenario = "paged"
     if failure == "health-timeout":
         _interrupt_health(monkeypatch, wire)
@@ -484,30 +519,6 @@ async def test_general_context_preserves_fallbacks_and_closes_on_cancel(
     assert len(wire.created) == 1 and wire.closed == [0]
     assert {row["id"] for row in wire.requests} == {0}
     assert all(set(row["timeout"].values()) == {15.0} for row in wire.requests)
-
-    monkeypatch.undo()
-    fresh_wire = _Wire()
-    fresh_wire.install(monkeypatch)
-    cancelled = False
-    with anyio.CancelScope() as scope:
-
-        async def cancel_during_get(request):
-            assert request.url.path == IDENTITY
-            scope.cancel()
-            await anyio.lowlevel.checkpoint()
-
-        fresh_wire.before_request = cancel_during_get
-        try:
-            await mcp.hub_my_context()
-        except anyio.get_cancelled_exc_class():
-            cancelled = True
-            raise
-
-    assert cancelled and scope.cancelled_caught
-    assert fresh_wire.closed == [0]
-    fresh_wire.before_request = None
-    await mcp.hub_my_context()
-    assert fresh_wire.closed == [0, 1]
 
 
 async def test_general_context_leaves_task_and_other_calls_isolated(wire):
@@ -531,9 +542,11 @@ async def test_general_context_leaves_task_and_other_calls_isolated(wire):
         released.set()
         await running
 
+    # A general call in this task must also release its binding before later calls.
+    await mcp.hub_my_context()
     await mcp.hub_my_context(task_id=77)
     await mcp.hub_health()
-    assert wire.closed == [1, 2, 0, 3, 4]
+    assert wire.closed == [1, 2, 0, 3, 4, 5]
     assert [
         row["id"] for row in wire.requests if row["route"] == "/api/tasks/77/context"
-    ] == [1, 3]
+    ] == [1, 4]
