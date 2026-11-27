@@ -2023,10 +2023,13 @@ async def _sweep_pair_delivery(db) -> None:
     except Exception:
         log.exception("Poll: pair delivery sweep could not list tasks")
         return
+    from hub.services.network_receipt import dedicated_worker_required
+
     for row in rows:
         task = dict(row)
         async with _task_isolation(db, "pair-delivery", task.get("id")):
-            await _deliver_pair_task(db, task)
+            if not await dedicated_worker_required(db, task["id"]):
+                await _deliver_pair_task(db, task)
 
 
 async def _deliver_pair_task(db, task: dict) -> None:

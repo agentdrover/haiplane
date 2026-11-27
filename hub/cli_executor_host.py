@@ -39,6 +39,11 @@ def _print_role_orders(result: Any) -> None:
 def print_order_line(result: Any) -> None:
     """#1941: the line about the last host order for ``oc-hub status``; never recomputed here."""
     _print_role_orders(result)
+    if isinstance(result, dict) and (receipt := result.get("network_receipt_order")):
+        print(
+            f"Контрольный заказ #{receipt['order_id']} на {receipt['host']} ({receipt.get('stage', 'issued')})",
+            file=sys.stderr,
+        )
     view = result.get("last_executor_order") if isinstance(result, dict) else None
     if not isinstance(view, dict):
         return

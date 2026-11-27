@@ -27,6 +27,7 @@ server-side drift detection in #534.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shlex
@@ -35,7 +36,10 @@ import time
 # Synchronous by design: this runs as a CLI (doctor/activate) and standalone
 # on servers. argv is always a fixed list — no shell ever sees these strings.
 import subprocess  # nosec B404
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from time import monotonic
 
 from hub import brand
 
@@ -274,6 +278,14 @@ BRANCH_MISSING = "missing"
 REMOTE_PRESENCE_TTL_SECONDS = 60.0
 _REMOTE_PRESENCE_CAP = 512
 _remote_presence: dict[tuple[str, str], tuple[float, bool]] = {}
+_presence_watchers: set[Callable[[str, str], None]] = set()
+
+
+def watch_remote_presence_forget(
+    callback: Callable[[str, str], None],
+) -> Callable[[], None]:
+    _presence_watchers.add(callback)
+    return lambda: _presence_watchers.discard(callback)
 
 
 def _cached_presence(repo: str, branch: str) -> bool | None:
@@ -305,6 +317,12 @@ def forget_remote_presence(repo: str = "", branch: str = "") -> None:
     base branch after a release), so the very next reader sees the world as it
     is now instead of waiting out a TTL for news the hub already has.
     """
+    _forget_remote_presence(repo, branch)
+    for callback in _presence_watchers.copy():
+        callback(repo, branch)
+
+
+def _forget_remote_presence(repo: str, branch: str) -> None:
     if not repo:
         _remote_presence.clear()
         return
@@ -338,12 +356,17 @@ def remote_has_branch(repo: str, branch: str) -> tuple[bool | None, str]:
     rc, out = _git(repo, "remote", "get-url", "origin")
     if rc != 0:
         return None, f"у клона нет remote origin — спросить некого: {out[:200]}"
+    answer, detail = _remote_heads(repo, branch)
+    if answer is not None:
+        _record_presence(repo, branch, answer)
+    return answer, detail
+
+
+def _remote_heads(repo: str, branch: str) -> tuple[bool | None, str]:
     rc, out = _git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
     if rc != 0:
         return None, f"ls-remote не ответил: {out[:200] or 'git молчит'}"
-    answer = bool(out.strip())
-    _record_presence(repo, branch, answer)
-    return answer, ""
+    return bool(out.strip()), ""
 
 
 @dataclass
@@ -413,6 +436,12 @@ def branch_sync(repo: str, project_branch: str) -> BranchSyncState:
     # an answer — it stops delivery outright, while a wrong key only weakens
     # the hook — so it is reported first and carries both names anyway.
     present, unchecked_because = remote_has_branch(path, declared)
+    return _branch_comparison(declared, recorded, present, unchecked_because)
+
+
+def _branch_comparison(
+    declared: str, recorded: str, present: bool | None, unchecked_because: str = ""
+) -> BranchSyncState:
     if present is False:
         return BranchSyncState(
             BRANCH_MISSING,
@@ -451,6 +480,65 @@ def branch_sync(repo: str, project_branch: str) -> BranchSyncState:
         declared,
         recorded,
     )
+
+
+@dataclass(frozen=True)
+class ConfirmedBranchObservation:
+    state: BranchSyncState
+    checked_at: datetime
+    monotonic_at: float
+
+
+async def observe_clone_branch(
+    path: str, declared: str, *, accept_origin: Callable[[str], bool]
+) -> BranchSyncState | ConfirmedBranchObservation:
+    """Observe a branch without reading or writing the legacy Git cache.
+
+    Issue commands separately so cancellation prevents the remaining Git
+    invocations. A command already in a thread has its own timeout.
+    """
+    rc, _ = await asyncio.to_thread(_git, path, "rev-parse", "--git-dir")
+    if rc != 0:
+        return _unobserved_branch(declared, "не удалось прочитать клон Git")
+    rc, recorded = await asyncio.to_thread(
+        _git, path, "config", "--get", BASE_BRANCH_KEY
+    )
+    if rc != 0 and (rc != 1 or recorded):
+        return _unobserved_branch(
+            declared, "не удалось прочитать настройку ветки клона"
+        )
+    rc, origin = await asyncio.to_thread(_git, path, "remote", "get-url", "origin")
+    if rc != 0:
+        return _unobserved_branch(
+            declared, "не удалось прочитать origin клона", recorded
+        )
+    if not accept_origin(origin):
+        return _unobserved_branch(
+            declared, "origin клона не подтверждает репозиторий проекта", recorded
+        )
+    return await asyncio.to_thread(_observe_remote_heads, path, declared, recorded)
+
+
+def _observe_remote_heads(
+    path: str, declared: str, recorded: str
+) -> BranchSyncState | ConfirmedBranchObservation:
+    present, _ = _remote_heads(path, declared)
+    if present is None:
+        return _unobserved_branch(
+            declared, "origin не подтвердил состояние ветки", recorded
+        )
+    observed_at = monotonic()
+    return ConfirmedBranchObservation(
+        _branch_comparison(declared, recorded, present), datetime.now(UTC), observed_at
+    )
+
+
+def _unobserved_branch(
+    declared: str, reason: str, recorded: str | None = None
+) -> BranchSyncState:
+    if recorded is not None and recorded != declared:
+        reason += "; локальная настройка ветки отличается"
+    return BranchSyncState(BRANCH_UNCHECKED, reason, declared, recorded or "")
 
 
 def _recorded_base(repo: str) -> str:

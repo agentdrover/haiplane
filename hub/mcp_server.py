@@ -10,11 +10,14 @@ import json
 import logging
 import re
 import time
+from contextlib import nullcontext
 from contextvars import ContextVar
 import urllib.parse
 from datetime import UTC, datetime
 from collections.abc import Callable
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+import anyio
 
 from pydantic import BeforeValidator
 
@@ -26,6 +29,7 @@ from pydantic import Field
 from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
 from hub.expected_sha import put_expected_sha_in
+from hub.mcp_http_compat import mounted_mcp_request
 from hub.mcp_internal_auth import identity_context_get, identity_is_human
 from hub.services.mcp_telemetry import record_call
 from hub.services.tree_output import (
@@ -237,7 +241,34 @@ mcp = InstrumentedFastMCP(
 def _hub_url() -> str:
     from hub.config import env_get
 
+    if (request := mounted_mcp_request.get()) is not None:
+        return request.rest_url
     return env_get("HUB_URL", "http://127.0.0.1:8080")
+
+
+if TYPE_CHECKING:
+    import httpx
+
+
+# The general context is the only tool call that borrows this client. Its
+# reads are sequential, including the awaited child task for /health.
+_GENERAL_CONTEXT_CLIENT: ContextVar[httpx.AsyncClient | None] = ContextVar(
+    "general_context_client", default=None
+)
+
+
+def _rest_client(timeout: float):
+    import httpx
+
+    request = mounted_mcp_request.get()
+    if request is None:
+        return httpx.AsyncClient(timeout=timeout)
+    # Preserve the validated Host for the Hub's allowlist. The socket address
+    # still comes from _hub_url(), and a local call must skip egress proxies.
+    headers = _auth_headers()
+    if request.host_header:
+        headers["Host"] = request.host_header
+    return httpx.AsyncClient(timeout=timeout, headers=headers, trust_env=False)
 
 
 def _hub_token() -> str:
@@ -245,16 +276,11 @@ def _hub_token() -> str:
 
     from hub.mcp_internal_auth import bearer_context_get
 
-    # Streamable MCP mounted in the same process: the REST call a tool makes
-    # carries the CALLER's Bearer (set by AuthMiddleware via
-    # hub.mcp_internal_auth). It goes first, never the service's env token
-    # (#1556): an env token ahead of it would let a read-only caller write
-    # under someone else's rights.
+    # An HTTP caller without a Bearer must never inherit the service token.
     caller = (bearer_context_get() or "").strip()
-    if caller:
+    if caller or mounted_mcp_request.get() is not None:
         return caller
-    # Local stdio MCP has no inbound request, so no caller bearer: the env
-    # token is its only credential.
+    # Standalone stdio uses its configured credential.
     return (env_get("HUB_TOKEN", "") or "").strip()
 
 
@@ -634,9 +660,21 @@ async def _api_get(path: str, *, timeout: float | None = None) -> Any:
     import httpx
 
     deadline = _TIMEOUT_DEFAULT if timeout is None else timeout
+    shared = _GENERAL_CONTEXT_CLIENT.get()
     try:
-        async with httpx.AsyncClient(timeout=deadline) as client:
-            resp = await client.get(f"{_hub_url()}{path}", headers=_auth_headers())
+        scope = nullcontext(shared) if shared is not None else _rest_client(deadline)
+        async with scope as client:
+            url = f"{_hub_url()}{path}"
+            headers = _auth_headers()
+            try:
+                if shared is None:
+                    resp = await client.get(url, headers=headers)
+                else:
+                    resp = await client.get(url, headers=headers, timeout=deadline)
+            finally:
+                if shared is not None:
+                    # A fresh client never forwarded cookies set by another GET.
+                    shared.cookies.clear()
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
@@ -675,7 +713,7 @@ async def _api_post(
     ).strip()
     deadline = _TIMEOUT_SLOW if timeout is None else timeout
     try:
-        async with httpx.AsyncClient(timeout=deadline) as client:
+        async with _rest_client(deadline) as client:
             resp = await client.post(
                 f"{_hub_url()}{path}", json=body or {}, headers=headers
             )
@@ -704,7 +742,7 @@ async def _api_patch(path: str, body: dict[str, Any] | None = None) -> Any:
 
     deadline = _TIMEOUT_DEFAULT
     try:
-        async with httpx.AsyncClient(timeout=deadline) as client:
+        async with _rest_client(deadline) as client:
             resp = await client.patch(
                 f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
             )
@@ -729,7 +767,7 @@ async def _api_put(path: str, body: Any) -> Any:
 
     deadline = _TIMEOUT_DEFAULT
     try:
-        async with httpx.AsyncClient(timeout=deadline) as client:
+        async with _rest_client(deadline) as client:
             resp = await client.put(
                 f"{_hub_url()}{path}", json=body, headers=_auth_headers()
             )
@@ -754,7 +792,7 @@ async def _api_delete(path: str) -> None:
 
     deadline = _TIMEOUT_DEFAULT
     try:
-        async with httpx.AsyncClient(timeout=deadline) as client:
+        async with _rest_client(deadline) as client:
             resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
             try:
                 resp.raise_for_status()
@@ -778,7 +816,7 @@ async def _api_delete_json(path: str) -> Any:
 
     deadline = _TIMEOUT_DEFAULT
     try:
-        async with httpx.AsyncClient(timeout=deadline) as client:
+        async with _rest_client(deadline) as client:
             resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
             try:
                 resp.raise_for_status()
@@ -803,7 +841,7 @@ async def _api_post_with_status(
 
     deadline = _TIMEOUT_SLOW
     try:
-        async with httpx.AsyncClient(timeout=deadline) as client:
+        async with _rest_client(deadline) as client:
             resp = await client.post(
                 f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
             )
@@ -833,7 +871,7 @@ async def _api_put_with_status(path: str, body: Any) -> tuple[Any, int]:
 
     deadline = _TIMEOUT_DEFAULT
     try:
-        async with httpx.AsyncClient(timeout=deadline) as client:
+        async with _rest_client(deadline) as client:
             resp = await client.put(
                 f"{_hub_url()}{path}", json=body, headers=_auth_headers()
             )
@@ -1436,6 +1474,10 @@ def _status_header_lines(task: dict[str, Any]) -> list[str]:
     parts.extend(filter(None, [_cause_suggestion_line(task)]))
     parts.extend(filter(None, [_verdict_route_line(task)]))
     parts.extend(owner_minutes_lines(task))
+    if receipt := task.get("network_receipt_order"):
+        parts.append(
+            f"Network receipt order #{receipt['order_id']} on {receipt['host']} ({receipt.get('stage', 'issued')})"
+        )
     parts.extend(executor_order_lines(task))
     parts.extend(delivery_rerun_lines(task))
     parts.extend(role_order_lines(task))
@@ -2213,7 +2255,7 @@ async def _general_hub_context(
     try:
         # Diagnostics carries identity + the active workspace mode (#530), so an
         # onboarding agent sees whether worktree isolation is in effect.
-        identity = await _api_get("/api/diagnostics/identity")
+        identity = await _read_identity_diagnostics()
     except HubApiError:
         try:
             identity = await _api_get("/api/whoami")
@@ -2350,9 +2392,18 @@ async def hub_my_context(
             error="invalid_arguments",
         )
     if task_id is None:
-        return await _general_hub_context(
-            max_chars=max_chars, mode=mode, project=project
-        )
+        client = _rest_client(_TIMEOUT_DEFAULT)
+        token = _GENERAL_CONTEXT_CLIENT.set(client)
+        try:
+            return await _general_hub_context(
+                max_chars=max_chars, mode=mode, project=project
+            )
+        finally:
+            _GENERAL_CONTEXT_CLIENT.reset(token)
+            # MCP cancellation can keep interrupting await points in the
+            # cancelled scope. Shield only the transport teardown.
+            with anyio.CancelScope(shield=True):
+                await client.aclose()
 
     query = _tree_query_string(max_chars=max_chars, mode=mode)
     ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
@@ -3866,7 +3917,9 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
     Args:
         include_archived: Include archived projects.
     """
-    query = "?include_archived=true" if include_archived else ""
+    query = "?branch_check=cached"
+    if include_archived:
+        query += "&include_archived=true"
     projects = await _api_get(f"/api/projects{query}")
     if not projects:
         return structured_echo_result("No projects.", projects=[])
@@ -3884,9 +3937,18 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
         f"{p['slug']}: {p['name']} | repo={p.get('repo') or '-'}@{forge_of(p)} "
         f"| base={p.get('default_branch') or config.PAIR_BASE_BRANCH}"
         + (" [archived]" if p.get("archived") else "")
+        + _catalog_branch_text(p)
         for p in projects
     ]
     return structured_echo_result("\n".join(lines), projects=projects)
+
+
+def _catalog_branch_text(project: dict[str, Any]) -> str:
+    observation = project.get("clone_branch_observation")
+    if not observation:  # Standalone MCP may still be pointed at an older Hub.
+        return ""
+    state = project["clone_branch"]["state"]
+    return f" | branch={state} {observation['status']} checked={observation['checked_at'] or 'never'}"
 
 
 def _null_is_empty(value: Any) -> Any:
@@ -5340,9 +5402,7 @@ if config.VAST_ENABLED:
         write the returned base_url to ~/.haiplane/vast-upstream.json on Mac
         so the local proxy picks it up automatically.
         """
-        import httpx
-
-        async with httpx.AsyncClient(timeout=1200) as client:
+        async with _rest_client(1200) as client:
             resp = await client.post(f"{_hub_url()}/api/vast/up")
             resp.raise_for_status()
             result = resp.json()
@@ -5402,9 +5462,7 @@ if config.VAST_ENABLED:
     @mcp.tool()
     async def hub_vast_down() -> str:
         """Destroy the active Vast.ai GPU instance to stop billing."""
-        import httpx
-
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with _rest_client(120) as client:
             resp = await client.post(f"{_hub_url()}/api/vast/down")
             resp.raise_for_status()
             result = resp.json()
@@ -6459,6 +6517,15 @@ async def hub_health() -> str:
     return _format_health(data)
 
 
+async def _read_identity_diagnostics() -> dict[str, Any]:
+    identity = await _api_get("/api/diagnostics/identity")
+    if (request := mounted_mcp_request.get()) is not None:
+        # REST sees the internal HTTP hop. The MCP diagnostic describes the
+        # client connection; the forwarded Host already preserves the mismatch check.
+        identity["connected_via"] = request.external_base_url
+    return identity
+
+
 def _format_identity_diagnostics(data: dict[str, Any]) -> str:
     lines = [
         f"User: {data['username']} (role: {data['role']})",
@@ -6507,7 +6574,7 @@ async def hub_admin_my_identity() -> str:
     on the wrong instance.
     """
     try:
-        data = await _api_get("/api/diagnostics/identity")
+        data = await _read_identity_diagnostics()
     except HubApiError as exc:
         return _format_hub_api_error(exc)
     return _format_identity_diagnostics(data)

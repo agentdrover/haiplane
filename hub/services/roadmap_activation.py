@@ -81,7 +81,7 @@ async def _previous(
 
 
 async def _verify_approval(
-    db: aiosqlite.Connection, mandate: _Mandate
+    db: aiosqlite.Connection, mandate: _Mandate, *, include_submitted: bool = False
 ) -> tuple[int, int, int, int]:
     rows = await fetchall(
         db,
@@ -107,7 +107,9 @@ async def _verify_approval(
         "super_admin",
     ):
         raise ActivationRefused("approver_not_administrator")
-    actual = await roadmap_requests._plan_snapshot(db, mandate.task_id, mandate.task_id)
+    actual = await roadmap_requests._plan_snapshot(
+        db, mandate.task_id, mandate.task_id, include_submitted=include_submitted
+    )
     expected = (
         mandate.project_id,
         mandate.approval_id,

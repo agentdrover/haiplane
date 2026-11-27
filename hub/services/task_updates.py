@@ -73,9 +73,11 @@ async def undelivered_advisory(
     Advisory by design: the completion is not blocked, and anything unknown
     stays silent.
     """
-    if body.kind != "done":
-        return ""
     from hub.services.delivery_gate import undelivered_warning
+    from hub.services.network_receipt import dedicated_worker_required
+
+    if body.kind != "done" or await dedicated_worker_required(db, task["id"]):
+        return ""
 
     try:
         return await undelivered_warning(db, task)
@@ -255,6 +257,10 @@ async def _inside_savepoint(
     principal_id: int | None,
 ) -> int:
     """Everything the savepoint protects; the ONE ``commit`` here is the original one."""
+    if body.kind == "done":
+        from hub.services.network_receipt_submission import require_receipt_done
+
+        await require_receipt_done(db, task, body)
     update_id = await _write_row_and_prevention(db, task, body, principal_id)
     await _record_finding_outcomes(db, task, body)
     await _route_done(db, task, body)
