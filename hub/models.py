@@ -4836,6 +4836,15 @@ class ProjectView(BaseModel):
         return v or {}
 
 
+class CloneBranchObservation(BaseModel):
+    status: Literal["fresh", "stale", "unknown"]
+    checked_at: datetime | None
+
+
+class CachedProjectView(ProjectView):
+    clone_branch_observation: CloneBranchObservation
+
+
 class ActivityItem(BaseModel):
     kind: str
     summary: str

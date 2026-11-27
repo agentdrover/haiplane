@@ -2899,7 +2899,7 @@ async def test_hub_list_projects(mock_api_get: AsyncMock) -> None:
     out = await hub_list_projects()
     structured = _mcp_structured(out)
     assert structured["projects"][0]["slug"] == "default"
-    mock_api_get.assert_awaited_once_with("/api/projects")
+    mock_api_get.assert_awaited_once_with("/api/projects?branch_check=cached")
 
 
 async def test_hub_list_projects_names_the_forge(mock_api_get: AsyncMock) -> None:

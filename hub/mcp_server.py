@@ -3882,7 +3882,9 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
     Args:
         include_archived: Include archived projects.
     """
-    query = "?include_archived=true" if include_archived else ""
+    query = "?branch_check=cached"
+    if include_archived:
+        query += "&include_archived=true"
     projects = await _api_get(f"/api/projects{query}")
     if not projects:
         return structured_echo_result("No projects.", projects=[])
@@ -3900,9 +3902,18 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
         f"{p['slug']}: {p['name']} | repo={p.get('repo') or '-'}@{forge_of(p)} "
         f"| base={p.get('default_branch') or config.PAIR_BASE_BRANCH}"
         + (" [archived]" if p.get("archived") else "")
+        + _catalog_branch_text(p)
         for p in projects
     ]
     return structured_echo_result("\n".join(lines), projects=projects)
+
+
+def _catalog_branch_text(project: dict[str, Any]) -> str:
+    observation = project.get("clone_branch_observation")
+    if not observation:  # Standalone MCP may still be pointed at an older Hub.
+        return ""
+    state = project["clone_branch"]["state"]
+    return f" | branch={state} {observation['status']} checked={observation['checked_at'] or 'never'}"
 
 
 def _null_is_empty(value: Any) -> Any:
