@@ -10,11 +10,14 @@ import json
 import logging
 import re
 import time
+from contextlib import nullcontext
 from contextvars import ContextVar
 import urllib.parse
 from datetime import UTC, datetime
 from collections.abc import Callable
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+import anyio
 
 from pydantic import BeforeValidator
 
@@ -241,6 +244,17 @@ def _hub_url() -> str:
     if (request := mounted_mcp_request.get()) is not None:
         return request.rest_url
     return env_get("HUB_URL", "http://127.0.0.1:8080")
+
+
+if TYPE_CHECKING:
+    import httpx
+
+
+# The general context is the only tool call that borrows this client. Its
+# reads are sequential, including the awaited child task for /health.
+_GENERAL_CONTEXT_CLIENT: ContextVar[httpx.AsyncClient | None] = ContextVar(
+    "general_context_client", default=None
+)
 
 
 def _rest_client(timeout: float):
@@ -646,9 +660,21 @@ async def _api_get(path: str, *, timeout: float | None = None) -> Any:
     import httpx
 
     deadline = _TIMEOUT_DEFAULT if timeout is None else timeout
+    shared = _GENERAL_CONTEXT_CLIENT.get()
     try:
-        async with _rest_client(deadline) as client:
-            resp = await client.get(f"{_hub_url()}{path}", headers=_auth_headers())
+        scope = nullcontext(shared) if shared is not None else _rest_client(deadline)
+        async with scope as client:
+            url = f"{_hub_url()}{path}"
+            headers = _auth_headers()
+            try:
+                if shared is None:
+                    resp = await client.get(url, headers=headers)
+                else:
+                    resp = await client.get(url, headers=headers, timeout=deadline)
+            finally:
+                if shared is not None:
+                    # A fresh client never forwarded cookies set by another GET.
+                    shared.cookies.clear()
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
@@ -2366,9 +2392,18 @@ async def hub_my_context(
             error="invalid_arguments",
         )
     if task_id is None:
-        return await _general_hub_context(
-            max_chars=max_chars, mode=mode, project=project
-        )
+        client = _rest_client(_TIMEOUT_DEFAULT)
+        token = _GENERAL_CONTEXT_CLIENT.set(client)
+        try:
+            return await _general_hub_context(
+                max_chars=max_chars, mode=mode, project=project
+            )
+        finally:
+            _GENERAL_CONTEXT_CLIENT.reset(token)
+            # MCP cancellation can keep interrupting await points in the
+            # cancelled scope. Shield only the transport teardown.
+            with anyio.CancelScope(shield=True):
+                await client.aclose()
 
     query = _tree_query_string(max_chars=max_chars, mode=mode)
     ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
