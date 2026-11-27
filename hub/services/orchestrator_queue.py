@@ -43,7 +43,7 @@ F2 (#1365). До этой задачи порядок держала памят�
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -384,6 +384,11 @@ async def not_leaf_reason(db: aiosqlite.Connection, task: dict[str, Any]) -> str
         children = await _open_children(db, int(task["id"]))
     except aiosqlite.Error as exc:
         return f"не лист: подзадачи прочитать не удалось ({type(exc).__name__})"
+    return non_leaf_reason(task, children)
+
+
+def non_leaf_reason(task: dict[str, Any], children: list[int]) -> str:
+    """Правило листа для уже прочитанного списка незавершённых подзадач."""
     listed = ", ".join(f"#{c}" for c in children)
     task_type = str(task.get("task_type") or "")
     if task_type not in LEAF_TYPES:
@@ -402,6 +407,8 @@ async def _skip_reason(
     candidate: dict[str, Any],
     active: list[dict[str, Any]],
     known_blockers: dict[int, list[dict[str, Any]]] | None = None,
+    *,
+    known_open_children: Mapping[int, list[int]] | None = None,
 ) -> dict[str, Any] | None:
     """Почему этот кандидат ждёт; ``None`` — не ждёт.
 
@@ -416,7 +423,14 @@ async def _skip_reason(
     waiting = current_wait(candidate)
     if waiting:
         return {"task_id": task_id, "reason": SKIP_DEFERRED, "detail": waiting}
-    not_leaf = await not_leaf_reason(db, candidate)
+    children = (
+        known_open_children.get(task_id) if known_open_children is not None else None
+    )
+    not_leaf = (
+        await not_leaf_reason(db, candidate)
+        if children is None
+        else non_leaf_reason(candidate, children)
+    )
     if not_leaf:
         return {"task_id": task_id, "reason": SKIP_NOT_LEAF, "detail": not_leaf}
     blockers = (
@@ -460,6 +474,7 @@ async def next_task(
     project: Any,
     *,
     known_blockers: dict[int, list[dict[str, Any]]] | None = None,
+    known_open_children: Mapping[int, list[int]] | None = None,
     exclude_state: bool = False,
     candidate_ids: frozenset[int] | None = None,
 ) -> dict[str, Any]:
@@ -467,6 +482,9 @@ async def next_task(
 
     ``known_blockers`` (#1527): страница пути уже прочитала доставку всех
     зависимостей графа; правило выбора остаётся этим, читатель не повторяется.
+
+    ``known_open_children`` содержит списки из того же снимка графа. Кандидата
+    вне снимка очередь проверяет отдельным чтением.
 
     ``exclude_state`` (#1647): кандидат для облачного исполнителя — задачи-
     состояния ему не отдаются, и очередь не упирается в такую в голове списка.
@@ -502,7 +520,13 @@ async def next_task(
     }
     if not answer["wip_full"]:
         for candidate in candidates:
-            skip = await _skip_reason(db, candidate, active, known_blockers)
+            skip = await _skip_reason(
+                db,
+                candidate,
+                active,
+                known_blockers,
+                known_open_children=known_open_children,
+            )
             if skip is None:
                 answer["next_task_id"] = int(candidate["id"])
                 break
