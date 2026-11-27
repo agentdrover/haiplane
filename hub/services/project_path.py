@@ -93,8 +93,11 @@ _TASKS_SQL = (
     "SELECT t.id, t.title, t.status, t.task_type, t.size, t.parent_id, "
     "t.project_id, t.archived, t.review_job_id, t.waiting_for, t.waiting_until, t.dor_passed, "
     "t.assigned_agent, t.priority, t.position, "
-    "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
-    "FROM tasks t"
+    "COALESCE(m.merge_count, 0) AS merges "
+    "FROM tasks t LEFT JOIN ("
+    "SELECT task_id, COUNT(*) AS merge_count FROM pipeline_merges "
+    "WHERE task_id IS NOT NULL GROUP BY task_id"
+    ") m ON m.task_id = t.id"
 )
 
 
@@ -373,24 +376,37 @@ def _state_word(task: dict[str, Any], group: str) -> str:
     return _STATE_WORDS[group]
 
 
-async def _demote_non_leaves(
-    db: aiosqlite.Connection,
+def _open_children_by_parent(graph: Graph) -> dict[int, list[int]]:
+    """Подзадачи из полного снимка графа, включая пустой список для листа."""
+    children: dict[int, list[int]] = {node: [] for node in graph.tasks}
+    for node, task in graph.tasks.items():
+        parent = task["parent_id"]
+        status = task["status"]
+        if (
+            parent in children
+            and task["archived"] == 0
+            and status is not None
+            and status not in _FINAL
+        ):
+            children[parent].append(node)
+    for siblings in children.values():
+        siblings.sort()
+    return children
+
+
+def _demote_non_leaves(
     graph: Graph,
     classes: dict[int, tuple[str, str]],
+    open_children: dict[int, list[int]],
 ) -> None:
-    """Не лист не стартуема: «ждёт подзадачи», а не «готово к старту».
-
-    Признак тот же, что у очереди (``orchestrator_queue.not_leaf_reason``,
-    #1455), второй копии нет; спрашивается только о тех, кто иначе был бы
-    готов, — это единицы запросов.
-    """
-    for node, (group, _) in list(classes.items()):
+    """Применить к готовым задачам то же правило листа, что и в очереди."""
+    for node, (group, _) in classes.items():
         if group != GROUP_READY:
             continue
-        why = await oq.not_leaf_reason(db, graph.tasks[node])
+        children = open_children[node]
+        why = oq.non_leaf_reason(graph.tasks[node], children)
         if not why:
             continue
-        children = await oq._open_children(db, node)
         listed = ", ".join(f"#{c}" for c in children)
         classes[node] = (
             GROUP_BLOCKED,
@@ -683,7 +699,8 @@ async def compute(
         n: _classify(graph, graph.tasks[n], reach.blockers.get(n, []), slug)
         for n in reach.nodes
     }
-    await _demote_non_leaves(db, graph, classes)
+    open_children = _open_children_by_parent(graph)
+    _demote_non_leaves(graph, classes, open_children)
     ctx = _Calc(
         slug=slug,
         edges=edges,
@@ -693,7 +710,9 @@ async def compute(
         reach=reach,
     )
     known = {n: reach.blockers.get(n, []) for n in graph.own}
-    answer = await oq.next_task(db, project, known_blockers=known)
+    answer = await oq.next_task(
+        db, project, known_blockers=known, known_open_children=open_children
+    )
     groups, nxt = _queue_groups(graph, ctx, answer)
     return {
         "project": slug,
