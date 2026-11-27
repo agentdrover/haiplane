@@ -194,12 +194,12 @@ async def _skill_layer(db: aiosqlite.Connection) -> WorkingRulesSkill:
 async def _policy_layer(db: aiosqlite.Connection, task_id: int) -> WorkingRulesPolicy:
     """Brief политики на сервере, без REST /effective-policy (implementer его не видит)."""
     try:
-        from hub.services.effective_policy import effective_policy, format_policy_brief
+        from hub.services.effective_policy import format_policy_brief, policy_brief
 
         project = await repo.resolve_project_for_task(db, task_id)
         if project is None:
             return WorkingRulesPolicy()
-        text = "\n".join(format_policy_brief(await effective_policy(db, project)))
+        text = "\n".join(format_policy_brief(await policy_brief(db, project)))
         return WorkingRulesPolicy(state="available", text=text, chars=len(text))
     except Exception as exc:  # noqa: BLE001
         log.warning("policy brief of task #%s not built: %s", task_id, exc)

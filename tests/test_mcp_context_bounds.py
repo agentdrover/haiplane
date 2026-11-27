@@ -109,7 +109,7 @@ def _fake_api(tasks: list[dict[str, Any]], ctx: dict[str, Any] | None = None):
     """Stand-in for _api_get that honours mode=summary the way the API does."""
     calls: list[str] = []
 
-    async def _get(path: str) -> Any:
+    async def _get(path: str, **_kwargs: object) -> Any:
         calls.append(path)
         if path.startswith("/api/diagnostics/identity"):
             return _identity()
