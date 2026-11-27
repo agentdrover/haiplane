@@ -154,7 +154,7 @@ from hub.auth import (
 from hub.csrf import CsrfMiddleware, would_reject_count_24h
 from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_envelope import enrich_error_payload
-from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
+from hub import mcp_http_compat
 from hub.mcp_catalog import (
     catalog_snapshot,
     view_summary,
@@ -565,7 +565,7 @@ app.add_middleware(RequestConnectionMiddleware)
 app.add_middleware(CsrfMiddleware)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
-app.add_middleware(McpStreamableAcceptCompatMiddleware)
+app.add_middleware(mcp_http_compat.McpStreamableAcceptCompatMiddleware)
 # Added last so it runs first. Empty allowlist preserves local/dev behavior;
 # production deployments can set HAIPLANE_HUB_ALLOWED_HOSTS.
 app.add_middleware(HostAllowlistMiddleware, allowed_hosts=config.HUB_ALLOWED_HOSTS)
@@ -4737,7 +4737,7 @@ def _check_bootstrap_token(request: Request) -> bool:
 # MCP transport for remote agents (Cursor, etc.). FastMCP's streamable HTTP app
 # already owns the /mcp route, so mount it at root and keep this mount last so
 # Hub REST/Web routes above continue to take precedence.
-app.mount("/", _mcp_streamable_app)
+app.mount("/", mcp_http_compat.McpRestRoutingMiddleware(_mcp_streamable_app))
 
 
 # ---------------------------------------------------------------------------
