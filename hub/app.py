@@ -1254,7 +1254,7 @@ async def api_executor_repair(
 
 
 @app.get("/api/projects/{slug}/effective-policy")
-async def api_effective_policy(slug: str, request: Request) -> dict:
+async def api_effective_policy(slug: str, request: Request, brief: str = "") -> dict:
     """Действующая политика проекта одной сводкой (#1457).
 
     Каждый ключ gate_policy со значением, источником (project, default или
@@ -1266,6 +1266,8 @@ async def api_effective_policy(slug: str, request: Request) -> dict:
 
     db = _db(request)
     project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
+    if brief == "true":
+        return await effective_policy.policy_brief(db, project)
     return await effective_policy.effective_policy(db, project)
 
 

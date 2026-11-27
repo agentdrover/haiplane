@@ -656,7 +656,10 @@ def _parse_transport_error(
     )
 
 
-async def _api_get(path: str, *, timeout: float | None = None) -> Any:
+async def _api_get(
+    path: str, *, timeout: float | None = None, query_suffix: str = ""
+) -> Any:
+    """GET a path with optional wire-only query, keeping the diagnostic path stable."""
     import httpx
 
     deadline = _TIMEOUT_DEFAULT if timeout is None else timeout
@@ -664,7 +667,7 @@ async def _api_get(path: str, *, timeout: float | None = None) -> Any:
     try:
         scope = nullcontext(shared) if shared is not None else _rest_client(deadline)
         async with scope as client:
-            url = f"{_hub_url()}{path}"
+            url = f"{_hub_url()}{path}{query_suffix}"
             headers = _auth_headers()
             try:
                 if shared is None:
@@ -2464,7 +2467,8 @@ async def _policy_brief_for_slug(slug: str) -> str:
         return ""
     try:
         data = await _api_get(
-            f"/api/projects/{urllib.parse.quote(slug, safe='')}/effective-policy"
+            f"/api/projects/{urllib.parse.quote(slug, safe='')}/effective-policy",
+            query_suffix="?brief=true",
         )
     except HubApiError as exc:
         logging.getLogger(__name__).warning(
