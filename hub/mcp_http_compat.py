@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv6Address, ip_address
 
+from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -80,6 +81,12 @@ class McpRestRoutingMiddleware:
             await self.app(scope, receive, send)
         finally:
             mounted_mcp_request.reset(token)
+
+
+def with_local_rest(app: Starlette) -> Starlette:
+    """Add routing context while preserving the mounted app's visible routes."""
+    app.add_middleware(McpRestRoutingMiddleware)
+    return app
 
 
 def _merge_streamable_mcp_accept(accept: str) -> str:

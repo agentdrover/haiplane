@@ -154,7 +154,7 @@ from hub.auth import (
 from hub.csrf import CsrfMiddleware, would_reject_count_24h
 from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_envelope import enrich_error_payload
-from hub import mcp_http_compat
+from hub import mcp_http_compat as mcp_http
 from hub.mcp_catalog import (
     catalog_snapshot,
     view_summary,
@@ -276,7 +276,7 @@ def _register_plugins() -> None:
 # MCP streamable-HTTP ASGI app. We instantiate it once at import time so it
 # can be mounted before lifespan runs; its session manager is started inside
 # our own lifespan via Starlette's lifespan_context.
-_mcp_streamable_app = mcp_server.streamable_http_app()
+_mcp_streamable_app = mcp_http.with_local_rest(mcp_server.streamable_http_app())
 
 
 async def _report_stale_env(db: aiosqlite.Connection) -> None:
@@ -565,7 +565,7 @@ app.add_middleware(RequestConnectionMiddleware)
 app.add_middleware(CsrfMiddleware)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
-app.add_middleware(mcp_http_compat.McpStreamableAcceptCompatMiddleware)
+app.add_middleware(mcp_http.McpStreamableAcceptCompatMiddleware)
 # Added last so it runs first. Empty allowlist preserves local/dev behavior;
 # production deployments can set HAIPLANE_HUB_ALLOWED_HOSTS.
 app.add_middleware(HostAllowlistMiddleware, allowed_hosts=config.HUB_ALLOWED_HOSTS)
@@ -4737,7 +4737,7 @@ def _check_bootstrap_token(request: Request) -> bool:
 # MCP transport for remote agents (Cursor, etc.). FastMCP's streamable HTTP app
 # already owns the /mcp route, so mount it at root and keep this mount last so
 # Hub REST/Web routes above continue to take precedence.
-app.mount("/", mcp_http_compat.McpRestRoutingMiddleware(_mcp_streamable_app))
+app.mount("/", _mcp_streamable_app)
 
 
 # ---------------------------------------------------------------------------
