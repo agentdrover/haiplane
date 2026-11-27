@@ -1331,19 +1331,23 @@ def granted_mode(asked: str, refusals: list[tuple[str, str]]) -> str:
     return asked
 
 
-async def mode_report(db: aiosqlite.Connection) -> dict[str, Any]:
-    """Requested and effective mode with the unmet criteria — a pure read.
-
-    Same grant as ``effective_mode`` but without its refusal announcement:
-    the policy summary (#1457) is a GET and must leave no trace in the feed.
-    """
+async def read_mode_grant(
+    db: aiosqlite.Connection,
+) -> tuple[str, str, list[tuple[str, str]]]:
+    """Resolve the current grant without recording refusals or building reports."""
     asked = configured_mode()
     refusals = await act_refusals(db) if asked == "act" else []
+    return asked, granted_mode(asked, refusals), refusals
+
+
+async def mode_report(db: aiosqlite.Connection) -> dict[str, Any]:
+    """Requested and effective mode with the unmet criteria — a pure read."""
     from hub.services.steward_exit import contour_report
 
+    asked, effective, refusals = await read_mode_grant(db)
     return {
         "requested": asked,
-        "effective": granted_mode(asked, refusals),
+        "effective": effective,
         "act_refusals": [{"code": c, "detail": d} for c, d in refusals],
         # #1601: счётчики нового контура — пары, согласие, возражения, таймауты,
         # ошибочные одобрения с номерами задач, процедурные эскалации отдельно.

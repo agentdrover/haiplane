@@ -23,7 +23,7 @@ CLAIMED = "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id="
 HEADLESS = "/api/tasks?claimed_by=fixture&status=review&limit=50"
 HEALTH = "/health"
 RELEASE = "/api/release-blocks"
-POLICY = "/api/projects/{slug}/effective-policy"
+POLICY = "/api/projects/{slug}/effective-policy?brief=true"
 
 CASES = (
     ("empty", "summary", ""),
@@ -52,7 +52,7 @@ BASE_RESPONSES = {
             "/api/tasks?claimed_by=fixture&limit=50&mode=summary&after_id=0",
             "/health",
             "/api/release-blocks",
-            "/api/projects/default/effective-policy",
+            "/api/projects/default/effective-policy?brief=true",
         ],
     },
     "paged": {
@@ -67,7 +67,7 @@ BASE_RESPONSES = {
             "/api/tasks/43",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
     "capped": {
@@ -85,7 +85,7 @@ BASE_RESPONSES = {
             "/api/tasks/43",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
     "diagnostics": {
@@ -101,7 +101,7 @@ BASE_RESPONSES = {
             "/api/tasks/43",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
     "page": {
@@ -115,7 +115,7 @@ BASE_RESPONSES = {
             "/api/tasks/42",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
     "headless": {
@@ -130,7 +130,7 @@ BASE_RESPONSES = {
             "/api/tasks/43",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
     "worktree": {
@@ -145,7 +145,7 @@ BASE_RESPONSES = {
             "/api/tasks/43",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
     "release-http": {
@@ -160,7 +160,7 @@ BASE_RESPONSES = {
             "/api/tasks/43",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
     "release-other": {
@@ -175,7 +175,7 @@ BASE_RESPONSES = {
             "/api/tasks/43",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
     "health-timeout": {
@@ -190,7 +190,7 @@ BASE_RESPONSES = {
             "/api/tasks/43",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
     "policy": {
@@ -205,7 +205,7 @@ BASE_RESPONSES = {
             "/api/tasks/43",
             "/health",
             "/api/release-blocks",
-            "/api/projects/lab/effective-policy",
+            "/api/projects/lab/effective-policy?brief=true",
         ],
     },
 }
