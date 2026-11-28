@@ -268,6 +268,8 @@ def _template_to_regex(template: str) -> re.Pattern[str]:
             elif name == "name" and "executor-hosts" in template:
                 # #1712: the host named in the path is compared to the key's own.
                 parts.append("(?P<name>[^/]+)")
+            elif name == "probe_order_id":
+                parts.append(r"probe-[0-9a-f]{32}")
             else:
                 parts.append("[^/]+")
         else:
@@ -483,6 +485,7 @@ def ci_key_route_allowed(
 SLOT_RUNNER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("GET", "/api/executor-hosts/{name}/orders"),
     ("GET", "/api/executor-hosts/{name}/orders/{order_id}"),
+    ("POST", "/api/executor-hosts/{name}/orders/{probe_order_id}/probe-receipt"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/redeem"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/ack"),
     ("POST", "/api/executor-hosts/{name}/orders/{order_id}/phase"),

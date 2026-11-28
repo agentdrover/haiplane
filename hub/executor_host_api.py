@@ -20,7 +20,7 @@ import asyncio
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 from pydantic import BaseModel, Field, ValidationError
 
 from hub import config
@@ -28,6 +28,7 @@ from hub.auth import LoginRateLimiter, current_identity, require_human_or_admin
 from hub.services import (
     executor_host_slots,
     executor_orders,
+    executor_quota_probe,
     host_redeem,
     launch_feedback,
     memory_wait,
@@ -49,6 +50,7 @@ _read_limiter = LoginRateLimiter(ORDER_READ_MAX, ORDER_READ_WINDOW)
 PHASE_MAX = 30
 PHASE_WINDOW = 60
 _phase_limiter = LoginRateLimiter(PHASE_MAX, PHASE_WINDOW)
+_PROBE_CACHE_HEADERS = {"Cache-Control": "no-store"}
 
 
 class ExecutorHostCreate(BaseModel):
@@ -236,7 +238,9 @@ async def _has_unredeemed(db: Any, host: str) -> bool:
 async def api_executor_host_orders(
     name: str,
     request: Request,
+    response: Response,
     wait: int = Query(default=0, ge=0, description="Long-poll секунд (до 60)"),
+    admission_version: executor_quota_probe.Switch | None = None,
 ) -> dict:
     """Незакрытые невыкупленные заказы хоста; long-poll по образцу /api/events.
 
@@ -245,6 +249,13 @@ async def api_executor_host_orders(
     """
     await _host_caller(request, name)
     db = _db(request)
+    if admission_version is not None:
+        response.headers.update(_PROBE_CACHE_HEADERS)
+        return {
+            "host": name,
+            "orders": [],
+            "probe_orders": await executor_quota_probe.offers(db, name),
+        }
     if _polling.get(name, 0) >= ORDERS_POLL_MAX:
         # Ключ одного хоста не должен копить сколько угодно открытых соединений.
         raise HTTPException(
@@ -271,13 +282,7 @@ async def api_executor_host_orders(
     return {"host": name, "orders": orders}
 
 
-@router.get("/api/executor-hosts/{name}/orders/{order_id}")
-async def api_executor_order_read(name: str, order_id: int, request: Request) -> dict:
-    """Итог заказа своего хоста: состояние, причина закрытия, задача (#1831).
-
-    После сдачи сессии прогона отозваны (#1783), и сдачу хост проверяет этим
-    чтением. Без кода, токенов и постановки. Чужой и несуществующий заказ — один 404.
-    """
+async def _order_read_access(request: Request, name: str) -> None:
     await _host_caller(request, name)
     _read_limiter._max_attempts = ORDER_READ_MAX
     if _read_limiter.is_blocked(name):
@@ -289,6 +294,59 @@ async def api_executor_order_read(name: str, order_id: int, request: Request) ->
             },
         )
     _read_limiter.record(name)
+
+
+@router.get("/api/executor-hosts/{name}/orders/probe-{probe_hex}")
+async def api_executor_quota_probe_check(
+    name: str,
+    request: Request,
+    response: Response,
+    admission_version: executor_quota_probe.Switch,
+    phase: executor_quota_probe.Phase,
+    probe_hex: str = Path(pattern=executor_quota_probe.HEX_PATTERN),
+) -> dict:
+    """Record one service observation with the same host key and no code."""
+    await _order_read_access(request, name)
+    response.headers.update(_PROBE_CACHE_HEADERS)
+    try:
+        return await executor_quota_probe.check_phase(
+            _db(request), name, f"probe-{probe_hex}", phase
+        )
+    except executor_orders.HostError as exc:
+        raise HTTPException(
+            exc.status, detail=exc.detail, headers=_PROBE_CACHE_HEADERS
+        ) from exc
+
+
+@router.post("/api/executor-hosts/{name}/orders/probe-{probe_hex}/probe-receipt")
+async def api_executor_quota_probe_receipt(
+    name: str,
+    request: Request,
+    response: Response,
+    body: executor_quota_probe.ProbeReceipt,
+    probe_hex: str = Path(pattern=executor_quota_probe.HEX_PATTERN),
+) -> dict:
+    """Record an idempotent proof for the two service observations."""
+    await _order_read_access(request, name)
+    response.headers.update(_PROBE_CACHE_HEADERS)
+    try:
+        return await executor_quota_probe.record(
+            _db(request), name, f"probe-{probe_hex}", body
+        )
+    except executor_orders.HostError as exc:
+        raise HTTPException(
+            exc.status, detail=exc.detail, headers=_PROBE_CACHE_HEADERS
+        ) from exc
+
+
+@router.get("/api/executor-hosts/{name}/orders/{order_id}")
+async def api_executor_order_read(name: str, order_id: int, request: Request) -> dict:
+    """Итог заказа своего хоста: состояние, причина закрытия, задача (#1831).
+
+    После сдачи сессии прогона отозваны (#1783), и сдачу хост проверяет этим
+    чтением. Без кода, токенов и постановки. Чужой и несуществующий заказ — один 404.
+    """
+    await _order_read_access(request, name)
     outcome = await executor_orders.read_order_outcome(_db(request), name, order_id)
     if outcome is None:
         raise HTTPException(404, detail={"reason": "order_not_found"})
