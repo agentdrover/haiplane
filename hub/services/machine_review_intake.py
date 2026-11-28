@@ -184,11 +184,20 @@ async def _alert_environment_refusal(
     читает уже сохранённые строки, — двух ответов на вопрос «это отказ
     среды?» быть не должно.
     """
-    from hub.services.review_dispatch import is_environment_refusal
+    from hub.services.review_dispatch import (
+        ACCESS_REFUSAL_WHERE_TO_LOOK,
+        is_access_refusal,
+        is_environment_refusal,
+    )
 
-    if not is_environment_refusal(
-        {"incomplete": body.incomplete, "incomplete_reason": body.incomplete_reason}
-    ):
+    declared = {
+        "incomplete": body.incomplete,
+        "incomplete_reason": body.incomplete_reason,
+    }
+    if is_access_refusal(declared):
+        await _alert_access_refusal(db, task_id, body, ACCESS_REFUSAL_WHERE_TO_LOOK)
+        return
+    if not is_environment_refusal(declared):
         return
     lost = (
         "; ".join(body.lost_dimensions[:5])
@@ -206,6 +215,39 @@ async def _alert_environment_refusal(
             "в той же среде даст тот же отказ, лечится настройкой окружения "
             "ревьюера. Ноль находок здесь означает «смотреть было нечем», а "
             "не «чисто» (#1238)."
+        ),
+    )
+
+
+async def _alert_access_refusal(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: MachineReviewSubmit,
+    where_to_look: str,
+) -> None:
+    """Назвать на карточке отказ ДОСТУПА, заявленный ревьюером (#2280).
+
+    Не отказ среды: проверки могли быть, не было брифа, критериев и харнесса.
+    Какой из случаев был (обмен ответил ошибкой, хаб не ответил, не прочитался
+    бриф), хаб не знает: прозу ``lost_dimensions`` он не разбирает, а аудит
+    пишется не на каждый. Поэтому алерт называет, где что видно
+    (``where_to_look``), и не утверждает одной причины.
+    """
+    lost = (
+        "; ".join(body.lost_dimensions[:5])
+        if body.lost_dimensions
+        else "перечень потерянных измерений не приложен"
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        (
+            f"Неполный отчёт: ревьюер НЕ ПОЛУЧИЛ ДОСТУП к хабу — {lost}. Это не "
+            "отказ среды и не исчерпание профиля: бриф, критерии и харнесс он "
+            f"не прочитал. {where_to_look} Ноль находок здесь означает «не "
+            "проверено по брифу», а не «чисто» (#2280)."
         ),
     )
 

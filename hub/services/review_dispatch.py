@@ -50,6 +50,7 @@ from hub.integrations.protocols import SnapshotArchive
 from hub.integrations import forge as forge_urls
 from hub.integrations.registry import plugins
 from hub.models import (
+    INCOMPLETE_REASON_ACCESS,
     INCOMPLETE_REASON_ENVIRONMENT,
     INCOMPLETE_REASON_PROFILE,
     RiskClass,
@@ -1856,7 +1857,7 @@ REPORT_BLOCK_INSTRUCTION = (
     '"start_line": 1, "detail": "..."}], '
     '"findings_rejected": [{"title": "...", "category": "...", "reason": "..."}], '
     '"unresolved": [{"title": "...", "why": "..."}], '
-    '"lost_dimensions": ["..."], "incomplete_reason": "environment|profile|", '
+    '"lost_dimensions": ["..."], "incomplete_reason": "environment|profile|access|", '
     '"harness_skill": "...", "harness_version": <число или null>, '
     '"tokens_spent": <число или null>, "model": "<твоя модель>"}\n'
     "```\n"
@@ -1866,8 +1867,10 @@ REPORT_BLOCK_INSTRUCTION = (
     "При incomplete=true назови ПРИЧИНУ одним словом в incomplete_reason: "
     "«environment» — смотреть было нечем (нет чем запустить проверки, не "
     "разрешается база для сравнения), «profile» — инструменты были, а охвата "
-    "на объём диффа не хватило. Это РАЗНЫЕ ответы человека: первое лечится "
-    "настройкой окружения, второе — ещё одним прогоном. Не заявишь — причина "
+    "на объём диффа не хватило, «access» — доступ к хабу не получен (код не "
+    "обменялся или бриф не прочитан). Это РАЗНЫЕ ответы человека: первое "
+    "лечится настройкой окружения, второе — ещё одним прогоном, третье — "
+    "разбором доступа к хабу. Не заявишь — причина "
     "останется неизвестной, и угадывать её по твоему тексту никто не будет. "
     "Если инструменты хаба недоступны — этот блок единственный способ "
     "доставить работу, и без него прогон пропадёт целиком."
@@ -1957,6 +1960,36 @@ def environment_attempt_block(needs_container: bool) -> str:
     return _ENVIRONMENT_ATTEMPT_HEAD + middle + _ENVIRONMENT_ATTEMPT_TAIL
 
 
+# #2280. Отказ доступа к хабу — своя причина, названная ДО чтения кода. На
+# #1734 ран, которому обмен вернул chat_pair_invalid, остался без брифа и
+# харнесса и назвал это «нечем запустить проверки» (environment): алерт отправил
+# человека чинить окружение, которое было в порядке. Слово ``access`` — из
+# словаря models.INCOMPLETE_REASONS; сам код в отчёт не просится.
+#
+# Случаев три, потому что верное для них разное: без сессии (обмен ответил
+# ошибкой или молчал) HTTP-сдача закрыта и отчёт идёт блоком, а после прошедшего
+# обмена сессия есть и POST machine-review открыт — сказать там «закрыта» значило
+# бы отнять у рана рабочий путь.
+_ACCESS_REFUSED_INSTRUCTION = (
+    "ЕСЛИ ДОСТУП НЕ ПОЛУЧЕН — это ОТДЕЛЬНАЯ причина, не отказ среды: проверки "
+    "у тебя могли быть, не было хаба. Не называй её environment. Во всех "
+    f'случаях incomplete=true, incomplete_reason="{INCOMPLETE_REASON_ACCESS}"; '
+    "сам код доступа в отчёт не пиши; дифф и код прочитай как обычно и "
+    "найденное не выбрасывай: недоступны бриф и харнесс, а не наблюдения. "
+    "Что писать в lost_dimensions — по тому, что ты видел:\n"
+    "1) обмен кода ответил ошибкой (401, 429 и т. п.): «доступ к хабу не "
+    "получен: обмен кода HTTP <код>»; сессии нет, HTTP-сдача закрыта — отчёт "
+    "блоком в конце ответа;\n"
+    "2) хаб на обмен не ответил (сеть, таймаут): «доступ к хабу не получен: "
+    "хаб не ответил на обмен кода»; сессии нет, HTTP-сдача закрыта — отчёт "
+    "блоком в конце ответа;\n"
+    "3) обмен прошёл, а бриф не прочитался: «бриф не прочитан: HTTP <код или "
+    "«нет ответа»>»; сессия у тебя есть, поэтому сдай отчёт POST "
+    "machine-review обычным путём, а блок в конце ответа — единственная сдача, "
+    "если POST не прошёл.\n"
+)
+
+
 def _delivery_block(task_id: int, code: str, base_url: str) -> str:
     """How to file the report through the contract, with no MCP (#1084).
 
@@ -1986,7 +2019,9 @@ def _delivery_block(task_id: int, code: str, base_url: str) -> str:
         "-H 'Content-Type: application/json' -d @report.json\n"
         "Сессия видит ровно две ручки этой задачи — обзор ревью и приём "
         "отчёта. Ни вердикт, ни клейм, ни правка задачи ей не доступны: "
-        "не пытайся, это не ограничение прошивки, а граница роли.\n\n"
+        "не пытайся, это не ограничение прошивки, а граница роли.\n"
+        + _ACCESS_REFUSED_INSTRUCTION
+        + "\n"
     )
 
 
@@ -2068,7 +2103,8 @@ LOCAL_CAPABILITIES_BLOCK = (
     "— «не установлено» допустимый исход, домысливать и читать исходники "
     "вне диффа нельзя.\n"
     'incomplete_reason="environment" — только когда смотреть было нечем: '
-    "бриф или HTTP хаба недоступны, код доступа не принят, дифф не приложен. "
+    "дифф не приложен. Бриф или HTTP хаба недоступны, код доступа не принят — "
+    'это incomplete_reason="access", а не environment (#2280). '
     "Нет доказательств тестов — это lost_dimensions с названием, а не "
     "environment.\n\n"
 )
@@ -2194,8 +2230,9 @@ _REPORT_ENVIRONMENT_CLAUSE = (
     "(нет чем запустить проверки, не разрешается база для сравнения)"
 )
 _REPORT_ENVIRONMENT_CLAUSE_LOCAL = (
-    "(бриф или HTTP хаба недоступны, дифф не приложен; тесты, которых ты "
-    "не запускал сам, сюда не относятся — см. блок ВОЗМОЖНОСТЕЙ)"
+    "(дифф не приложен; бриф или HTTP хаба недоступны — это «access», не "
+    "«environment»; тесты, которых ты не запускал сам, сюда не относятся — "
+    "см. блок ВОЗМОЖНОСТЕЙ)"
 )
 
 
@@ -2497,10 +2534,45 @@ ENVIRONMENT_REFUSAL_NOTE = (
 )
 
 
+def is_access_refusal(report: Mapping[str, Any] | None) -> bool:
+    """Отчёт неполон ПОТОМУ ЧТО ревьюер не получил доступ к хабу (#2280).
+
+    Тот же закон, что у ``is_environment_refusal``: заявление ревьюера, слово
+    из словаря, прозы не читаем. Это не отказ среды: предикат отказа среды на
+    такой отчёт не срабатывает, и «повтор даст тот же отказ» про него не
+    говорится — новый заказ выписывает новый код.
+    """
+    if report is None or not report.get("incomplete"):
+        return False
+    return (report.get("incomplete_reason") or "") == INCOMPLETE_REASON_ACCESS
+
+
+#: Где смотреть, почему не вышел доступ — для алерта карточки и примечания
+#: лестницы (#2280). Хаб не знает, какой из случаев был: прозу ``lost_dimensions``
+#: он не разбирает (закон модуля), а аудит пишется не на каждый. Поэтому текст
+#: называет, где что видно, и не утверждает одной причины.
+ACCESS_REFUSAL_WHERE_TO_LOOK = (
+    "Где смотреть причину: отказ обмена кода 401 — как правило, в закрытом "
+    "аудите chat_pair_redeem_refused (право admin.audit.read; запись о "
+    "неизвестном коде прорежена, #1694); 429 и недоступность "
+    "хаба аудит не пишут; если в аудите есть chat_pair_redeem, обмен прошёл — "
+    "не прочитался бриф, а не обмен."
+)
+
+#: Хвост алерта лестницы, когда неполнота — отказ доступа (#2280).
+ACCESS_REFUSAL_NOTE = (
+    " ПРИЧИНА — ДОСТУП К ХАБУ по заявлению ревьюера: бриф, критерии и харнесс "
+    "не прочитаны. Это не отказ среды (проверки могли быть доступны) и не "
+    f"исчерпание профиля. {ACCESS_REFUSAL_WHERE_TO_LOOK}"
+)
+
+
 def _ladder_cause_note(report: Mapping[str, Any] | None) -> str:
-    """Что дописать в алерт лестницы про ПРИЧИНУ неполноты (#1238)."""
+    """Что дописать в алерт лестницы про ПРИЧИНУ неполноты (#1238, #2280)."""
     if is_environment_refusal(report):
         return ENVIRONMENT_REFUSAL_NOTE
+    if is_access_refusal(report):
+        return ACCESS_REFUSAL_NOTE
     return ""
 
 
@@ -2540,7 +2612,8 @@ async def count_environment_refusals(
         for row in incomplete_rows
         if (row.get("incomplete_reason") or "") == INCOMPLETE_REASON_PROFILE
     )
-    declared = environment + profile_exhausted
+    access = sum(1 for row in incomplete_rows if is_access_refusal(row))
+    declared = environment + profile_exhausted + access
     incomplete_total = len(incomplete_rows)
     if declared:
         share_note = (
@@ -2562,6 +2635,7 @@ async def count_environment_refusals(
         "reason_unstated": incomplete_total - declared,
         "environment_refusals": environment,
         "profile_exhausted": profile_exhausted,
+        "access_refusals": access,
         # Доля есть только при непустом знаменателе; иначе её нет, и вместо
         # числа стоит None рядом со словом «недобор» в share_note.
         "environment_share": (round(environment / declared, 3) if declared else None),

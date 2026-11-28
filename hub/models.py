@@ -4114,7 +4114,7 @@ class OutcomeAnswerView(BaseModel):
 
 #: Почему машинное ревью объявило себя неполным — СО СЛОВ ревьюера (#1238).
 #:
-#: Два случая, неразличимые в карточке до этой задачи, требуют разных ответов
+#: Случаи, неразличимые в карточке до этой задачи, требуют разных ответов
 #: человека и разных денег:
 #:
 #: * ``environment`` — ОТКАЗ СРЕДЫ. Ревьюеру было нечем смотреть: в среде нет
@@ -4124,14 +4124,22 @@ class OutcomeAnswerView(BaseModel):
 #: * ``profile`` — ИСЧЕРПАНИЕ ПРОФИЛЯ. Инструменты были, охвата не хватило:
 #:   дифф больше, чем один проход. Ровно это и покупает добор (#879).
 #:
-#: Пустая строка — «не заявлена». Это НЕ третья причина и не «со средой всё
+#: * ``access`` — ДОСТУП К ХАБУ (#2280). Код доступа не дал сессию (обмен
+#:   ответил ошибкой или хаб на него не ответил) либо обмен прошёл, а бриф не
+#:   прочитался: проверки у ревьюера могли быть, не было брифа, критериев и
+#:   харнесса. Это не отказ среды и не исчерпание профиля: настройка окружения
+#:   его не лечит, а какой из случаев был, хаб по слову не знает.
+#:
+#: Пустая строка — «не заявлена». Это НЕ четвёртая причина и не «со средой всё
 #: хорошо»: так выглядят все отчёты, написанные до появления поля.
 INCOMPLETE_REASON_ENVIRONMENT = "environment"
 INCOMPLETE_REASON_PROFILE = "profile"
+INCOMPLETE_REASON_ACCESS = "access"
 INCOMPLETE_REASON_UNSTATED = ""
 INCOMPLETE_REASONS: tuple[str, ...] = (
     INCOMPLETE_REASON_ENVIRONMENT,
     INCOMPLETE_REASON_PROFILE,
+    INCOMPLETE_REASON_ACCESS,
 )
 
 
@@ -4266,10 +4274,11 @@ class MachineReviewSubmit(ReviewPinSubmit):
     # reading as a clean one. Forgetting must fail loudly at the schema.
     incomplete: bool
     # WHY it is incomplete, in the reviewer's own words from a fixed
-    # vocabulary (#1238). Two causes that look identical in the card today
-    # need opposite answers: an environment refusal is not cured by a second
+    # vocabulary (#1238, #2280). Three causes that look identical in the card
+    # need different answers: an environment refusal is not cured by a second
     # run in the same environment, an exhausted profile is exactly what the
-    # ladder (#879) buys another run for.
+    # ladder (#879) buys another run for, and no hub access is cured by
+    # neither.
     #
     # Optional, and empty means "not stated" — never "environment was fine".
     # Required would have been louder, but the only path the cloud reviewer

@@ -740,6 +740,10 @@ def test_the_cloud_review_prompt_is_unchanged() -> None:
     Эталоны сняты с develop до правки (tests/fixtures/cloud_review_prompt):
     lite и deep, MCP и HTTP, с контейнерной задачей и без. Регрессионная
     защита: зелёная и до, и после.
+
+    #2280: эталоны HTTP-пути (с кодом доступа) дополнены абзацем «ЕСЛИ ДОСТУП
+    НЕ ПОЛУЧЕН» в блоке доступа; во всех восьми блок отчёта называет и слово
+    ``access`` в перечне причин. Остальной текст эталонов не тронут.
     """
     from hub.services.review_dispatch import _delivery_block, _review_prompt
 

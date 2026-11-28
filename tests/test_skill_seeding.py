@@ -766,9 +766,11 @@ async def test_first_rollout_leaves_every_active_prod_skill_untouched(
     """
     # executor-pair-discipline: текст сида менял #1866 (три правила ревью) и
     # #1953 (раздел про критика k8); активная версия админа остаётся, новая
-    # ложится черновиком.
+    # ложится черновиком. hub-review-report-reading: #2280 добавил причину
+    # access в перечень incomplete_reason — тот же случай.
     changed_by_admin = {
         "local-executor-hub-repo",
+        "hub-review-report-reading",
         "hub-submit-task",
         "executor-pair-discipline",
     }
