@@ -93,6 +93,45 @@ async def _check_review_scope(
     return current, work, ""
 
 
+async def select_review_model(
+    db: aiosqlite.Connection, task: Any, requested: str
+) -> str | None:
+    """Pin a managed cloud review to the independent model in the signed plan."""
+    decision, execution_work, reason = await _scope(db, task)
+    if decision is None or reason:
+        await note_review_blocker(
+            db,
+            task,
+            ReviewBlocker(reason, "plan_owner", "check_signed_plan_and_execution"),
+        )
+        return None
+    if decision.snapshot.terms.billing_mode != "included_only":
+        return requested
+
+    from hub.services.model_family import same_family
+
+    dispatch = decision.snapshot.dispatch_authority
+    terms = dispatch.review_subscription if dispatch else None
+    model = terms.model if terms else ""
+    declared = (task["submission_model"] or "").strip()
+    if (
+        same_family(model, execution_work["model"]) is not False
+        or (declared and same_family(model, declared) is not False)
+        or (requested and requested != model)
+    ):
+        await note_review_blocker(
+            db,
+            task,
+            ReviewBlocker(
+                "pilot_signed_review_model_unavailable",
+                "operator",
+                "verify_signed_review_model",
+            ),
+        )
+        return None
+    return model
+
+
 async def _trusted_ci(db: aiosqlite.Connection, task: Any) -> bool:
     report = await ci_trust.trusted_report(db, int(task["id"]), task["submission_sha"])
     if report is None:
@@ -336,6 +375,16 @@ async def _write_review_reservation(
             )
         ):
             return False, None
+        if subscription := await quota.refusal(db, decision, grant):
+            if subscription != quota.WAITING:
+                await note_review_blocker(
+                    db,
+                    task,
+                    ReviewBlocker(
+                        subscription, "operator", "verify_review_subscription"
+                    ),
+                )
+            return False, None
         previous = await _one(
             db,
             """SELECT * FROM epic_plan_work WHERE task_id=? AND generation=?
@@ -346,7 +395,6 @@ async def _write_review_reservation(
             if previous["attempt"] == binding.attempt:
                 same = (
                     previous["review_dispatch_id"] is None
-                    and not spend.subscription_refusal(decision, grant)
                     and previous["authority_ref"] == grant.reference
                     and previous["ceiling_cents"] == grant.ceiling_cents
                     and spend.binding_of(previous) == binding
@@ -369,8 +417,6 @@ async def _write_review_reservation(
                 or previous["charged_cents"] is None
             ):
                 return False, None
-        if await quota.refusal(db, decision, grant):
-            return False, None
         if refusal := await spend.refusal(db, decision, grant):
             from hub.services import epic_plan_escalation
 

@@ -4498,6 +4498,14 @@ async def _prepare_claimed_order(
     from hub.services import epic_plan_gates
 
     task_id = int(task["id"])
+    managed = await epic_plan_gates.managed(db, task_id)
+    model = (
+        await epic_plan_gates.select_review_model(db, task, force_model)
+        if managed
+        else force_model
+    )
+    if model is None:
+        return None
     if not await _claim_the_order(
         db, task_id, generation, force_profile, replaces_dispatch_id, force_model
     ):
@@ -4523,9 +4531,9 @@ async def _prepare_claimed_order(
             generation=generation,
             force_profile=force_profile,
             principal_id=principal_id,
-            force_model=force_model,
+            force_model=model,
             cloud=True,
-            defer_access_code=await epic_plan_gates.managed(db, task_id),
+            defer_access_code=managed,
         )
         # Последнее слово перед тратой: подготовка заказа ходит в сеть, и за это окно
         # сдача могла смениться — ЛЮБОЙ облачный заказ, не только переспрос (фильтр
