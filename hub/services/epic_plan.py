@@ -32,7 +32,12 @@ PROJECT: Literal["receipt-split-calculator"] = "receipt-split-calculator"
 GROUPS = frozenset({2374, 2375, 2376})
 LEAVES = frozenset({2377, 2378, 2379, 2380})
 INCLUDED = GROUPS | LEAVES | {EPIC_ID}
-TERMS = PlanTerms()
+TERMS = PlanTerms(
+    billing_mode="included_only",
+    quota_action="wait_for_reset",
+    total_cents=0,
+    leaf_cents=0,
+)
 ACTIONS = ["approve_statement", "prepare_leaf_for_dispatch"]
 PAID_ACTIONS = ["launch_bounded_executor", "order_bounded_independent_review"]
 EXCEPTIONS = [
@@ -172,16 +177,23 @@ def _dispatch_authority() -> PlanDispatchAuthority | None:
     from hub.services import epic_plan_transport
     from hub.services.epic_plan_authority import configured_source_fingerprint
 
-    if (
-        epic_plan_transport.executor_transport("k8") is None
-        or epic_plan_transport.review_transport() is None
-    ):
+    executor = epic_plan_transport.executor_transport("k8")
+    review = epic_plan_transport.review_transport()
+    if executor is None or review is None:
+        return None
+    execution_terms = executor.subscription()
+    review_terms = review.subscription()
+    if execution_terms is None or review_terms is None:
         return None
     source = configured_source_fingerprint()
     model = (config.env_get("EPIC_PLAN_EXECUTOR_MODEL", "") or "").strip()
     issuer = config.env_get("EPIC_PLAN_DISPATCH_PRINCIPAL_ID", "") or ""
     if (
         not source
+        or execution_terms.provider != "OpenAI"
+        or execution_terms.model != model
+        or review_terms.provider != "Cursor"
+        or review_terms.model != "grok-4.7"
         or not model
         or len(model) > 128
         or not issuer.isascii()
@@ -194,6 +206,8 @@ def _dispatch_authority() -> PlanDispatchAuthority | None:
         executor_model=model,
         issuer_principal_id=int(issuer),
         budget_source_fingerprint=source,
+        executor_subscription=execution_terms,
+        review_subscription=review_terms,
         conditions=[
             "project_executor_and_review_policy",
             "current_hard_spending_grant_and_verified_checkout",
@@ -238,7 +252,7 @@ async def snapshot(db: aiosqlite.Connection, epic_id: int) -> PlanSnapshot:
     leaf_ceiling, wip_limit = _project_caps(project)
     dispatch = _dispatch_authority()
     return PlanSnapshot(
-        schema_version="2" if dispatch else "1",
+        schema_version="3" if dispatch else "1",
         epic_id=epic_id,
         project=PROJECT,
         owner_principal_id=await _owner(db),

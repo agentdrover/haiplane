@@ -11,6 +11,10 @@
     <dt>Действия</dt><dd>{{ plan.snapshot.allowed_actions | join(", ") }}</dd>
     {% if plan.snapshot.dispatch_authority %}
     <dt>Исполнитель</dt><dd>{{ plan.snapshot.dispatch_authority.host }} · {{ plan.snapshot.dispatch_authority.executor_model }}</dd>
+    {% for title, account in [("Исполнение", plan.snapshot.dispatch_authority.executor_subscription), ("Ревью", plan.snapshot.dispatch_authority.review_subscription)] if account %}
+    <dt>{{ title }} по подписке</dt><dd>{{ account.provider }} · {{ account.model }} · период {{ account.quota_period }}.
+        Подтверждение условий <code style="overflow-wrap:anywhere">{{ account.terms_fingerprint }}</code>.</dd>
+    {% endfor %}
     <dt>Условия запуска</dt><dd>{{ plan.snapshot.dispatch_authority.conditions | join(", ") }}</dd>
     {% endif %}
     {% if plan.dispatch_blocker %}
@@ -19,6 +23,7 @@
     <dt>Исключения</dt><dd>{{ plan.snapshot.exceptions | join(", ") }}</dd>
     {% set terms = plan.snapshot.terms %}
     <dt>Срок и ограничения</dt>
+    {% if terms.billing_mode == "included_only" %}<dd>Только включённая подписка Codex и Grok. Дополнительные списания — 0. Если квота исчерпана, стюард ждёт её обновления.</dd>{% endif %}
     <dd>{{ terms.duration_days }} суток. WIP {{ terms.max_in_progress }}.
         Потолки расходов в центах USD: {{ terms.total_cents }} за пилот, {{ terms.leaf_cents }} за лист.
         Проектный потолок расходов на лист {{ plan.snapshot.project_leaf_ceiling_cents if plan.snapshot.project_leaf_ceiling_cents is not none else "неизвестен" }}.
