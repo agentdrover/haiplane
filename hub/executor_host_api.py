@@ -20,7 +20,7 @@ import asyncio
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 from pydantic import BaseModel, Field, ValidationError
 
 from hub import config
@@ -50,6 +50,7 @@ _read_limiter = LoginRateLimiter(ORDER_READ_MAX, ORDER_READ_WINDOW)
 PHASE_MAX = 30
 PHASE_WINDOW = 60
 _phase_limiter = LoginRateLimiter(PHASE_MAX, PHASE_WINDOW)
+_PROBE_CACHE_HEADERS = {"Cache-Control": "no-store"}
 
 
 class ExecutorHostCreate(BaseModel):
@@ -237,6 +238,7 @@ async def _has_unredeemed(db: Any, host: str) -> bool:
 async def api_executor_host_orders(
     name: str,
     request: Request,
+    response: Response,
     wait: int = Query(default=0, ge=0, description="Long-poll секунд (до 60)"),
     admission_version: executor_quota_probe.Switch | None = None,
 ) -> dict:
@@ -248,6 +250,7 @@ async def api_executor_host_orders(
     await _host_caller(request, name)
     db = _db(request)
     if admission_version is not None:
+        response.headers.update(_PROBE_CACHE_HEADERS)
         return {
             "host": name,
             "orders": [],
@@ -297,35 +300,43 @@ async def _order_read_access(request: Request, name: str) -> None:
 async def api_executor_quota_probe_check(
     name: str,
     request: Request,
+    response: Response,
     admission_version: executor_quota_probe.Switch,
     phase: executor_quota_probe.Phase,
     probe_hex: str = Path(pattern=executor_quota_probe.HEX_PATTERN),
 ) -> dict:
     """Record one service observation with the same host key and no code."""
     await _order_read_access(request, name)
+    response.headers.update(_PROBE_CACHE_HEADERS)
     try:
         return await executor_quota_probe.check_phase(
             _db(request), name, f"probe-{probe_hex}", phase
         )
     except executor_orders.HostError as exc:
-        raise _as_http(exc) from exc
+        raise HTTPException(
+            exc.status, detail=exc.detail, headers=_PROBE_CACHE_HEADERS
+        ) from exc
 
 
 @router.post("/api/executor-hosts/{name}/orders/probe-{probe_hex}/probe-receipt")
 async def api_executor_quota_probe_receipt(
     name: str,
     request: Request,
+    response: Response,
     body: executor_quota_probe.ProbeReceipt,
     probe_hex: str = Path(pattern=executor_quota_probe.HEX_PATTERN),
 ) -> dict:
     """Record an idempotent proof for the two service observations."""
     await _order_read_access(request, name)
+    response.headers.update(_PROBE_CACHE_HEADERS)
     try:
         return await executor_quota_probe.record(
             _db(request), name, f"probe-{probe_hex}", body
         )
     except executor_orders.HostError as exc:
-        raise _as_http(exc) from exc
+        raise HTTPException(
+            exc.status, detail=exc.detail, headers=_PROBE_CACHE_HEADERS
+        ) from exc
 
 
 @router.get("/api/executor-hosts/{name}/orders/{order_id}")

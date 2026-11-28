@@ -71,6 +71,7 @@ async def test_order_bound_quota_admission(world, monkeypatch):
 
     explicit = await _feed(world)
     assert explicit.status_code == 200
+    assert explicit.headers["Cache-Control"] == "no-store"
     assert explicit.json() == {"host": "k8", "orders": [], "probe_orders": []}
     assert (await _feed(world, version="2")).status_code == 422
 
@@ -91,7 +92,9 @@ async def test_probe_phases_bind_one_id_and_refuse_wrong_callers(world, issued):
     assert (await _phase(world, oid, "before_redeem", version="2")).status_code == 422
     premature = await _phase(world, oid, "before_exec")
     assert premature.json()["status"] == "wait"
-    first = (await _phase(world, oid, "before_redeem")).json()
+    observed = await _phase(world, oid, "before_redeem")
+    assert observed.headers["Cache-Control"] == "no-store"
+    first = observed.json()
     second = (await _phase(world, oid, "before_exec")).json()
     assert first == (await _phase(world, oid, "before_redeem")).json()
     assert second == (await _phase(world, oid, "before_exec")).json()
