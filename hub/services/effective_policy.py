@@ -469,6 +469,17 @@ def key_rows(project: Any) -> list[dict[str, Any]]:
     return [_key_row(key, entry, policy) for key, entry in REGISTRY.items()]
 
 
+async def policy_brief(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
+    """Read only the inputs to the two policy lines in the work context."""
+    keys = key_rows(project)
+    requested, effective, _ = await steward_shadow.read_mode_grant(db)
+    return {
+        "slug": project["slug"],
+        "keys": keys,
+        "steward": {"requested": requested, "effective": effective},
+    }
+
+
 async def effective_policy(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
     """Действующая политика проекта: ключи, сервер, стюард, замки, последняя правка."""
     policy = project_policy.gate_policy_of(project)

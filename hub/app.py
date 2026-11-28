@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from hub import brand, config, models, services, skill_publish
+from hub.services import project_catalog
 from hub.services.spec_context import linked_requirements, requirement_lines
 from hub import db as db_module
 from hub import repository as repo
@@ -96,6 +97,7 @@ from hub.models import (
     StewardJudgementSubmit,
     StewardJudgementView,
     CategoryCheckSubmit,
+    CachedProjectView,
     CloneBranchState,
     FindingDispositionsSubmit,
     OutcomeAnswerSubmit,
@@ -154,7 +156,7 @@ from hub.auth import (
 from hub.csrf import CsrfMiddleware, would_reject_count_24h
 from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_envelope import enrich_error_payload
-from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
+from hub import mcp_http_compat as mcp_http
 from hub.mcp_catalog import (
     catalog_snapshot,
     view_summary,
@@ -276,7 +278,7 @@ def _register_plugins() -> None:
 # MCP streamable-HTTP ASGI app. We instantiate it once at import time so it
 # can be mounted before lifespan runs; its session manager is started inside
 # our own lifespan via Starlette's lifespan_context.
-_mcp_streamable_app = mcp_server.streamable_http_app()
+_mcp_streamable_app = mcp_http.with_local_rest(mcp_server.streamable_http_app())
 
 
 async def _report_stale_env(db: aiosqlite.Connection) -> None:
@@ -480,6 +482,7 @@ async def lifespan(app: FastAPI):
             "доработки он ведёт сам, этот экземпляр их не выполняет",
             config.HUB_DB_PATH,
         )
+    app.state.project_catalog = project_catalog.ProjectCatalog()
     try:
         async with mcp_lifespan:
             await _startup_checks(app.state.db)
@@ -497,6 +500,7 @@ async def lifespan(app: FastAPI):
             steps={
                 "local review runs": cancel_local_runs(),
                 "local advisors": _cancel_local_advisors(),
+                "project catalog": app.state.project_catalog.stop(),
             },
         )
         set_telemetry_sink(None)
@@ -565,7 +569,7 @@ app.add_middleware(RequestConnectionMiddleware)
 app.add_middleware(CsrfMiddleware)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
-app.add_middleware(McpStreamableAcceptCompatMiddleware)
+app.add_middleware(mcp_http.McpStreamableAcceptCompatMiddleware)
 # Added last so it runs first. Empty allowlist preserves local/dev behavior;
 # production deployments can set HAIPLANE_HUB_ALLOWED_HOSTS.
 app.add_middleware(HostAllowlistMiddleware, allowed_hosts=config.HUB_ALLOWED_HOSTS)
@@ -982,22 +986,10 @@ async def api_create_subtasks_bulk(
 
 
 async def _project_view(row) -> ProjectView:
-    """The one way a project leaves this API (#887).
-
-    The clone check is attached HERE rather than at each call site so that a
-    surface added later cannot ship a project card without it — the same reason
-    the branch itself has one reader. Off the event loop because it shells out
-    to git: a workspace on unreachable storage must delay one response, not
-    block the server.
-    """
+    """Attach the live clone check off the event loop (#887)."""
     view = ProjectView(**dict(row))
     sync = await asyncio.to_thread(project_policy.clone_branch_state, row)
-    view.clone_branch = CloneBranchState(
-        state=sync.state,
-        reason=sync.reason,
-        project_branch=sync.project_branch,
-        clone_branch=sync.clone_branch,
-    )
+    view.clone_branch = CloneBranchState.model_validate(sync, from_attributes=True)
     return view
 
 
@@ -1076,12 +1068,15 @@ async def api_create_project(
     return await _project_view(row)
 
 
-@app.get("/api/projects", response_model=list[ProjectView])
+@app.get("/api/projects", response_model=list[CachedProjectView] | list[ProjectView])
 async def api_list_projects(
     request: Request,
     include_archived: bool = Query(default=False),
+    branch_check: Literal["live", "cached"] = Query(default="live"),
 ):
     rows = await repo.list_projects(_db(request), include_archived=include_archived)
+    if branch_check == "cached":
+        return request.app.state.project_catalog.list_views(rows)
     return [await _project_view(r) for r in rows]
 
 
@@ -1259,7 +1254,7 @@ async def api_executor_repair(
 
 
 @app.get("/api/projects/{slug}/effective-policy")
-async def api_effective_policy(slug: str, request: Request) -> dict:
+async def api_effective_policy(slug: str, request: Request, brief: str = "") -> dict:
     """Действующая политика проекта одной сводкой (#1457).
 
     Каждый ключ gate_policy со значением, источником (project, default или
@@ -1271,6 +1266,8 @@ async def api_effective_policy(slug: str, request: Request) -> dict:
 
     db = _db(request)
     project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
+    if brief == "true":
+        return await effective_policy.policy_brief(db, project)
     return await effective_policy.effective_policy(db, project)
 
 

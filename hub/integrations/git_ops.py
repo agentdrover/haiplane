@@ -472,6 +472,24 @@ def repo_slug(remote: str) -> str:
     return "/".join(parts[-2:]).lower()
 
 
+def origin_matches_project(origin: str, repo: str, forge: str) -> bool:
+    """Whether origin can attest to the repository named by the project."""
+    host = _project_origin_host(origin)
+    actual_forge = forge_registry.forge_of_host(host)
+    if actual_forge and actual_forge != forge:
+        return False
+    if not repo:
+        # A project may name only its workspace. The clone selects the origin.
+        return True
+    expected = _project_origin_host(repo) or forge_registry.git_host(forge)
+    return host == expected and repo_slug(origin) == repo_slug(repo)
+
+
+def _project_origin_host(url: str) -> str:
+    host = _origin_host(url).partition(":")[0]
+    return forge_registry.git_host("github") if host == "ssh.github.com" else host
+
+
 async def clone_root(start: str) -> str:
     """Main clone of the git checkout at ``start``; ``""`` when there is none.
 
