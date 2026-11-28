@@ -4649,7 +4649,9 @@ async def _steward_return_gate(state: VerdictContext) -> None:
             "уже другое",
             code="generation_moved",
         )
-    revoked = await authority_refusal(state.db, state.task_id)
+    revoked = await authority_refusal(
+        state.db, state.task_id, state.expected_generation
+    )
     if revoked:
         raise HTTPException(422, f"{revoked[0]}: {revoked[1]}")
 
@@ -4667,7 +4669,7 @@ async def _automation_ci_gate(state: VerdictContext) -> None:
 
     if (
         state.applied_by_steward
-        and state.claim is not None  # применение поллера; прямой вызов метки не имеет
+        and (state.claim is not None or config.STEWARD_ACT_PILOT is not None)
         and state.body.verdict.value == "changes_requested"
     ):
         await _steward_return_gate(state)  # #2053

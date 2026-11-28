@@ -46,6 +46,7 @@ async def launch_on_slot(
                 booked,
                 issuer_principal_id=issuer_principal_id,
                 issuer_human=issuer_human,
+                bind_retry_source=True,
             )
     except skills.SkillBundleError as exc:
         return el._refused(str(exc), task_id)

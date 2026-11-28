@@ -48,6 +48,7 @@ from typing import Any
 import aiosqlite
 from fastapi import HTTPException
 
+from hub import config
 from hub import repository as repo
 from hub.services import verdict_owner, watch_notices
 from hub.db import fetchall, write_transaction
@@ -458,8 +459,20 @@ async def _fence(
     task = dict(await repo.get_task(db, task_id) or {})
     _refuse_if_the_submission_moved(task, generation)
     _refuse_if_the_verdict_is_taken(task, generation)
-    if claim is None:
+    if claim is None and config.STEWARD_ACT_PILOT is None:
         return
+    if claim is not None:
+        await _require_application_claim(db, claim)
+    from hub.services.steward_apply import authority_refusal
+
+    revoked = await authority_refusal(db, task_id, generation)
+    if revoked:
+        raise CodedRefusal(422, f"{revoked[0]}: {revoked[1]}", code=revoked[0])
+
+
+async def _require_application_claim(
+    db: aiosqlite.Connection, claim: tuple[int, str]
+) -> None:
     held = await fetchall(
         db,
         "SELECT 1 FROM steward_judgements WHERE id=? AND advisor_outcome='applying' "
@@ -470,11 +483,6 @@ async def _fence(
         raise CodedRefusal(
             409, "метка применения потеряна - эскалация не записана", code="claim_lost"
         )
-    from hub.services.steward_apply import authority_refusal
-
-    revoked = await authority_refusal(db, task_id)
-    if revoked:
-        raise CodedRefusal(422, f"{revoked[0]}: {revoked[1]}", code=revoked[0])
 
 
 async def _hand_to_the_human(

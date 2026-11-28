@@ -58,6 +58,7 @@ async def apply_judge_changes_requests(db: aiosqlite.Connection) -> int:
     """
     from hub.services.steward_advisor import _stamp_now
     from hub.services.steward_dispatch import _policy_wants_steward
+    from hub.services.steward_limited_act import refusal_for
     from hub.services.steward_shadow import effective_mode
 
     if await effective_mode(db) != "act":
@@ -76,6 +77,8 @@ async def apply_judge_changes_requests(db: aiosqlite.Connection) -> int:
     for row in rows:
         item = dict(row)
         task_id, generation = int(item["task_id"]), int(item["generation"])
+        if await refusal_for(db, task_id, generation):
+            continue
         if await task_automation_not_applicable(db, task_id):
             continue  # #1647: state-задачу стюард не двигает
         project = await repo.resolve_project_for_task(db, task_id)
