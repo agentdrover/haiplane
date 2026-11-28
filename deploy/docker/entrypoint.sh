@@ -8,4 +8,6 @@ if [ "${HAIPLANE_DEMO_SEED:-0}" = "1" ]; then
     python /app/scripts/demo_seed.py
 fi
 
+python /app/scripts/github_credentials_bootstrap.py
+
 exec haiplane-hub

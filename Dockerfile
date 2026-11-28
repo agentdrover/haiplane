@@ -16,7 +16,8 @@ ENV UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH" \
     HAIPLANE_HUB_HOST=0.0.0.0 \
-    HAIPLANE_HUB_DB=/data/hub.db
+    HAIPLANE_HUB_DB=/data/hub.db \
+    HAIPLANE_GITHUB_CREDENTIAL_KEY_FILE=/keys/github/credentials.keys
 
 # Dependency layer first so a code edit does not re-resolve the lock.
 COPY pyproject.toml uv.lock ./

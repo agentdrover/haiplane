@@ -1,5 +1,11 @@
 # Invariants
 
+- GitHub credential foundation: encrypted slots, separate operator keyring,
+  immutable operation context, three permission planes, persistent refresh
+  leases and fail-closed recovery are defined in
+  [github-credential-contract.md](github-credential-contract.md). Public
+  browser/Git wiring and process isolation remain separate epic tasks.
+
 These are the rules most likely to be broken by “small” changes.
 
 ## Domain Invariants
