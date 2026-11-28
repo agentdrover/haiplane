@@ -45,6 +45,9 @@ DECIDER_NONE = "none"
 CODE_LOCK_743 = "gate_lock_743"
 CODE_STEWARD_OFF = "steward_off"
 CODE_REVIEWER_PENDING = "reviewer_pending"
+#: Ревью не куплено из-за красного CI на закреплённом коммите (#2209):
+#: маршрут обязан назвать это, а не ждать ревьюера, которого не позовут.
+CODE_RED_CI = "red_ci"
 CODE_STEWARD_SHADOW = "steward_shadow"
 CODE_STEWARD_ACT = "steward_act"
 CODE_ADVISOR_SKIPPED = "steward_advisor_skipped"
@@ -217,6 +220,18 @@ async def _steward_route(
     if steward_shadow._only_the_reviewer_is_missing(
         steward, implementer, reviewer
     ) and await steward_shadow._project_expects_a_reviewer(db, int(task["id"])):
+        # #2209: тот же вопрос, что задаёт старт стюарда, — с тем же ответом.
+        # Иначе карточка ждёт ревьюера, которого не купят никогда.
+        from hub.services import review_ci_gate
+
+        red = await review_ci_gate.ci_forbids_review(db, task)
+        if red:
+            return _human(
+                CODE_RED_CI,
+                review_ci_gate.red_ci_note(red)
+                + ": стюард не начнёт, пока ревью не куплено",
+                mode,
+            )
         return _human(
             CODE_REVIEWER_PENDING,
             "кросс-модельного ревьюера ещё не позвали: стюард не начнёт, пока "
