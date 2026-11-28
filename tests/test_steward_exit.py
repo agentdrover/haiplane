@@ -345,7 +345,7 @@ async def test_mark_on_a_standing_verdict_is_not_a_silent_repeat(
 async def test_counter_does_not_trust_the_display_name(
     db: aiosqlite.Connection, client, hdr
 ):
-    """Codex P-2: человек с именем agent=policy в счётчик входит."""
+    """Человек с именем agent=policy больше не пишет вердикт (#2147): 422, счётчик пуст."""
     from hub.services import steward_exit
 
     task_id = await _paired_review(client, db, hdr, "named")
@@ -354,7 +354,35 @@ async def test_counter_does_not_trust_the_display_name(
         json=_cr_body(agent="policy", pair_miss=False, pair_miss_note=NOTE),
         headers=hdr["human"],
     )
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["reason"] == "reserved_actor_name"
+    assert await steward_exit.human_returns_not_pair_miss(db) == 0
+
+
+async def test_counter_keeps_historical_events_named_after_automation(
+    db: aiosqlite.Connection, client, hdr
+):
+    """История не переписывается (#2147): человеческий возврат с actor=policy,
+    записанный до запрета, остаётся в счётчике pair_miss=false.
+    """
+    from hub.services import steward_exit
+
+    task_id = await _paired_review(client, db, hdr, "historic")
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={
+            "verdict": "changes_requested",
+            "submission_generation": 1,
+            "human": True,
+            "pair_miss": False,
+            "pair_miss_note": NOTE,
+        },
+    )
+    await db.commit()
+
     assert await steward_exit.human_returns_not_pair_miss(db) == 1
 
 
