@@ -41,7 +41,23 @@ AUTHORITY_URL = "https://budget.example.test/pilot"
 AUTHORITY_TOKEN = "fixture-synthetic-auth"  # pragma: allowlist secret
 
 
+def subscription_fixture(provider, model):
+    from hub.epic_plan_view import SubscriptionEvidence
+
+    return SubscriptionEvidence(
+        provider=provider,
+        model=model,
+        account_fingerprint="f" * 64,
+        terms_fingerprint="c" * 64,
+        quota_period="weekly",
+        additional_charges_disabled=True,
+    )
+
+
 class SyntheticExecutor:
+    def subscription(self):
+        return subscription_fixture("OpenAI", "codex-fixture")
+
     async def issue(self, db, project, booking, grant):
         binding = grant.binding
         assert binding.phase == "executor"
@@ -57,6 +73,9 @@ class SyntheticExecutor:
 
 
 class SyntheticReview:
+    def subscription(self):
+        return subscription_fixture("Cursor", "grok-4.7")
+
     def __init__(self):
         self.sent = {}
 
@@ -80,6 +99,8 @@ async def prepared(
     pilot,  # noqa: F811 - imported pytest fixture
     keys,  # noqa: F811 - imported pytest fixtures
 ):
+    # Previous paid-grant scenarios remain covered for persisted decisions.
+    monkeypatch.setattr(epic_plan, "TERMS", epic_plan.PlanTerms())
     pid, actors = pilot
     agent, _ = actors["plan-agent"]
     owner_id, owner = actors["plan-owner"]
@@ -267,15 +288,18 @@ async def test_rework_round_is_bound_to_new_sha(db, prepared, monkeypatch):
         principal_id=owner_id,
         attempt=1,
     ) == (False, None)
-    ready, reservation = await gates.reserve_review(
-        db,
-        task,
-        channel="cloud",
-        model="independent",
-        principal_id=reviewer_id,
-        attempt=1,
+    request = transport.ReviewRequest(
+        "review-fixture-generation-2",
+        "https://example.test/repo.git",
+        "task-2377/pilot",
+        repaired_sha,
+        "independent",
+        "review the pin",
+        "https://hub.example.test/mcp",
     )
-    assert ready and reservation is not None
+    started, reservation = await review_dispatch._launch_metered_review(
+        db, dict(task), request, reviewer_id, 1
+    )
     replay_ready, replay = await gates.reserve_review(
         db,
         task,
@@ -293,33 +317,21 @@ async def test_rework_round_is_bound_to_new_sha(db, prepared, monkeypatch):
     )
     await repo.update_task(db, 2377, risk_class="R3")
     await db.commit()
-    assert not await gates.ready_to_send(db, reservation)
+    assert not await gates.begin_review_send(db, reservation)
     await repo.update_task(db, 2377, risk_class="R2")
     await db.execute(
         "UPDATE principals SET status='disabled' WHERE id=?", (reviewer_id,)
     )
     await db.commit()
-    assert not await gates.ready_to_send(db, reservation)
+    assert not await gates.begin_review_send(db, reservation)
     await db.execute("UPDATE principals SET status='active' WHERE id=?", (reviewer_id,))
     await db.commit()
 
-    request = transport.ReviewRequest(
-        "review-fixture-generation-2",
-        "https://example.test/repo.git",
-        "task-2377/pilot",
-        repaired_sha,
-        "independent",
-        "review the pin",
-        "https://hub.example.test/mcp",
-    )
-    started, sent_permit = await review_dispatch._launch_metered_review(
-        db, dict(task), request, reviewer_id, 1
-    )
     adopted, adopted_permit = await review_dispatch._launch_metered_review(
         db, dict(task), request, reviewer_id, 1
     )
     assert started.agent_id == adopted.agent_id == "synthetic-review"
-    assert adopted.adopted and sent_permit.id == adopted_permit.id == reservation.id
+    assert adopted.adopted and adopted_permit.id == reservation.id
     dispatch_id = await repo.create_review_dispatch(
         db,
         task_id=2377,

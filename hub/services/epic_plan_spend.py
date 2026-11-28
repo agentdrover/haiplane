@@ -26,6 +26,32 @@ async def usage(db: aiosqlite.Connection, task_id: int) -> tuple[int, int, bool]
     return int(rows[0]["total"]), int(rows[0]["leaf"]), bool(rows[0]["exceeded"])
 
 
+def subscription_refusal(decision: PlanDecision, grant: authority.SpendingGrant) -> str:
+    snapshot = decision.snapshot
+    if snapshot.terms.billing_mode != "included_only":
+        return ""
+    dispatch = snapshot.dispatch_authority
+    if dispatch is None:
+        return "pilot_subscription_unverified"
+    terms = (
+        dispatch.executor_subscription
+        if grant.binding.phase == "executor"
+        else dispatch.review_subscription
+    )
+    if (
+        terms is None
+        or terms.model != grant.binding.model
+        or grant.subscription_account_fingerprint != terms.account_fingerprint
+        or grant.subscription_terms_fingerprint != terms.terms_fingerprint
+        or grant.ceiling_cents != 0
+        or grant.quota_available is None
+    ):
+        return "pilot_subscription_unverified"
+    if not grant.quota_available:
+        return "pilot_wait_for_quota_reset"
+    return ""
+
+
 async def refusal(
     db: aiosqlite.Connection,
     decision: PlanDecision,
@@ -37,6 +63,8 @@ async def refusal(
         or grant.binding.plan_version != decision.version
     ):
         return "spending_grant_stale"
+    if subscription := subscription_refusal(decision, grant):
+        return subscription
     total, leaf, exceeded = await usage(db, grant.binding.task_id)
     if exceeded:
         return "spending_cap_breached"

@@ -23,7 +23,7 @@ def add_parser(sub: Any, api: Any) -> None:
 
     plan = sub.add_parser(
         "epic-plan",
-        help="Read pilot authority, blockers, or sign the selected plan version",
+        help="Read subscription terms and blockers, or sign this pilot plan version",
     )
     actions = plan.add_subparsers(dest="action", required=True)
     for name in ("show", "approve", "stopped", "revoked"):

@@ -75,6 +75,39 @@ async def bind_code_to_dispatch(
         )
 
 
+async def bind_code_id_to_dispatch(
+    db: aiosqlite.Connection,
+    code_id: int | None,
+    dispatch_id: int,
+    task_id: int,
+    generation: int,
+    principal_id: int | None,
+) -> None:
+    """Bind the exact pilot access ID, including a session or an early report."""
+    if code_id is None or principal_id is None:
+        return
+    scope = (code_id, principal_id, task_id, generation)
+    await db.execute(
+        "UPDATE chat_pair_codes SET dispatch_id=? WHERE id=? AND principal_id=? "
+        "AND bound_task_id=? AND bound_generation=? AND kind='reviewer' "
+        "AND dispatch_id IS NULL",
+        (dispatch_id, *scope),
+    )
+    await db.execute(
+        "UPDATE chat_pair_sessions SET dispatch_id=? WHERE code_id=? AND principal_id=? "
+        "AND bound_task_id=? AND bound_generation=? AND kind='reviewer' "
+        "AND dispatch_id IS NULL",
+        (dispatch_id, *scope),
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET dispatch_id=?, "
+        "profile=(SELECT profile FROM review_dispatches WHERE id=?) "
+        "WHERE code_id=? AND principal_id=? AND task_id=? AND submission_generation=? "
+        "AND dispatch_id IS NULL",
+        (dispatch_id, dispatch_id, *scope),
+    )
+
+
 async def accepted_dispatch(
     db: aiosqlite.Connection,
     task_id: int,
