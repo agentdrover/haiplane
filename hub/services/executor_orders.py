@@ -58,6 +58,7 @@ from hub.services import (
     order_deadline,
     owner_minutes,
     project_policy,
+    steward_limited_act,
 )
 
 log = logging.getLogger("hub.services.executor_orders")
@@ -830,6 +831,7 @@ async def _issue_atomically(
     issuer_principal_id: int | None,
     issuer_human: bool = False,
     pilot_start: tuple[str, str] | None = None,
+    bind_retry_source: bool = False,
 ) -> tuple[int, int]:
     """``_issue`` под SAVEPOINT: сбой откатывает ЕГО записи, а не только свои.
 
@@ -847,6 +849,19 @@ async def _issue_atomically(
             if issuer_principal_id is None:
                 raise HTTPException(409, "a system issuer cannot return a running task")
             await _return_for_repair(db, booked, issuer_principal_id)
+        source = None
+        if bind_retry_source:
+            task = (
+                await repo.get_task(db, int(booked.task["id"]))
+                if booked.returning
+                else booked.task
+            )
+            if task is not None:
+                source = await steward_limited_act.retry_source_pin(
+                    db, dict(task), str(project["slug"]), booked.host["name"]
+                )
+        if source:
+            pilot_start = (source[1].starting_sha, source[1].model)
         result = await _issue(
             db,
             project,
@@ -855,6 +870,14 @@ async def _issue_atomically(
             issuer_human=issuer_human,
             pilot_start=pilot_start,
         )
+        if source:
+            await repo.insert_event(
+                db,
+                kind=steward_limited_act.RETRY_SOURCE_EVENT,
+                task_id=int(booked.task["id"]),
+                actor="hub",
+                payload={"approval_event_id": source[0], "source_order_id": result[0]},
+            )
     except BaseException:
         await db.execute("ROLLBACK TO executor_slot_issue")
         await db.execute("RELEASE executor_slot_issue")

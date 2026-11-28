@@ -7,9 +7,8 @@ from typing import Any
 import aiosqlite
 from fastapi import HTTPException
 
-from hub import repository as repo
 from hub.db import write_transaction
-from hub.services import epic_plan, project_policy, steward_limited_act as scope
+from hub.services import epic_plan, project_policy
 from hub.services import executor_skill_bundle as skills
 
 
@@ -41,30 +40,14 @@ async def launch_on_slot(
             if isinstance(booked, str):
                 return el._refused(booked, task_id)
             await epic_plan.refuse_legacy_start(db, int(booked.task["id"]))
-            source = await scope.retry_source_pin(
-                db, booked.task, str(project["slug"]), host
-            )
             order_id, row_id = await orders._issue_atomically(
                 db,
                 project,
                 booked,
                 issuer_principal_id=issuer_principal_id,
                 issuer_human=issuer_human,
-                pilot_start=(source[1].starting_sha, source[1].model)
-                if source
-                else None,
+                bind_retry_source=True,
             )
-            if source:
-                await repo.insert_event(
-                    db,
-                    kind=scope.RETRY_SOURCE_EVENT,
-                    task_id=int(booked.task["id"]),
-                    actor="hub",
-                    payload={
-                        "approval_event_id": source[0],
-                        "source_order_id": order_id,
-                    },
-                )
     except skills.SkillBundleError as exc:
         return el._refused(str(exc), task_id)
     except aiosqlite.IntegrityError:

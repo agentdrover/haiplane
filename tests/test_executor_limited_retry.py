@@ -7,11 +7,13 @@ import pytest
 
 from hub import brand, config, repository as repo
 from hub.db import connect, fetchall
+from hub.services import admin as admin_svc
 from hub.services import executor_limited_retry as retry
 from hub.services import executor_orders as orders
 from hub.services import steward_limited_act as scope
 from tests.executor_slot_support import seed_slot_skills
 from tests.test_executor_orders import _make_key
+from tests.test_slot_repair_running import FINDINGS_JSON
 from tests.test_steward_applied import _client_task, _grant_act
 from tests.test_steward_limited_act import _pilot
 from tests.test_steward_shadow import _project
@@ -58,6 +60,10 @@ def public_key():
 
 @pytest.fixture
 async def candidate(db, monkeypatch, public_key):
+    return await _launch_failed_source(db, monkeypatch, public_key)
+
+
+async def _launch_failed_source(db, monkeypatch, public_key, *, returning=False):
     monkeypatch.setenv(brand.ENV_PREFIX + "HUB_URL", "https://hub.example.test")
     _grant_act(monkeypatch)
     await seed_slot_skills(db)
@@ -74,27 +80,82 @@ async def candidate(db, monkeypatch, public_key):
         db, name="k8", public_key_pem=public_key, created_by=None
     )
     task_id = await _client_task(db, project_id, risk_class="R1")
+    issuer_id = None
+    if returning:
+        issuer = await admin_svc.create_principal(
+            db, kind="human", username="repair-owner", role_slug="operator"
+        )
+        issuer_id = issuer["id"]
+        await repo.update_task(
+            db,
+            task_id,
+            status="running",
+            review_verdict="changes_requested",
+            review_verdict_generation=1,
+            review_findings=FINDINGS_JSON,
+        )
+        previous_run = await repo.create_executor_run(
+            db,
+            task_id=task_id,
+            submission_generation=1,
+            agent_id="previous",
+            run_id="previous",
+            model=MODEL,
+        )
+        await repo.update_executor_run(
+            db, previous_run, tokens=1000, cents=10.0, outcome="finished", finish=True
+        )
+    else:
+        await repo.update_task(db, task_id, status="open")
     pilot = await _pilot(db, monkeypatch, project_id, task_id)
-    await repo.update_task(db, task_id, status="open")
     await db.commit()
     pilot.tasks[0].retry = scope.RetryTarget(starting_sha=SHA, model=MODEL)
     monkeypatch.setattr(config, "STEWARD_ACT_PILOT", pilot.model_dump_json())
     project = await repo.resolve_project_for_task(db, task_id)
     launched = await orders.launch_on_slot(
-        db, project, host="k8", task_id=task_id, issuer_principal_id=None
+        db,
+        project,
+        host="k8",
+        task_id=task_id,
+        issuer_principal_id=issuer_id,
+        issuer_human=returning,
     )
     assert launched.launched, launched.reason
     order_id, run_id = launched.order_id, launched.row_id
     assert order_id is not None and run_id is not None
-    original_run = await repo.get_executor_run(db, run_id)
-    assert (original_run["starting_ref"], original_run["model"]) == (SHA, MODEL)
+    if not returning:
+        original_run = await repo.get_executor_run(db, run_id)
+        assert (original_run["starting_ref"], original_run["model"]) == (SHA, MODEL)
     delivered = await orders.deliver_orders(db, "k8")
     assert [order["id"] for order in delivered] == [order_id]
-    assert SHA in delivered[0]["order_text"] and MODEL in delivered[0]["order_text"]
+    if not returning:
+        assert SHA in delivered[0]["order_text"] and MODEL in delivered[0]["order_text"]
     await orders.ack_order(db, "k8", order_id, orders.ACK_REDEEM_FAILED)
     transport = Transport()
     monkeypatch.setattr(retry, "retry_transport", lambda: transport)
     return task_id, order_id, run_id, transport
+
+
+async def test_returning_repair_order_allows_one_retry(db, monkeypatch, public_key):
+    task_id, source, source_run_id, _ = await _launch_failed_source(
+        db, monkeypatch, public_key, returning=True
+    )
+
+    repeated = await retry.sweep(db)
+    assert repeated is not None
+    assert await retry.sweep(db) is None
+    source_run = await repo.get_executor_run(db, source_run_id)
+    assert (source_run["starting_ref"], source_run["model"]) == (SHA, MODEL)
+    rows = await fetchall(
+        db,
+        "SELECT source_order_id, order_id FROM executor_limited_retry WHERE task_id=?",
+        (task_id,),
+    )
+    assert [tuple(row) for row in rows] == [(source, repeated)]
+    delivered = await orders.deliver_orders(db, "k8")
+    assert [row["id"] for row in delivered] == [repeated]
+    await orders.ack_order(db, "k8", repeated, orders.ACK_REDEEM_FAILED)
+    assert await retry.sweep(db) is None
 
 
 async def test_confirmed_prestart_failure_allows_only_one_retry(db, db_dsn, candidate):
