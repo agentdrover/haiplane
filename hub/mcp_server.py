@@ -5159,6 +5159,8 @@ async def hub_agent_outbox(
     """Publish a role delivery, read its status, or read the order scope."""
     from urllib.parse import quote
 
+    # Executor quota probes use the host-only REST protocol. Issuance is a
+    # local database-owner command, with no remote MCP equivalent.
     path = f"/api/executor-hosts/{quote(host, safe='')}/role-orders/{order_id}/outbox"
     try:
         if payload is None:

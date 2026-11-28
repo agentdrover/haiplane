@@ -13,6 +13,8 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+from hub.cli_executor_quota_probe import add_executor_quota_probe_parser
+
 
 def _api(*args: Any, **kwargs: Any) -> Any:
     # Лениво: hub.cli собирает парсеры при импорте и импортирует этот модуль.
@@ -163,6 +165,7 @@ def add_executor_host_parsers(sub: Any) -> None:
     for each in (p_add, p_slots, p_host):
         each.add_argument("--json", action="store_true", help="Print raw JSON")
     p_host.set_defaults(func=cmd_executor_host)
+    add_executor_quota_probe_parser(sub)
 
     p_launch = sub.add_parser(
         "executor-launch", help="Launch the executor on a task (human)"
